@@ -158,6 +158,18 @@ def get_scout_brain_data(account_id: str) -> dict:
         return {}
 
 
+def get_hero_data(account_id: str) -> dict:
+    """Carica l'ultimo snapshot dell'eroe scritto da HeroManager."""
+    safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
+    hero_file = STATE_DIR / f"hero_{safe_id}.json"
+    if not hero_file.exists():
+        return {}
+    try:
+        return json.loads(hero_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def get_account_session_info(acc: Settings) -> dict:
     f = acc.state_file or (STATE_DIR / f"session_{acc.account_id}.json")
     if f.exists():
@@ -485,6 +497,43 @@ with tab_villages:
                 "feeder": "feeder (Economico) — Mercato/Magazzini + Spedizione surplus al Target",
             }
 
+            # Chiavi edificio (salvate in building_focus) -> etichetta italiana
+            building_focus_labels = {
+                "main": "🏛️ Edificio Principale",
+                "warehouse": "📦 Magazzino",
+                "granary": "🌾 Granaio",
+                "cranny": "🕳️ Nascondiglio",
+                "embassy": "🤝 Ambasciata",
+                "rally_point": "🚩 Punto di Raduno",
+                "marketplace": "⚖️ Mercato",
+                "residence": "🏠 Residenza",
+                "palace": "🏰 Palazzo",
+                "treasury": "💰 Tesoreria",
+                "academy": "🎓 Accademia",
+                "smithy": "⚒️ Fucina",
+                "tournament_square": "🏟️ Piazza del Torneo",
+                "barracks": "⚔️ Caserma",
+                "great_barracks": "⚔️ Grande Caserma",
+                "stable": "🐎 Scuderia",
+                "great_stable": "🐎 Grande Scuderia",
+                "workshop": "🛠️ Officina",
+                "hospital": "🏥 Ospedale",
+                "hero_mansion": "🦸 Casa dell'Eroe",
+                "town_hall": "🎉 Municipio",
+                "trade_office": "📈 Ufficio Commerciale",
+                "brickyard": "🧱 Fabbrica di Mattoni",
+                "sawmill": "🪚 Segheria",
+                "iron_foundry": "⛏️ Fonderia",
+                "grain_mill": "🌾 Mulino",
+                "bakery": "🥖 Panificio",
+                "stonemason_lodge": "🪨 Bottega del Marmista",
+                "trapper": "🪤 Trappolaio",
+                "horse_drinking_trough": "🐴 Abbeveratoio",
+                "great_warehouse": "📦 Grande Magazzino",
+                "great_granary": "🌾 Grande Granaio",
+                "city_wall": "🧱 Mura / Staccionata / Terrapieno",
+            }
+
             for idx, vname in enumerate(all_known):
                 old_cfg = cur_acc.villages.get(vname, VillageConfig(name=vname))
                 with st.expander(f"🏰 Configurazione per '{vname}'", expanded=True):
@@ -518,13 +567,20 @@ with tab_villages:
                         )
                         parsed_units = [u.strip() for u in units_str.split(",") if u.strip()]
                     with u_col2:
-                        focus_str = st.text_input(
-                            f"Edifici Prioritari (separati da virgola):",
-                            value=", ".join(old_cfg.building_focus),
+                        # Le opzioni includono eventuali chiavi legacy gia'
+                        # salvate e non presenti nella mappa (retrocompat).
+                        focus_options = list(building_focus_labels.keys())
+                        for _f in old_cfg.building_focus:
+                            if _f not in focus_options:
+                                focus_options.append(_f)
+                        parsed_focus = st.multiselect(
+                            "Edifici Prioritari:",
+                            options=focus_options,
+                            default=[f for f in old_cfg.building_focus if f in focus_options],
+                            format_func=lambda k: building_focus_labels.get(k, k),
                             key=f"focus_{cur_acc.account_id}_{idx}",
-                            help="Es: barracks, stable, granary, marketplace",
+                            help="Edifici a cui dare priorita' di upgrade in questo villaggio",
                         )
-                        parsed_focus = [f.strip() for f in focus_str.split(",") if f.strip()]
 
                     updated_villages[vname] = VillageConfig(
                         name=vname,
@@ -656,6 +712,38 @@ with tab_modules:
             format_func=lambda i: mod_acc_opts[i], key="mod_acc_sel",
         )
         mod_acc = accounts[mod_acc_idx]
+
+        # ---------------- STATUS EROE ----------------
+        hero_data = get_hero_data(mod_acc.account_id)
+        st.markdown("### 🦸 Status & Controllo Eroe")
+        h_col1, h_col2, h_col3, h_col4 = st.columns(4)
+        with h_col1:
+            st.metric("Salute Eroe", f"{hero_data.get('health', '–')}%" if hero_data else "–")
+        with h_col2:
+            _status_map = {
+                "home": "A casa", "adventure": "In avventura",
+                "moving": "In marcia", "away": "Fuori villaggio",
+                "dead": "Morto/in cura",
+            }
+            st.metric(
+                "Stato",
+                _status_map.get(hero_data.get("status", ""), "–") if hero_data else "–",
+            )
+        with h_col3:
+            st.metric("Avventure disponibili", hero_data.get("adventures", "–") if hero_data else "–")
+        with h_col4:
+            _lvl = hero_data.get("level", 0) if hero_data else 0
+            st.metric("Livello", _lvl if _lvl else "–")
+        if hero_data:
+            _upd = datetime.datetime.fromtimestamp(
+                hero_data.get("updated_at", 0)
+            ).strftime("%d/%m %H:%M")
+            st.caption(
+                f"Ultima azione: `{hero_data.get('last_action') or '-'}` — aggiornato {_upd}"
+            )
+        else:
+            st.caption("Nessun dato eroe: attiva il modulo e attendi il primo ciclo dell'agente.")
+        st.divider()
 
         # Villaggi noti da config + snapshot storico
         mod_snapshots = get_latest_village_snapshots(mod_acc.account_id)
@@ -820,6 +908,54 @@ with tab_modules:
                     step=1.0,
                 )
 
+            st.divider()
+
+            # ---------------- EROE ----------------
+            st.markdown("### 🦸 Modulo Eroe Autonomo")
+            hero_enabled = st.toggle(
+                "Abilita Modulo Eroe",
+                value=mod_acc.hero.enabled,
+                key="hero_toggle",
+                help="Monitora salute, applica unguenti e spedisce in avventura.",
+            )
+            hero_adv = st.toggle(
+                "Abilita Spedizione Automatica in Avventura",
+                value=mod_acc.hero.auto_adventures,
+                key="hero_auto_adv",
+                help="Invia l'eroe alla prima avventura disponibile quando e' a casa.",
+            )
+            hr_col1, hr_col2, hr_col3 = st.columns(3)
+            with hr_col1:
+                hero_heal_sel = st.slider(
+                    "Usa unguenti sotto salute %",
+                    min_value=10, max_value=90,
+                    value=int(mod_acc.hero.heal_threshold),
+                )
+            with hr_col2:
+                hero_min_hp_sel = st.slider(
+                    "Salute minima per avventura %",
+                    min_value=10, max_value=90,
+                    value=int(mod_acc.hero.min_health_to_adventure),
+                )
+            with hr_col3:
+                attr_opts = ["auto", "resources", "strength", "off", "def"]
+                cur_attr = (
+                    mod_acc.hero.attribute_focus
+                    if mod_acc.hero.attribute_focus in attr_opts else "auto"
+                )
+                hero_attr_sel = st.selectbox(
+                    "Focus attributi (level-up):",
+                    attr_opts,
+                    index=attr_opts.index(cur_attr),
+                    format_func=lambda a: {
+                        "auto": "Auto (dal profilo account)",
+                        "resources": "Risorse",
+                        "strength": "Forza",
+                        "off": "Bonus attacco",
+                        "def": "Bonus difesa",
+                    }[a],
+                )
+
             mod_saved = st.form_submit_button(
                 "💾 Salva Configurazione Farming, Espansione & AI Scout", type="primary"
             )
@@ -874,9 +1010,16 @@ with tab_modules:
             mod_acc.scout_brain.min_loot_ratio = min_loot_sel
             mod_acc.scout_brain.blacklist_hours = bl_hours_sel
 
+            # Eroe
+            mod_acc.hero.enabled = hero_enabled
+            mod_acc.hero.auto_adventures = hero_adv
+            mod_acc.hero.heal_threshold = int(hero_heal_sel)
+            mod_acc.hero.min_health_to_adventure = int(hero_min_hp_sel)
+            mod_acc.hero.attribute_focus = hero_attr_sel
+
             save_accounts(accounts)
             st.success(
-                "Parametri di farming, espansione e AI Scout aggiornati e salvati su "
+                "Parametri di farming, espansione, AI Scout ed eroe aggiornati e salvati su "
                 "accounts.json! L'agente li applicherà al prossimo ciclo."
             )
             time.sleep(1)

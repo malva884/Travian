@@ -113,6 +113,7 @@ class BuildQueueItem:
     level: int = 0
     remaining_seconds: int = 0
     is_resource_field: bool = False
+    slot_id: int = 0  # slot dorf1/dorf2 da build.php?id=N, 0 = non letto
 
 
 @dataclass

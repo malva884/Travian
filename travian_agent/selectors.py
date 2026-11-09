@@ -96,10 +96,20 @@ MARKET_TAB_SEND: list[str] = [
     "a.tabItem:has-text('Send')",
     "a.tabItem:has-text('Gestione')",
     "a.tabItem:has-text('Management')",
-    "a:has-text('Invia risorse')",
-    "a:has-text('Send resources')",
-    "a:has-text('Invia')",
-    "a:has-text('Send')",
+    # UI moderne: le tab del mercato possono essere button/div/role=tab,
+    # non <a> — il click va provato anche su elementi non-anchor
+    "button:has-text('Invia risorse')",
+    "button:has-text('Send resources')",
+    "[role='tab']:has-text('Invia')",
+    "[role='tab']:has-text('Send')",
+    ".tabItem:has-text('Invia risorse')",
+    ".tabItem:has-text('Send resources')",
+    "#content button:has-text('Invia')",
+    "#content button:has-text('Send')",
+    "#content a:has-text('Invia risorse')",
+    "#content a:has-text('Send resources')",
+    "#content a:has-text('Invia')",
+    "#content a:has-text('Send')",
     ".contentNavi a:first-child",
 ]
 MARKET_SEND_INPUTS: dict[str, list[str]] = {
@@ -108,6 +118,10 @@ MARKET_SEND_INPUTS: dict[str, list[str]] = {
     "iron": ["input[name='r3']", "input#r3", "input[id*='r3']", "input[name*='r3']"],
     "crop": ["input[name='r4']", "input#r4", "input[id*='r4']", "input[name*='r4']"],
 }
+# ATTENZIONE: questi selettori vanno usati SEMPRE scoped dentro il form di
+# invio marcato ([data-tts-sendform]). Il campo 'rinomina villaggio' in
+# testata alle pagine dorf/build usa lo stesso name='dname'/'illage':
+# applicati all'intera pagina rinominerebbero il villaggio attivo.
 MARKET_TARGET_INPUT: list[str] = [
     "input[name='dname']",
     "input[name='targetVillage']",
@@ -116,8 +130,13 @@ MARKET_TARGET_INPUT: list[str] = [
     "input[name='targetVillageName']",
     "input[name*='illage']",
     "input[id*='illage']",
+    "input[name='destination']",
+    "input[name*='destination']",
+    "input[name='recipient']",
+    "input[id*='village' i]",
     "input[placeholder*='illagg']",  # 'villaggio'
     "input[placeholder*='illage']",  # 'village'
+    "input[placeholder*='estin']",   # 'destinazione'/'destination'
 ]
 # Suggerimenti dell'autocomplete dopo aver digitato il nome villaggio
 MARKET_TARGET_SUGGESTION: list[str] = [
@@ -129,7 +148,8 @@ MARKET_TARGET_SUGGESTION: list[str] = [
     "li.suggestion",
     "[class*='suggest'] li",
     "[class*='autocomplete'] li",
-    ".villageList li",
+    # NB: NON includere '.villageList li' — e' la sidebar dei villaggi:
+    # cliccarla naviga verso quel villaggio e cambia il contesto attivo.
 ]
 MARKET_SEND_BUTTON: list[str] = [
     "button:has-text('Invia risorse')",
@@ -140,15 +160,17 @@ MARKET_SEND_BUTTON: list[str] = [
     "#enabledButton",
 ]
 # Seconda pagina di conferma invio (T4.x mostra un riepilogo prima dello smistamento)
+# Il riepilogo di conferma va cercato solo nel contenuto principale e mai
+# nel form di rinomina villaggio (che contiene input[name='dname']).
 MARKET_CONFIRM_BUTTON: list[str] = [
-    "button:has-text('Invia risorse')",
-    "button:has-text('Send resources')",
-    "button:has-text('Conferma')",
-    "button:has-text('Confirm')",
-    "button[type='submit']",
-    "input[type='submit']",
-    "#btn_ok",
-    "button.send",
+    "#content button:has-text('Invia risorse')",
+    "#content button:has-text('Send resources')",
+    "#content button:has-text('Conferma')",
+    "#content button:has-text('Confirm')",
+    "#content button.send",
+    "#content #btn_ok",
+    "#content form:not(:has(input[name='dname'])) button[type='submit']",
+    "#content form:not(:has(input[name='dname'])) input[type='submit']",
 ]
 
 # Punto di Raduno (dorf2, gid 16): tab liste raid / farm list.

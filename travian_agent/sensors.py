@@ -277,8 +277,15 @@ class TravianParser:
                         let name = nameEl?.innerText?.trim() || nameEl?.getAttribute('alt')?.trim() || '';
                         const durationEl = el.querySelector('.buildDuration, .timer, .dur, .clocks');
                         let duration = durationEl?.innerText?.trim() || '';
+                        // Slot di origine dal link build.php?id=N (se la riga lo contiene)
+                        const link = el.querySelector('a[href*="build.php?id="]') || el.closest('a[href*="build.php?id="]');
+                        let slotId = null;
+                        if (link) {
+                            const m = (link.getAttribute('href') || '').match(/build\\.php[?&]id=(\\d+)/);
+                            if (m) slotId = parseInt(m[1], 10);
+                        }
                         if (name) {
-                            items.push({ building: name, time_left: duration });
+                            items.push({ building: name, time_left: duration, slot_id: slotId });
                         }
                     });
                     return items;
@@ -289,9 +296,48 @@ class TravianParser:
         except Exception as exc:
             logger.debug("JS evaluate per coda costruzione fallito: %s", exc)
 
-        # Fallback
-        items = await self.read_build_queue()
-        return [{"building": i.name, "time_left": str(i.remaining_seconds)} for i in items]
+        # Fallback DOM locator (non richiama read_build_queue: ricorsione)
+        for sel in (
+            ".buildingList li",
+            "#buildingContract .buildingRow",
+            ".buildingsOverview .buildingRow",
+            "table#building_contract tr",
+        ):
+            rows = self.page.locator(sel)
+            try:
+                count = await rows.count()
+            except Exception:
+                continue
+            if count == 0:
+                continue
+            for i in range(count):
+                try:
+                    row = rows.nth(i)
+                    name_el = row.locator(".name, .building, img[alt]").first
+                    name = ""
+                    if await name_el.count() > 0:
+                        name = (
+                            (await name_el.inner_text()).strip()
+                            or (await name_el.get_attribute("alt") or "").strip()
+                        )
+                    dur_el = row.locator(".buildDuration, .timer, .dur, .clocks").first
+                    duration = ""
+                    if await dur_el.count() > 0:
+                        duration = (await dur_el.inner_text()).strip()
+                    slot_id = None
+                    link = row.locator("a[href*='build.php?id=']").first
+                    if await link.count() > 0:
+                        m = _SLOT_ID.search(await link.get_attribute("href") or "")
+                        if m:
+                            slot_id = int(m.group(1))
+                    if name:
+                        items.append(
+                            {"building": name, "time_left": duration, "slot_id": slot_id}
+                        )
+                except Exception:
+                    continue
+            break
+        return items
 
     async def check_incoming_attacks(self) -> bool:
         """Controlla se ci sono movimenti di truppe ostili diretti verso il villaggio."""
@@ -762,6 +808,7 @@ class TravianParser:
                     level=parse_int(name),
                     remaining_seconds=parse_timer(duration_str),
                     is_resource_field=is_res,
+                    slot_id=slot_id if isinstance(slot_id, int) else 0,
                 )
             )
         return items

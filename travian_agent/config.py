@@ -92,6 +92,17 @@ class ScoutBrainConfig:
 
 
 @dataclass
+class HeroConfig:
+    """Modulo eroe autonomo: avventure, auto-cura e punti attributo."""
+
+    enabled: bool = False
+    auto_adventures: bool = True        # spedizione automatica in avventura
+    heal_threshold: int = 50            # % salute sotto cui usare gli unguenti
+    min_health_to_adventure: int = 40   # % salute minima per la spedizione
+    attribute_focus: str = "auto"       # auto|strength|off|def|resources
+
+
+@dataclass
 class Settings:
     server_url: str
     username: str = ""
@@ -125,6 +136,7 @@ class Settings:
     farming: FarmingConfig = field(default_factory=FarmingConfig)
     expansion: ExpansionConfig = field(default_factory=ExpansionConfig)
     scout_brain: ScoutBrainConfig = field(default_factory=ScoutBrainConfig)
+    hero: HeroConfig = field(default_factory=HeroConfig)
 
     def __post_init__(self) -> None:
         if not self.account_id:
@@ -199,6 +211,13 @@ def load_accounts() -> list[Settings]:
                                     k: v
                                     for k, v in dict(item.get("scout_brain_settings") or {}).items()
                                     if k in ScoutBrainConfig.__dataclass_fields__
+                                }
+                            ),
+                            hero=HeroConfig(
+                                **{
+                                    k: v
+                                    for k, v in dict(item.get("hero_settings") or {}).items()
+                                    if k in HeroConfig.__dataclass_fields__
                                 }
                             ),
                             expansion=ExpansionConfig(
@@ -291,6 +310,13 @@ def save_accounts(accounts: list[Settings]) -> None:
                 "min_loot_ratio": acc.scout_brain.min_loot_ratio,
                 "blacklist_hours": acc.scout_brain.blacklist_hours,
                 "max_targets_per_wave": acc.scout_brain.max_targets_per_wave,
+            },
+            "hero_settings": {
+                "enabled": acc.hero.enabled,
+                "auto_adventures": acc.hero.auto_adventures,
+                "heal_threshold": acc.hero.heal_threshold,
+                "min_health_to_adventure": acc.hero.min_health_to_adventure,
+                "attribute_focus": acc.hero.attribute_focus,
             },
             "expansion_settings": {
                 "auto_expand": acc.expansion.auto_expand,

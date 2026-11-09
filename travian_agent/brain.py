@@ -17,6 +17,7 @@ from .models import (
     GID_BARRACKS,
     GID_GRANARY,
     GID_MARKETPLACE,
+    GID_PALACE,
     GID_STABLE,
     GID_WAREHOUSE,
     GID_WORKSHOP,
@@ -53,6 +54,48 @@ def rule_alert_under_attack(state: GameState, settings: Settings) -> Action | No
     return None
 
 
+# Livelli massimi noti degli edifici Travian nel dorf2 (default prudente: 20).
+_BUILDING_MAX_LEVEL: dict[int, int] = {
+    GID_WAREHOUSE: 20,
+    GID_GRANARY: 20,
+}
+# Campi risorsa del dorf1: livello 10 nei villaggi normali, 21 in capitale.
+_FIELD_MAX_NORMAL = 10
+_FIELD_MAX_CAPITAL = 21
+
+
+def _is_capital(state: GameState) -> bool:
+    """True se nel dorf2 esiste il Palazzo (presente solo in capitale)."""
+    return any(f.gid == GID_PALACE for f in state.interior_fields())
+
+
+def _field_max_level(state: GameState, f: Field) -> int:
+    """Livello massimo raggiungibile dal field (stima conservativa)."""
+    if f.is_resource_field:
+        return _FIELD_MAX_CAPITAL if _is_capital(state) else _FIELD_MAX_NORMAL
+    return _BUILDING_MAX_LEVEL.get(f.gid, 20)
+
+
+def _queued_slot_ids(state: GameState) -> set[int]:
+    """Slot gia' occupati da una costruzione in coda."""
+    return {q.slot_id for q in state.build_queue if q.slot_id > 0}
+
+
+def _upgradeable_fields(state: GameState, fields: list[Field]) -> list[Field]:
+    """Filtro di validazione preventiva sui candidati UPGRADE_FIELD.
+
+    Esclude gli slot gia' occupati da una costruzione in corso (slot_id
+    letto dalla coda) e i field gia' al livello massimo, cosi' l'azione
+    contiene solo upgrade realmente avviabili.
+    """
+    queued = _queued_slot_ids(state)
+    return [
+        f
+        for f in fields
+        if f.slot_id not in queued and f.level < _field_max_level(state, f)
+    ]
+
+
 def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action | None:
     """Se la coda risorse e' libera, propone l'upgrade del campo piu' debole.
 
@@ -69,7 +112,7 @@ def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action |
     elif state.build_queue:
         return None
 
-    fields = state.resource_fields()
+    fields = _upgradeable_fields(state, state.resource_fields())
     if not fields:
         return None
 
@@ -142,7 +185,7 @@ def rule_upgrade_storage(state: GameState, settings: Settings) -> Action | None:
     if not needed:
         return None
 
-    interior = state.interior_fields()
+    interior = _upgradeable_fields(state, state.interior_fields())
     candidates: list[Field] = []
     for gid in needed:
         by_gid = sorted(

@@ -18,6 +18,7 @@ from .browser import TravianBrowser
 from .config import BASE_DIR, Settings, load_accounts
 from .expansion import ExpansionManager, feeder_surplus, find_market
 from .farming import FarmingManager, find_rally_point
+from .hero import HeroManager
 from .models import Action, ActionType, Field, GameState, Resources, Village
 from .sensors import GameObserver
 
@@ -29,6 +30,7 @@ _last_video_bonus_claim: dict[str, float] = {}
 _farming_managers: dict[str, FarmingManager] = {}
 _expansion_managers: dict[str, ExpansionManager] = {}
 _scout_brains: dict[str, AIScoutBrain] = {}
+_hero_managers: dict[str, HeroManager] = {}
 
 
 def _append_history(account_id: str, state: GameState, action: Action) -> None:
@@ -83,6 +85,7 @@ async def monitor_all_villages(
     farming_mgr: FarmingManager | None = None,
     expansion_mgr: ExpansionManager | None = None,
     scout_brain: AIScoutBrain | None = None,
+    hero_mgr: HeroManager | None = None,
 ) -> None:
     """Ciclo di controllo multi-villaggio per l'account corrente.
 
@@ -132,12 +135,24 @@ async def monitor_all_villages(
                 reason="Attivazione automatica bonus +15% produzione risorse per 8 ore (video ad)",
             )
             claim_result = await executor.execute(claim_action)
-            if claim_result.success:
+            # Registra il timer solo se il bonus e' stato davvero accreditato
+            # o era gia' attivo: un fallimento viene ritentato al ciclo dopo.
+            claimed = claim_result.success and (
+                "attivati" in claim_result.message
+                or "già attivi" in claim_result.message
+            )
+            if claimed:
                 _last_video_bonus_claim[settings.account_id] = now
                 logger.info("%s Bonus video +15%% registrato per le prossime 8 ore", prefix)
-            else:
+            elif claim_result.success:
                 logger.debug(
-                    "%s Riscatto bonus video non eseguito: %s",
+                    "%s Bonus video: %s (nessuna attivazione confermata)",
+                    prefix,
+                    claim_result.message,
+                )
+            else:
+                logger.warning(
+                    "%s Riscatto bonus video fallito: %s",
                     prefix,
                     claim_result.message,
                 )
@@ -327,6 +342,13 @@ async def monitor_all_villages(
         except Exception as e_exc:
             logger.warning("%s Errore modulo espansione: %s", prefix, e_exc)
 
+    # 3.1 Modulo eroe: cura, avventure, attributi (account-level, con cooldown)
+    if hero_mgr is not None and settings.hero.enabled:
+        try:
+            await hero_mgr.run(browser=browser, settings=settings, prefix=prefix)
+        except Exception as h_exc:
+            logger.warning("%s Errore modulo eroe: %s", prefix, h_exc)
+
     # 4. Global Power Assessment: valutazione complessiva impero multi-villaggio
     if scout_brain is not None:
         try:
@@ -379,6 +401,7 @@ async def run_single_account_loop(
                             settings.farming = fresh_acc.farming
                             settings.expansion = fresh_acc.expansion
                             settings.scout_brain = fresh_acc.scout_brain
+                            settings.hero = fresh_acc.hero
                             break
                 except Exception as hr_err:
                     logger.debug("%s Errore hot-reload config: %s", prefix, hr_err)
@@ -433,6 +456,10 @@ async def run_single_account_loop(
                     _scout_brains[settings.account_id] = AIScoutBrain(
                         settings.account_id
                     )
+                if settings.account_id not in _hero_managers:
+                    _hero_managers[settings.account_id] = HeroManager(
+                        settings.account_id
+                    )
                 await monitor_all_villages(
                     browser=browser,
                     observer=observer,
@@ -444,6 +471,7 @@ async def run_single_account_loop(
                     farming_mgr=_farming_managers[settings.account_id],
                     expansion_mgr=_expansion_managers[settings.account_id],
                     scout_brain=_scout_brains[settings.account_id],
+                    hero_mgr=_hero_managers[settings.account_id],
                 )
 
                 # Reset del conteggio errori e ripristino al completamento con successo

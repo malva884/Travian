@@ -22,23 +22,144 @@ _NEWDID = re.compile(r"newdid=(\d+)")
 # si prendono i campi testo/numerici dentro il form che contiene il campo
 # destinazione, escludendo nome villaggio, coordinate X/Y e ricerca.
 _JS_MARKET_QTY_INPUTS = """
-    const findQtyInputs = () => {
-        const isQty = (i) => {
-            const t = (i.type || 'text').toLowerCase();
-            if (t !== 'text' && t !== 'number' && t !== '') return false;
-            const key = ((i.name || '') + ' ' + (i.id || '')).toLowerCase().trim();
-            if (/^(x|y)$/.test(key)) return false;
-            if (/dname|village|target|player|search|name|message|note/.test(key)) return false;
-            return true;
-        };
-        const scope =
-            document.querySelector(
-                'form:has(input[name*="dname" i]), form:has(input[name*="village" i]), ' +
-                'form:has(input[id*="village" i]), form:has(input[name="x"]), ' +
-                '#sendResources, .sendResources, #marketplaceSend, .marketplaceSend'
-            ) || document;
-        return Array.from(scope.querySelectorAll('input')).filter(isQty);
+    const isQtyInput = (i) => {
+        const t = (i.type || 'text').toLowerCase();
+        if (t !== 'text' && t !== 'number' && t !== '') return false;
+        const key = ((i.name || '') + ' ' + (i.id || '')).toLowerCase().trim();
+        if (/^(x|y)$/.test(key)) return false;
+        if (/dname|village|target|player|search|name|message|note/.test(key)) return false;
+        return true;
     };
+    const isTargetInput = (i) => {
+        const t = (i.type || 'text').toLowerCase();
+        if (t !== 'text' && t !== 'search' && t !== '') return false;
+        const key = ((i.name || '') + ' ' + (i.id || '')).toLowerCase().trim();
+        if (/dname|target.*village|village.*name|entervillage/.test(key)) return true;
+        if (/^village$|^target$|destination|newvillage|selectvillage|recipient/.test(key)) return true;
+        const ph = (i.placeholder || i.getAttribute('aria-label') || '').toLowerCase();
+        return /villaggio|village|destinazione|destination/.test(ph);
+    };
+    const villageNames = Array.from(document.querySelectorAll(
+        '.villageList a, .villageList .name, #sidebarBoxVillagelist a, ' +
+        '#sidebarBoxVillagelist .name, .villageInput option'
+    )).map(e => (e.innerText || '').trim().toLowerCase()).filter(t => t.length > 0);
+    const isVillageSelect = (s) => {
+        if (!s.options || s.options.length < 2) return false;
+        const optTexts = Array.from(s.options).map(o => (o.text || '').toLowerCase());
+        return villageNames.some(v => optTexts.some(o => o.includes(v)));
+    };
+    const findSendForm = () => {
+        // Aggiunti i selettori specifici per le schermate moderne di invio risorse nel mercato
+        const scopes = document.querySelectorAll(
+            '#sendResources, .sendResources, #marketplaceSend, .marketplaceSend, ' +
+            '.marketplace, #marketplace, [class*="sendRes" i], [class*="market" i], ' +
+            '.contentNavi, #content, .content, main, form, div[class*="send" i]'
+        );
+        for (const scope of scopes) {
+            const inputs = Array.from(scope.querySelectorAll('input'));
+            const hasQty = inputs.some(i => isQtyInput(i) && !isTargetInput(i));
+            if (!hasQty) continue;
+            const hasTarget = inputs.some(isTargetInput) ||
+                !!Array.from(scope.querySelectorAll('select')).find(isVillageSelect);
+            if (hasTarget) return scope;
+        }
+        // Fallback di ultima istanza: restituisce il body se contiene input risorsa e target
+        return document.body;
+    };
+    const findQtyInputs = () => {
+        const scope = findSendForm();
+        return scope
+            ? Array.from(scope.querySelectorAll('input'))
+                  .filter(i => isQtyInput(i) && !isTargetInput(i))
+            : [];
+    };
+    const findTargetInput = () => {
+        const scope = findSendForm();
+        if (!scope) return null;
+        return Array.from(scope.querySelectorAll('input')).find(isTargetInput) || null;
+    };
+"""
+
+# Clicca il pulsante 'Attiva' del bonus VIDEO (+15% per 8 ore). Il pulsante
+# gold '+25% per 7 giorni' (es. "Attiva 5", con prezzo) sta nella STESSA
+# card e scalerebbe gold senza conferma: si accetta solo un bottone che
+# viene DOPO il testo '+15%' nel DOM e senza cifre (prezzo) nel testo.
+# Clicca il pulsante 'Attiva' del bonus VIDEO (+15% per 8 ore).
+_JS_CLICK_VIDEO_BONUS = """
+    () => {
+        // Cerca qualsiasi elemento che contenga il bonus del 15% o la durata di 8 ore
+        const elements = Array.from(document.querySelectorAll('div, span, p, td, li, .advantage, .item'));
+
+        for (const el of elements) {
+            const t = (el.innerText || '').toLowerCase();
+            // Controllo flessibile: basta che trovi il +15% e il riferimento temporale o video
+            const has15 = /\\+\\s*15\\s*%/.test(t);
+            const hasDuration = /(8|otto)\\s*(ore|hours?|hrs?|h)?\\b/.test(t) || t.includes('video');
+
+            if (has15 && hasDuration) {
+                // Cerca il bottone di attivazione all'interno dello stesso blocco o genitore vicino
+                let scope = el;
+                for (let i = 0; i < 4 && scope; i++) {
+                    const btn = Array.from(scope.querySelectorAll(
+                        'button, a, input[type="submit"], input[type="button"], .textButtonV1, .green'
+                    )).find(b => {
+                        if (b.disabled || b.offsetParent === null) return false;
+                        const bt = (b.innerText || b.value || '').trim().toLowerCase();
+                        // Accetta bottoni di attivazione o visione video ed esclude i prezzi in Gold (es. cifre numeriche)
+                        const isActivate = /attiva|activate|guarda|watch|start|gratis|free/.test(bt);
+                        const hasGoldPrice = /\\d/.test(bt) && !bt.includes('15');
+                        return isActivate && !hasGoldPrice;
+                    });
+
+                    if (btn) { 
+                        btn.click(); 
+                        return true; 
+                    }
+                    scope = scope.parentElement;
+                }
+            }
+        }
+        return false;
+    }
+"""
+
+# Numero di dialog/modal visibili (baseline per rilevare l'apertura del popup ad)
+_JS_DIALOG_COUNT = """
+    () => Array.from(document.querySelectorAll(
+        '.dialog, .popupWrapper, .modalDialog, [role="dialog"], .overlay, .modal'
+    )).filter(el => {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return r.width > 80 && r.height > 60 && s.display !== 'none' && s.visibility !== 'hidden';
+    }).length
+"""
+
+# Rileva se il popup del video ad e' presente (video, iframe ad o nuovo dialog)
+_JS_AD_PRESENT = """
+    (baseDialogs) => {
+        const isVis = (el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width < 80 || r.height < 60) return false;
+            const s = getComputedStyle(el);
+            return s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        if (Array.from(document.querySelectorAll('video')).some(isVis)) return 'video';
+        for (const f of document.querySelectorAll('iframe')) {
+            const src = (f.src || '').toLowerCase();
+            if (isVis(f) && /ad|azerion|ima|video|improved|pubmatic|doubleclick|advert/.test(src)) return 'iframe-ad';
+        }
+        const dialogs = Array.from(document.querySelectorAll(
+            '.dialog, .popupWrapper, .modalDialog, [role="dialog"], .overlay, .modal'
+        )).filter(isVis);
+        if (dialogs.length > baseDialogs) return 'dialog';
+        return null;
+    }
+"""
+
+# Conta i marker di bonus gia' attivi ("+15% attivo per 07:59:00")
+_JS_ACTIVE_BONUS_MARKS = """
+    () => ((document.body.innerText || '')
+        .match(/attiv[oa]?\\s+per\\s+\\d|active\\s+for\\s+\\d/gi) || []).length
 """
 
 
@@ -258,6 +379,25 @@ class ActionExecutor:
 
             await self.browser.goto(build_url)
 
+            # Verifica preventiva: la pagina segnala livello massimo raggiunto?
+            try:
+                is_max_level = await page.evaluate(
+                    """
+                    () => /livello massimo|fully upgraded|max(imal)?(imum)?\\s*level|
+                           completamente migliorato|maximale stufe|niveau max/i
+                        .test(document.body.innerText || '')
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                is_max_level = False
+            if is_max_level:
+                logger.info(
+                    "Slot %s gia' al livello massimo nel villaggio %s: cerco alternativa",
+                    slot_id,
+                    village_id,
+                )
+                continue
+
             button = None
             for sel in selectors.UPGRADE_BUTTON:
                 locator = page.locator(sel).first
@@ -322,46 +462,44 @@ class ActionExecutor:
         )
         await sleep_human(1.0, 2.0)
 
-        # 3. Trova e attiva i bonus video (+15% per 8 ore)
-        activated_count = 0
-        for _ in range(4):
-            clicked = await page.evaluate("""
-                () => {
-                    const buttons = Array.from(document.querySelectorAll(
-                        '.dialog button, #paymentWizard button, .featureProduction button, .productionBoost button, .feature button'
-                    ));
-                    for (const b of buttons) {
-                        const txt = (b.innerText || '').trim().toLowerCase();
-                        const card = (b.closest('.feature, .box, .card, .productionBonus, div') ? b.closest('.feature, .box, .card, .productionBonus, div').innerText : '').toLowerCase();
-                        const pTxt = (b.parentElement ? b.parentElement.innerText : '').toLowerCase();
+        # 3. Attiva i bonus video (+15% per 8 ore), una risorsa alla volta:
+        # click 'Attiva' -> popup video -> chiusura automatica a fine video.
+        # Baseline dialog/pagine per rilevare il popup; i marker
+        # '+15% attivo per' verificano l'accredito reale.
+        base_dialogs = await page.evaluate(_JS_DIALOG_COUNT)
+        base_pages = len(page.context.pages) if page.context else 1
 
-                        // Cerca bottoni 'Attiva' associati a +15% / 8 ore, escludendo Gold / +25%
-                        const isVideoBonus = (
-                            (card.includes('+15%') || pTxt.includes('+15%') || txt.includes('15%')) &&
-                            (card.includes('8') || pTxt.includes('8') || card.includes('ore') || card.includes('hours')) &&
-                            !b.disabled &&
-                            !txt.includes('gold') &&
-                            !txt.includes('25%') &&
-                            !txt.includes('attivo') &&
-                            !txt.includes('active')
-                        );
-                        if (isVideoBonus) {
-                            b.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-            """)
+        activated_count = 0
+        fails = 0
+        for _ in range(4):
+            if fails >= 2:
+                break
+            active_before = await page.evaluate(_JS_ACTIVE_BONUS_MARKS)
+            clicked = await page.evaluate(_JS_CLICK_VIDEO_BONUS)
             if not clicked:
                 break
 
-            activated_count += 1
-            logger.info("Avviato video per bonus risorsa %d/4. Attesa termine riproduzione video...", activated_count)
+            logger.info(
+                "Video bonus: popup avviato, attesa riproduzione (%d/4 gia' accreditati)",
+                activated_count,
+            )
+            completed = await self._wait_for_video_ad_completion(
+                page,
+                base_dialog_count=base_dialogs,
+                base_page_count=base_pages,
+            )
 
-            # Attende il completamento effettivo del video prima di passare al prossimo
-            await self._wait_for_video_ad_completion(page, max_wait_seconds=45)
-            logger.info("Bonus risorsa %d/4 completato e accreditato", activated_count)
+            active_after = await page.evaluate(_JS_ACTIVE_BONUS_MARKS)
+            if active_after > active_before:
+                activated_count += 1
+                logger.info("Bonus +15%% accreditato (%d/4 risorse)", activated_count)
+            else:
+                fails += 1
+                logger.warning(
+                    "Attivazione non verificata (popup chiuso=%s): tentativo %d/2",
+                    completed,
+                    fails,
+                )
             await sleep_human(1.5, 2.5)
 
         # 4. Chiude il dialog del negozio
@@ -373,138 +511,161 @@ class ActionExecutor:
             return ActionResult(
                 True, f"attivati {activated_count} bonus produzione risorsa (+15% 8h)"
             )
+        if fails > 0:
+            return ActionResult(
+                False,
+                "popup video non confermato: nessun bonus accreditato",
+            )
         return ActionResult(
             True, "bonus +15% già attivi o nessun bonus video attivabile"
         )
 
-    async def _wait_for_video_ad_completion(self, page, max_wait_seconds: int = 45) -> bool:
-        """Attende la fine effettiva della riproduzione del video pubblicitario.
+    async def _wait_for_video_ad_completion(
+        self,
+        page,
+        base_dialog_count: int = 0,
+        base_page_count: int = 1,
+        appear_timeout: float = 15.0,
+        max_wait_seconds: float = 100.0,
+    ) -> bool:
+        """Attende apertura e chiusura autonoma del popup del video ad.
 
-        Non chiude prematuramente il player: monitora tag <video>, countdown e
-        pulsanti di completamento/riscossione per garantire che Travian registri
-        il bonus +15% per 8 ore.
+        Fase 1 (max `appear_timeout`s): il popup deve APPARIRE — overlay con
+        <video>/iframe ad in pagina oppure nuova scheda del browser. Se non
+        appare, il click non e' andato a buon fine (evita falsi positivi).
+        Fase 2 (max `max_wait_seconds`s): il popup si chiude da solo a fine
+        video; se resta aperto dopo la fine del video si prova la chiusura
+        manuale via X del dialog che contiene l'ad (mai lo shop).
         """
-        # Attesa iniziale per l'avvio del player pubblicitario
-        await asyncio.sleep(2.0)
-
-        start_time = time.time()
-        while time.time() - start_time < max_wait_seconds:
-            # 1. Ispezione stato video nel DOM principale
-            status = await page.evaluate("""
-                () => {
-                    // Cerca tutti i tag video (principali e visibili)
-                    const videos = Array.from(document.querySelectorAll('video'));
-                    for (const v of videos) {
-                        if (v.ended || (v.duration && v.currentTime >= v.duration - 0.5)) {
-                            return { state: 'ended', current: v.currentTime, duration: v.duration };
-                        }
-                        if (!v.paused && v.duration > 0) {
-                            return { state: 'playing', remaining: Math.ceil(v.duration - v.currentTime) };
-                        }
-                    }
-
-                    // Cerca overlay / iframe pubblicitari noti
-                    const adContainers = document.querySelectorAll(
-                        '#adContainer, #videoPlayer, .videoDialog, #imaContainer, #videoOverlay, iframe[src*="ad"], iframe[src*="video"], iframe[src*="ima"]'
-                    );
-                    const isAdVisible = Array.from(adContainers).some(el => {
-                        const r = el.getBoundingClientRect();
-                        return r.width > 50 && r.height > 50;
-                    });
-
-                    // Cerca pulsanti di completamento post-video (es. 'Riscuoti', 'Claim', 'Continua', 'Chiudi')
-                    const endButtons = Array.from(document.querySelectorAll(
-                        'button.rewardButton, button.claimButton, .videoDialog button.close, #adContainer button.close, button:has-text("Riscuoti"), button:has-text("Claim")'
-                    )).filter(b => !b.disabled && b.offsetParent !== null);
-
-                    if (endButtons.length > 0) {
-                        return { state: 'ready_to_claim', hasButton: true };
-                    }
-
-                    // Se non ci sono video in riproduzione né container pubblicitari visibili,
-                    // l'ad è terminato e il popup si è chiuso autonomamente
-                    if (!isAdVisible && videos.length === 0) {
-                        return { state: 'closed' };
-                    }
-
-                    return { state: 'waiting' };
-                }
-            """)
-
-            state = (status or {}).get("state")
-            if state == "ended":
-                logger.debug("Video pubblicitario terminato.")
-                break
-            elif state == "playing":
-                rem = (status or {}).get("remaining", "?")
-                logger.debug("Video in riproduzione... (~%ss rimanenti)", rem)
-            elif state == "ready_to_claim":
-                logger.debug("Pulsante di riscossione/chiusura post-video pronto.")
-                break
-            elif state == "closed":
-                logger.debug("Overlay video chiuso/completato.")
-                break
-
-            # Cerca anche all'interno di eventuali iframe di terze parti (IMA SDK / Azerion)
-            ad_ended_in_frame = False
-            for frame in page.frames:
-                if frame == page.main_frame:
-                    continue
-                try:
-                    f_status = await frame.evaluate("""
-                        () => {
-                            const v = document.querySelector('video');
-                            if (v && (v.ended || (v.duration && v.currentTime >= v.duration - 0.5))) {
-                                return true;
-                            }
-                            const btn = document.querySelector('.close-button, .reward-button, #close, .btn-close');
-                            if (btn && !btn.disabled) {
-                                btn.click();
-                                return true;
-                            }
-                            return false;
-                        }
-                    """)
-                    if f_status:
-                        ad_ended_in_frame = True
-                        break
-                except Exception:
-                    continue
-
-            if ad_ended_in_frame:
-                logger.debug("Video completato nel frame pubblicitario.")
-                break
-
-            await asyncio.sleep(2.0)
-
-        # Clicca eventuali pulsanti di chiusura del player terminato (NON del negozio)
-        try:
-            post_ad_close = [
-                "button.rewardButton",
-                "button.claimButton",
-                "#adContainer button.close",
-                ".videoDialog .close",
-                "#videoPlayer button.close",
-                "button.adClose",
-            ]
-            for sel in post_ad_close:
-                btn = page.locator(sel).first
-                if await btn.count() > 0 and await btn.is_visible():
-                    await btn.click()
-                    await asyncio.sleep(1.0)
+        # --- fase 1: attesa apertura popup ---
+        start = time.time()
+        opened = False
+        while time.time() - start < appear_timeout:
+            try:
+                if len(page.context.pages) > base_page_count:
+                    opened = True
                     break
+            except Exception:  # noqa: BLE001
+                pass
+            if await page.evaluate(_JS_AD_PRESENT, base_dialog_count):
+                opened = True
+                break
+            await asyncio.sleep(0.6)
+
+        if not opened:
+            logger.warning(
+                "Popup video non rilevato entro %.0fs: click non riuscito?",
+                appear_timeout,
+            )
+            return False
+
+        logger.debug("Popup video aperto: attesa termine riproduzione")
+
+        # --- fase 2: attesa chiusura autonoma a fine video ---
+        start = time.time()
+        ended_since: float | None = None
+        while time.time() - start < max_wait_seconds:
+            popup_open = False
+            try:
+                popup_open = len(page.context.pages) > base_page_count
+            except Exception:  # noqa: BLE001
+                pass
+
+            state = None
+            if not popup_open:
+                state = await page.evaluate(_JS_AD_PRESENT, base_dialog_count)
+            if not popup_open and not state:
+                await asyncio.sleep(1.5)  # lascia completare l'accredito AJAX
+                logger.debug("Popup video chiuso")
+                return True
+
+            if ended_since is None and await self._video_ended_anywhere(page):
+                ended_since = time.time()
+                logger.debug("Video terminato: attesa chiusura popup")
+
+            # Video finito da >10s ma popup ancora aperto -> chiusura via X
+            if ended_since and time.time() - ended_since > 10:
+                if await self._close_ad_overlay(page):
+                    await asyncio.sleep(1.5)
+                    logger.debug("Popup video chiuso manualmente dopo fine video")
+                    return True
+                ended_since = time.time()  # riprova dopo altri 10s
+
+            await asyncio.sleep(1.5)
+
+        # Timeout: popup mai chiuso -> chiusura forzata e segnala fallimento
+        await self._close_ad_overlay(page)
+        logger.warning("Popup video non chiuso entro %.0fs", max_wait_seconds)
+        return False
+
+    async def _video_ended_anywhere(self, page) -> bool:
+        """True se un <video> (pagina o iframe ad) ha raggiunto la fine."""
+        js = """
+            () => Array.from(document.querySelectorAll('video'))
+                .some(v => v.ended || (v.duration && v.currentTime >= v.duration - 0.5))
+        """
+        try:
+            if await page.evaluate(js):
+                return True
         except Exception:  # noqa: BLE001
             pass
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            try:
+                if await frame.evaluate(js):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
 
-        # Pausa di sicurezza per permettere a Travian di confermare l'attivazione via AJAX/websocket
-        await asyncio.sleep(2.5)
-        return True
+    async def _close_ad_overlay(self, page) -> bool:
+        """Clicca la X del dialog che contiene il video ad (mai lo shop)."""
+        try:
+            return bool(await page.evaluate("""
+                () => {
+                    const dialogs = document.querySelectorAll(
+                        '.dialog, .popupWrapper, .modalDialog, [role="dialog"], .modal'
+                    );
+                    for (const d of dialogs) {
+                        const r = d.getBoundingClientRect();
+                        if (r.width < 80 || r.height < 60) continue;
+                        const hasAd = d.querySelector('video') || d.querySelector(
+                            'iframe[src*="ad" i], iframe[src*="video" i], ' +
+                            'iframe[src*="azerion" i], iframe[src*="ima" i]'
+                        );
+                        if (!hasAd) continue;
+                        const c = d.querySelector(
+                            '.close, .cancel, .closeButton, .dialogClose, ' +
+                            '[class*="close" i], button[title*="chiud" i], ' +
+                            'button[title*="close" i], a[title*="close" i]'
+                        );
+                        if (c) { c.click(); return true; }
+                    }
+                    return false;
+                }
+            """))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _dump_market_html(self, page) -> None:
+        """Salva l'HTML della pagina mercato in debug/<account>/market_state.html."""
+        try:
+            debug_dir = getattr(self.settings, "debug_dir", None)
+            if debug_dir is None:
+                return
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            (debug_dir / "market_state.html").write_text(
+                await page.content(), encoding="utf-8"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Dump HTML mercato fallito: %s", exc)
 
     async def _send_resources(self, action: Action, village_id: int = 0) -> ActionResult:
         """Invia l'eccedenza ad un altro villaggio tramite il Mercato.
 
-        Flusso T4.x: build.php?id=<mercato>&t=5 -> tab invio -> campi r1-r4 +
-        nome villaggio -> submit -> pagina di riepilogo -> conferma.
+        Flusso T4.x: build.php?id=<mercato>&t=5 -> tab invio -> nome villaggio (con autocomplete)
+        + coordinate (X|Y) -> quantità r1-r4 -> submit -> pagina di riepilogo -> conferma.
         """
         params = action.params or {}
         market_slot = params.get("market_slot")
@@ -526,9 +687,6 @@ class ActionExecutor:
         market_status = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
             () => {
                 const bodyText = (document.body && document.body.innerText) || '';
-                // 'Mercanti: 20/20' e' la prima riga del tab invio; prendiamo
-                // il PRIMO match perche' in basso compare anche 'Mercanti: 0/20'
-                // (mercanti richiesti dalla spedizione corrente).
                 const m = bodyText.match(
                     /(?:mercanti|merchants?|haendler|händler|comerciantes?|marchands?)[^0-9]{0,20}([0-9]+)[^0-9]{0,5}[/][^0-9]{0,5}([0-9]+)/i
                 );
@@ -556,7 +714,7 @@ class ActionExecutor:
             }
         """)
 
-        # Se i mercanti sono esauriti (es. 0/1 in viaggio), segnala senza errori bloccanti
+        # Se i mercanti sono esauriti, segnala senza errori bloccanti
         if market_status and market_status.get("noMerchants"):
             m_info = market_status.get("merchants") or {}
             avail = m_info.get("available", 0)
@@ -567,15 +725,62 @@ class ActionExecutor:
                 f"nessun mercante disponibile al mercato ({avail}/{total} in viaggio)",
             )
 
-        # Se gli input non sono presenti, clicca il tab 'Invia risorse' e
-        # attendi che il contenuto venga caricato (tab AJAX o reload)
+        # Se gli input non sono presenti, clicca il tab 'Invia risorse'
         if not market_status or market_status.get("inputsCount", 0) == 0:
-            if await self._click_first(page, selectors.MARKET_TAB_SEND, timeout_ms=2000):
+            clicked = await self._click_first(
+                page, selectors.MARKET_TAB_SEND, timeout_ms=2000
+            )
+            if not clicked:
+                clicked = await page.evaluate("""
+                                              () => {
+                                                  const re = /invia risorse|send resources|invia|send|gestione|management/i;
+                                                  const els = document.querySelectorAll(
+                                                      '#content button, #content [role="tab"], #content .tabItem, ' +
+                                                      '#content a, #content li, .navigation a, .navigation button, ' +
+                                                      'nav button, nav a, nav li'
+                                                  );
+                                                  for (const el of els) {
+                                                      const t = (el.innerText || '').trim();
+                                                      if (t.length > 0 && t.length < 60 && re.test(t) &&
+                                                          !el.disabled && el.offsetParent !== null) {
+                                                          el.click();
+                                                          return true;
+                                                      }
+                                                  }
+                                                  return false;
+                                              }
+                                              """)
+            if clicked:
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=3000)
                 except Exception:
                     pass
                 await sleep_human(0.8, 1.5)
+
+        # Guardia critica: prosegui SOLO se esiste il vero form di invio mercato
+        has_form = False
+        for _ in range(6):
+            has_form = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
+                () => {
+                    const f = findSendForm();
+                    if (!f) return false;
+                    f.setAttribute('data-tts-sendform', '1');
+                    return true;
+                }
+            """)
+            if has_form:
+                break
+            await sleep_human(0.5, 0.9)
+        if not has_form:
+            await self._dump_market_html(page)
+            return ActionResult(
+                False,
+                "form di invio mercato non caricato (tab 'Invia risorse' assente?)",
+            )
+        send_scope = "[data-tts-sendform='1']"
+
+        # Snapshot del nome del villaggio attivo per sicurezza
+        village_name_before = await self._active_village_name(page)
 
         # 2. Compila le quantità di risorse
         filled = 0
@@ -584,11 +789,9 @@ class ActionExecutor:
             if amount <= 0:
                 continue
             for sel in sel_list:
-                field = page.locator(sel).first
+                field = page.locator(f"{send_scope} {sel}").first
                 try:
-                    if await field.count() == 0:
-                        continue
-                    if await field.is_disabled():
+                    if await field.count() == 0 or await field.is_disabled():
                         continue
                     await field.fill(str(amount), timeout=1000)
                     filled += 1
@@ -597,99 +800,49 @@ class ActionExecutor:
                     continue
 
         if filled == 0:
-            # Fallback JS: prova i nomi classici r1-r4 / m2[n]
-            filled = await page.evaluate(f"""
-                (res) => {{
+            filled = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
+                (res) => {
+                    const form = findSendForm();
+                    if (!form) return 0;
                     let cnt = 0;
-                    const map = {{ wood: 1, clay: 2, iron: 3, crop: 4 }};
-                    for (const [k, v] of Object.entries(res)) {{
+                    const map = { wood: 1, clay: 2, iron: 3, crop: 4 };
+                    for (const [k, v] of Object.entries(res)) {
                         const num = parseInt(v, 10);
                         if (!num || num <= 0) continue;
                         const idx = map[k];
-                        const inp = document.querySelector(
-                            `#r${{idx}}, input[name="r${{idx}}"], input[name="m2[${{idx}}]"], #m2_${{idx}}`
+                        const inp = form.querySelector(
+                            `#r${idx}, input[name="r${idx}"], input[name="m2[${idx}]"], #m2_${idx}`
                         );
-                        if (inp && !inp.disabled) {{
+                        if (inp && !inp.disabled) {
                             inp.value = num;
-                            inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
                             cnt++;
-                        }}
-                    }}
+                        }
+                    }
                     return cnt;
-                }}
+                }
             """, resources)
 
         if filled == 0:
-            # Fallback strutturale: le UI con slider possono usare nomi
-            # qualsiasi -> prendi i campi quantita' del form in ordine DOM
-            # (legno/argilla/ferro/grano).
-            qty_map = {
-                "wood": int(resources.get("wood", 0) or 0),
-                "clay": int(resources.get("clay", 0) or 0),
-                "iron": int(resources.get("iron", 0) or 0),
-                "crop": int(resources.get("crop", 0) or 0),
-            }
-            filled = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
-                (res) => {
-                    const order = ['wood', 'clay', 'iron', 'crop'];
-                    const cands = findQtyInputs().slice(0, 4);
-                    let cnt = 0;
-                    order.forEach((r, idx) => {
-                        const amount = parseInt(res[r], 10);
-                        const inp = cands[idx];
-                        if (!inp || !amount || amount <= 0) return;
-                        inp.readOnly = false;
-                        inp.disabled = false;
-                        inp.focus();
-                        inp.value = String(amount);
-                        for (const ev of ['input', 'change', 'keyup', 'blur']) {
-                            inp.dispatchEvent(new Event(ev, { bubbles: true }));
-                        }
-                        cnt++;
-                    });
-                    return cnt;
-                }
-            """, qty_map)
+            return ActionResult(False, "form di invio mercato non trovato o campi non compilabili")
 
-        if filled == 0:
-            # Dump diagnostico: url finale, input presenti e testo visibile
-            debug = await page.evaluate("""
-                () => ({
-                    url: location.href,
-                    title: document.title,
-                    formCount: document.forms.length,
-                    inputs: Array.from(document.querySelectorAll('input'))
-                        .slice(0, 40)
-                        .map(i => ({
-                            name: i.name || '', id: i.id || '', type: i.type || '',
-                            disabled: i.disabled, readonly: i.readOnly,
-                            visible: i.offsetParent !== null,
-                        })),
-                    text: ((document.body && document.body.innerText) || '').slice(0, 400),
-                })
-            """)
-            logger.warning(
-                "Mercato slot %s: form di invio non compilabile. url=%s forms=%s inputs=%s testo=%r",
-                market_slot,
-                debug.get("url"),
-                debug.get("formCount"),
-                debug.get("inputs"),
-                debug.get("text"),
-            )
-            return ActionResult(
-                False,
-                "form di invio mercato non trovato o campi non compilabili (verificare mercanti/tab)",
-            )
-
-        # 3. Compila il villaggio di destinazione. Si digita (non fill) per
-        # attivare l'autocomplete del campo nome villaggio.
+        # 3. COMPILAZIONE DESTINAZIONE BLINDATA (Esclude categoricamente i campi di rinomina)
         target_filled = False
+
         for sel in selectors.MARKET_TARGET_INPUT:
-            locator = page.locator(sel).first
+            # Filtro di sicurezza: ignora se il selettore contiene parole legate alla rinomina
+            if any(bad in sel.lower() for bad in ["rename", "dname", "renamer"]):
+                continue
+            locator = page.locator(f"{send_scope} {sel}").first
             try:
                 if await locator.count() == 0 or await locator.is_disabled():
                     continue
+                # Controllo extra sull'attributo name dell'elemento trovato
+                name_attr = (await locator.get_attribute("name") or "").lower()
+                if "dname" in name_attr or "rename" in name_attr:
+                    continue
+
                 await locator.fill("", timeout=500)
                 await locator.press_sequentially(str(target), delay=40, timeout=1500)
                 target_filled = True
@@ -698,15 +851,13 @@ class ActionExecutor:
                 continue
 
         if not target_filled:
-            target_filled = await page.evaluate("""
+            target_filled = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
                 (targetName) => {
-                    const inp = document.querySelector(
-                        '#enterVillageName, input[name="dname"], input[name="targetVillage"], ' +
-                        'input#targetVillage, input[name="villageName"], input[name="targetVillageName"], ' +
-                        'input[name*="illage" i], input[id*="illage" i], ' +
-                        'input[placeholder*="illage" i], input[placeholder*="illagg" i]'
-                    );
+                    const inp = findTargetInput();
                     if (inp && !inp.disabled) {
+                        const nameAttr = ((inp.name || '') + ' ' + (inp.id || '')).toLowerCase();
+                        if (nameAttr.includes('dname') || nameAttr.includes('rename')) return false;
+
                         inp.readOnly = false;
                         inp.focus();
                         inp.value = targetName;
@@ -720,48 +871,58 @@ class ActionExecutor:
             """, str(target))
 
         if not target_filled:
-            return ActionResult(
-                False,
-                f"campo destinazione villaggio non trovato (target '{target}')",
-            )
+            return ActionResult(False, f"campo destinazione villaggio non trovato (target '{target}')")
 
-        # Se il form usa l'autocomplete, seleziona il suggerimento che
-        # contiene il nome target; altrimenti il nome digitato basta.
+        # Clic sul suggerimento dell'autocomplete del mercato
         await sleep_human(0.4, 0.9)
         await self._pick_target_suggestion(page, str(target))
 
-        # Coordinate opzionali passate nei params: alcuni server le richiedono
+        # Compilazione coordinate esatte (X, Y) per blindare ulteriormente la richiesta
         tx, ty = params.get("target_x"), params.get("target_y")
         if tx is not None and ty is not None:
             await page.evaluate("""
-                ([x, y]) => {
-                    const ix = document.querySelector('input[name="x"], input#xCoord, input[id*="xCoord"]');
-                    const iy = document.querySelector('input[name="y"], input#yCoord, input[id*="yCoord"]');
-                    if (ix) { ix.value = String(x); ix.dispatchEvent(new Event('input', { bubbles: true })); }
-                    if (iy) { iy.value = String(y); iy.dispatchEvent(new Event('input', { bubbles: true })); }
-                }
-            """, [tx, ty])
+                                ([x, y]) => {
+                                    const ix = document.querySelector('input[name="x"], input#xCoord, input[id*="xCoord"], .coordinateX input, input.xCoord');
+                                    const iy = document.querySelector('input[name="y"], input#yCoord, input[id*="yCoord"], .coordinateY input, input.yCoord');
+                                    if (ix) {
+                                        ix.value = String(x);
+                                        ix.dispatchEvent(new Event('input', {bubbles: true}));
+                                        ix.dispatchEvent(new Event('change', {bubbles: true}));
+                                    }
+                                    if (iy) {
+                                        iy.value = String(y);
+                                        iy.dispatchEvent(new Event('input', {bubbles: true}));
+                                        iy.dispatchEvent(new Event('change', {bubbles: true}));
+                                    }
+                                }
+                                """, [tx, ty])
 
-        await sleep_human(
-            self.settings.action_delay_min, self.settings.action_delay_max
-        )
+        if "build.php" not in (page.url or ""):
+            return ActionResult(False, "selezione destinazione uscita dal mercato - invio annullato")
+
+        await sleep_human(self.settings.action_delay_min, self.settings.action_delay_max)
 
         # 4. Submit del form di invio
-        if not await self._click_first(page, selectors.MARKET_SEND_BUTTON):
+        send_buttons = [f"{send_scope} {s}" for s in selectors.MARKET_SEND_BUTTON]
+        if not await self._click_first(page, send_buttons):
             return ActionResult(False, "pulsante di invio mercato non trovato")
         await sleep_human(1.0, 2.0)
 
-        # 5. T4.x mostra una pagina di riepilogo: conferma invio
+        # 5. CONTROLLO FINALE ANTIRINOMINA: se il nome del villaggio attivo è cambiato, blocca tutto
+        if village_name_before:
+            village_name_after = await self._active_village_name(page)
+            if village_name_after and village_name_after != village_name_before:
+                logger.error(
+                    "Tentativo di rinomina bloccato! Il villaggio attivo stava per essere cambiato da '%s' a '%s'",
+                    village_name_before, village_name_after
+                )
+                return ActionResult(False, "blocco di sicurezza: impedita modifica nome villaggio")
+
+        # Conferma finale T4.x (riepilogo)
         await self._click_first(page, selectors.MARKET_CONFIRM_BUTTON)
         await sleep_human(0.5, 1.0)
 
-        logger.info(
-            "Inviate %s a '%s' dal mercato slot %s (villaggio %s)",
-            resources,
-            target,
-            market_slot,
-            village_id,
-        )
+        logger.info("Risorse inviate con successo a '%s' dal mercato slot %s", target, market_slot)
         return ActionResult(True, f"risorse inviate a '{target}'")
 
     async def _send_raid(self, action: Action, village_id: int = 0) -> ActionResult:
@@ -1504,6 +1665,25 @@ class ActionExecutor:
             except Exception:  # noqa: BLE001
                 continue
         return False
+
+    async def _active_village_name(self, page) -> str | None:
+        """Nome del villaggio attivo letto dalla sidebar/testata."""
+        for sel in selectors.ACTIVE_VILLAGE_NAME:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() == 0:
+                    continue
+                tag = await loc.evaluate("el => el.tagName")
+                if tag == "INPUT":
+                    val = await loc.input_value(timeout=500)
+                else:
+                    val = await loc.inner_text(timeout=500)
+                val = (val or "").strip()
+                if val:
+                    return val
+            except Exception:  # noqa: BLE001
+                continue
+        return None
 
     async def _pick_target_suggestion(self, page, target: str) -> bool:
         """Se il campo destinazione mostra un autocomplete, clicca il
