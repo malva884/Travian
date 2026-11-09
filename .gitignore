@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+state/
+debug/
+accounts.json
+agent.log
+.pytest_cache/
+pytest-cache-files-*/
+.idea/

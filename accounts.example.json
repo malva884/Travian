@@ -1,0 +1,91 @@
+[
+  {
+    "account_id": "server_1",
+    "server_url": "https://ts11.x1.international.travian.com",
+    "username": "your_email@example.com",
+    "password": "your_password_here",
+    "headless": true,
+    "loop_interval_min": 30.0,
+    "loop_interval_max": 90.0,
+    "action_delay_min": 0.8,
+    "action_delay_max": 2.5,
+    "max_build_queue": 1,
+    "max_resource_queue": 1,
+    "max_interior_queue": 1,
+    "allow_parallel_build": false,
+    "auto_video_bonus": true,
+    "strategy_profile": "balanced",
+    "farming_settings": {
+      "enabled": false,
+      "interval_min_minutes": 12.0,
+      "interval_max_minutes": 18.0,
+      "farm_list": "",
+      "unit": ""
+    },
+    "scout_brain_settings": {
+      "enabled": true,
+      "gemini_api_key": "your_gemini_api_key_here",
+      "gemini_model": "gemini-2.5-flash",
+      "scan_radius": 20,
+      "max_travel_time_minutes": 66,
+      "min_loot_ratio": 0.3,
+      "blacklist_hours": 12.0,
+      "max_targets_per_wave": 5
+    },
+    "expansion_settings": {
+      "auto_expand": true,
+      "founder_village": "",
+      "crop_min": 9,
+      "min_culture_margin": 0,
+      "target_slots": []
+    },
+    "village_roles": {},
+    "villages": {
+      "Villaggio1": {
+        "name": "Villaggio1",
+        "role": "hammer",
+        "target_village": "",
+        "allowed_units": [
+          "Imperiani",
+          "Equites Imperatoris",
+          "Equites Caesaris",
+          "Cavalieri"
+        ],
+        "priority_units": [
+          "Imperiani",
+          "Equites Imperatoris",
+          "Equites Caesaris",
+          "Cavalieri"
+        ],
+        "building_focus": [
+          "barracks",
+          "stable",
+          "workshop",
+          "smithy",
+          "granary"
+        ],
+        "farm_enabled": true,
+        "farm_unit": ""
+      },
+      "Villaggio2": {
+        "name": "Villaggio2",
+        "role": "croplog",
+        "target_village": "Villaggio1",
+        "allowed_units": [
+          "Legionario"
+        ],
+        "priority_units": [
+          "Legionario"
+        ],
+        "building_focus": [
+          "mill",
+          "bakery",
+          "granary",
+          "palace"
+        ],
+        "farm_enabled": true,
+        "farm_unit": ""
+      }
+    }
+  }
+]
