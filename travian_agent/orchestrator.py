@@ -292,12 +292,18 @@ async def monitor_all_villages(
                 and village.name != expansion_mgr.feed_target
             ):
                 market = find_market(state.interior_fields())
+                vcfg_feed = settings.village_config_for(village.name, target_vid)
+                market_slot = (
+                    int(vcfg_feed.market_slot or 0)
+                    if vcfg_feed is not None and vcfg_feed.market_slot
+                    else (market.slot_id if market is not None else 0)
+                )
                 surplus = feeder_surplus(state)
-                if market is not None and surplus:
+                if market_slot and surplus:
                     feed_action = Action(
                         type=ActionType.SEND_RESOURCES,
                         params={
-                            "market_slot": market.slot_id,
+                            "market_slot": market_slot,
                             "target": expansion_mgr.feed_target,
                             "resources": surplus,
                         },

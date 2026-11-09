@@ -22,7 +22,7 @@ from travian_agent.config import (
     save_accounts,
     save_env_settings,
 )
-from travian_agent.models import VillageRole
+from travian_agent.models import STATIC_TROOP_LABELS, VillageRole
 
 st.set_page_config(
     page_title="Travian Agent Multi-Account Dashboard",
@@ -557,15 +557,22 @@ with tab_villages:
                         )
                         assigned_target = "" if new_target == "(Nessuno)" else new_target
 
-                    u_col1, u_col2 = st.columns([1, 1])
+                    u_col1, u_col2, u_col3 = st.columns([2, 2, 1])
                     with u_col1:
-                        units_str = st.text_input(
-                            f"Unità Addestrabili Consentite (separate da virgola):",
-                            value=", ".join(old_cfg.allowed_units),
+                        # Opzioni = nomi unita' delle tre tribu' (dedup, ordine
+                        # della mappa) + eventuali valori legacy gia' salvati
+                        unit_options = list(dict.fromkeys(STATIC_TROOP_LABELS.values()))
+                        for _u in old_cfg.allowed_units:
+                            if _u not in unit_options:
+                                unit_options.append(_u)
+                        parsed_units = st.multiselect(
+                            "Unità Addestrabili Consentite:",
+                            options=unit_options,
+                            default=[u for u in old_cfg.allowed_units if u in unit_options],
                             key=f"units_{cur_acc.account_id}_{idx}",
-                            help="Es: Imperiani, Cavalieri (usato dai ruoli hammer/defensive)",
+                            help="Ordine = priorita' di addestramento (usato dai ruoli "
+                                 "hammer/defensive). Vuoto = nessun filtro.",
                         )
-                        parsed_units = [u.strip() for u in units_str.split(",") if u.strip()]
                     with u_col2:
                         # Le opzioni includono eventuali chiavi legacy gia'
                         # salvate e non presenti nella mappa (retrocompat).
@@ -581,6 +588,17 @@ with tab_villages:
                             key=f"focus_{cur_acc.account_id}_{idx}",
                             help="Edifici a cui dare priorita' di upgrade in questo villaggio",
                         )
+                    with u_col3:
+                        parsed_market_slot = st.number_input(
+                            "Slot Mercato:",
+                            min_value=0,
+                            max_value=40,
+                            value=int(old_cfg.market_slot or 0),
+                            step=1,
+                            key=f"market_slot_{cur_acc.account_id}_{idx}",
+                            help="Slot dorf2 del Mercato (19-40). "
+                                 "0 = rilevamento automatico via gid=17.",
+                        )
 
                     updated_villages[vname] = VillageConfig(
                         name=vname,
@@ -588,6 +606,9 @@ with tab_villages:
                         target_village=assigned_target,
                         allowed_units=parsed_units,
                         building_focus=parsed_focus,
+                        farm_enabled=old_cfg.farm_enabled,
+                        farm_unit=old_cfg.farm_unit,
+                        market_slot=int(parsed_market_slot),
                     )
 
             save_submitted = st.form_submit_button("💾 Salva Ruoli & Strategia (Applicazione a Caldo)", type="primary")

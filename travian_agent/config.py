@@ -38,6 +38,7 @@ class VillageConfig:
     building_focus: list[str] = field(default_factory=list)  # priorita' edifici (Sprint 3+)
     farm_enabled: bool = True       # include questo villaggio nei cicli di raid
     farm_unit: str = ""             # unita' da saccheggio (vuoto = truppe leggere auto)
+    market_slot: int = 0            # slot dorf2 del Mercato (0 = auto-detect via gid=17)
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:
@@ -256,6 +257,7 @@ def load_accounts() -> list[Settings]:
                                     building_focus=list(cfg.get("building_focus", [])),
                                     farm_enabled=bool(cfg.get("farm_enabled", True)),
                                     farm_unit=str(cfg.get("farm_unit", "")),
+                                    market_slot=int(cfg.get("market_slot", 0) or 0),
                                 )
                                 for key, cfg in (item.get("villages") or {}).items()
                                 if isinstance(cfg, dict)
@@ -339,6 +341,7 @@ def save_accounts(accounts: list[Settings]) -> None:
                     "building_focus": list(cfg.building_focus),
                     "farm_enabled": cfg.farm_enabled,
                     "farm_unit": cfg.farm_unit,
+                    "market_slot": int(cfg.market_slot or 0),
                 }
                 for key, cfg in acc.villages.items()
             },

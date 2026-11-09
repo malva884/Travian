@@ -321,19 +321,26 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
         return None
 
     # --- 1) Mercato: invia l'eccedenza al peer con piu' spazio ---
+    # Slot manuale (dashboard) ha priorita' sull'auto-detect gid=17
+    vcfg = settings.village_config_for(state.village_name, state.village_id)
     market = _find_interior_by_gid(state, (GID_MARKETPLACE,))
+    market_slot = (
+        int(vcfg.market_slot or 0)
+        if vcfg is not None and vcfg.market_slot
+        else (market.slot_id if market is not None else 0)
+    )
     target = _best_peer_for_surplus(state, surplus)
-    if market is not None and target:
+    if market_slot and target:
         return Action(
             type=ActionType.SEND_RESOURCES,
             params={
-                "market_slot": market.slot_id,
+                "market_slot": market_slot,
                 "target": target,
                 "resources": surplus,
             },
             reason=(
                 f"Storage pieno: invio {surplus} a '{target}' "
-                f"via Mercato (slot {market.slot_id})"
+                f"via Mercato (slot {market_slot})"
             ),
         )
 

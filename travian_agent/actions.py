@@ -11,7 +11,12 @@ from typing import Any
 from . import selectors
 from .browser import TravianBrowser, sleep_human
 from .config import Settings
-from .models import Action, ActionResult, ActionType
+from .models import (
+    Action,
+    ActionResult,
+    ActionType,
+    STATIC_TROOP_LABELS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -240,19 +245,6 @@ STATIC_TROOP_COSTS: dict[str, dict[str, int]] = {
     "t29": {"wood": 30750, "clay": 45000, "iron": 31000, "crop": 37500},
     "t30": {"wood": 4400, "clay": 5600, "iron": 4600, "crop": 4200},
 }
-
-STATIC_TROOP_LABELS: dict[str, str] = {
-    "t1": "Legionario", "t2": "Pretoriano", "t3": "Imperiano",
-    "t4": "Emissario a cavallo", "t5": "Equites Imperatoris", "t6": "Equites Caesaris",
-    "t7": "Ariete", "t8": "Catapulta da fuoco", "t9": "Senatore", "t10": "Colono",
-    "t11": "Combattente", "t12": "Alabardiere", "t13": "Guerriero con ascia",
-    "t14": "Esploratore", "t15": "Paladino", "t16": "Cavaliere Teutonico",
-    "t17": "Ariete", "t18": "Catapulta", "t19": "Comandante", "t20": "Colono",
-    "t21": "Falange", "t22": "Spadaccino", "t23": "Esploratore",
-    "t24": "Fulmine di Teutates", "t25": "Cavaliere Druido", "t26": "Haeduan",
-    "t27": "Ariete", "t28": "Trabucco", "t29": "Capotribù", "t30": "Colono",
-}
-
 
 class ActionExecutor:
     def __init__(self, browser: TravianBrowser, settings: Settings) -> None:
@@ -658,14 +650,17 @@ class ActionExecutor:
             (debug_dir / "market_state.html").write_text(
                 await page.content(), encoding="utf-8"
             )
+            await page.screenshot(
+                path=str(debug_dir / "market_state.png"), full_page=True
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Dump HTML mercato fallito: %s", exc)
 
     async def _send_resources(self, action: Action, village_id: int = 0) -> ActionResult:
         """Invia l'eccedenza ad un altro villaggio tramite il Mercato.
 
-        Flusso T4.x: build.php?id=<mercato>&t=5 -> tab invio -> nome villaggio (con autocomplete)
-        + coordinate (X|Y) -> quantità r1-r4 -> submit -> pagina di riepilogo -> conferma.
+        Flusso T4.x: build.php?id=<mercato>&gid=17 -> click tab 'Invia risorse' -> autocomplete target
+        + quantità r1-r4 -> submit -> conferma.
         """
         params = action.params or {}
         market_slot = params.get("market_slot")
@@ -677,42 +672,95 @@ class ActionExecutor:
         page = self.browser.page
         assert page is not None
 
-        # Naviga direttamente al tab invio risorse (t=5) del mercato
-        build_url = f"{selectors.PATH_BUILD}?id={market_slot}&t=5"
+        # Apriamo la pagina del mercato usando il gid=17 universale
+        build_url = f"{selectors.PATH_BUILD}?id={market_slot}&gid=17"
         if village_id > 0:
             build_url += f"&newdid={village_id}"
+
         await self.browser.goto(build_url)
+        await sleep_human(1.0, 1.5)
 
-        # 1. Stato del mercato: mercanti liberi e presenza del form di invio
-        market_status = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
-            () => {
-                const bodyText = (document.body && document.body.innerText) || '';
-                const m = bodyText.match(
-                    /(?:mercanti|merchants?|haendler|händler|comerciantes?|marchands?)[^0-9]{0,20}([0-9]+)[^0-9]{0,5}[/][^0-9]{0,5}([0-9]+)/i
-                );
-                const merchants = m
-                    ? { available: parseInt(m[1], 10), total: parseInt(m[2], 10) }
-                    : null;
+        # 0. VERIFICA PREVENTIVA: Controlliamo se in questo slot esiste effettivamente il Mercato (gid=17)
+        is_market_valid = await page.evaluate("""
+                                              () => {
+                                                  const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
+                                                  const titleText = ((document.querySelector('h1, h2, .title')?.innerText) || '').toLowerCase();
 
-                const errText = (
-                    document.querySelector('.error, .none, .warning, .noMerchants, .alert')?.innerText || ''
-                ).toLowerCase();
-                const noMerchants = (
-                    (merchants !== null && merchants.total > 0 && merchants.available === 0) ||
-                    errText.includes('nessun mercante') ||
-                    errText.includes('no merchant') ||
-                    errText.includes('no trader') ||
-                    errText.includes('kein händler')
-                );
+                                                  if (titleText.includes('edificio') || titleText.includes('costruisci') ||
+                                                      bodyText.includes('questo edificio non esiste') ||
+                                                      bodyText.includes('this building does not exist')) {
+                                                      return false;
+                                                  }
+                                                  return true;
+                                              }
+                                              """)
 
-                return {
-                    merchants: merchants,
-                    noMerchants: noMerchants,
-                    inputsCount: findQtyInputs().length,
-                    url: location.href,
-                };
-            }
-        """)
+        if not is_market_valid:
+            logger.info("Villaggio slot %s: Mercato (gid=17) non presente o non valido in questo slot", market_slot)
+            return ActionResult(False, "mercato non presente in questo villaggio o slot errato")
+
+        # 1. CLICK ESPLICITO SUL TAB "INVIA RISORSE" (Fondamentale per la schermata T4.x)
+        clicked_tab = await page.evaluate("""
+                                          () => {
+                                              // Cerca l'elemento del tab o link "Invia risorse" / "Send resources"
+                                              const elements = document.querySelectorAll(
+                                                  '.tabItem, .container.tabItem, a, button, .tab, div[class*="tab"]'
+                                              );
+                                              for (const el of elements) {
+                                                  const text = (el.innerText || '').trim().toLowerCase();
+                                                  if (text === 'invia risorse' || text === 'send resources' || text.includes('invia risorse')) {
+                                                      el.click();
+                                                      return true;
+                                                  }
+                                              }
+                                              // Fallback: cerca tramite selettori generici di tab
+                                              const altTab = document.querySelector('.tabItem:nth-child(2), .tabItem.normal:nth-child(2)');
+                                              if (altTab) {
+                                                  altTab.click();
+                                                  return true;
+                                              }
+                                              return false;
+                                          }
+                                          """)
+
+        if clicked_tab:
+            await sleep_human(0.8, 1.2)
+
+        # 2. Stato del mercato: verifica dei mercanti e presenza dei campi di input
+        market_status = None
+        for _ in range(4):
+            market_status = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
+                () => {
+                    const bodyText = (document.body && document.body.innerText) || '';
+                    const m = bodyText.match(
+                        /(?:mercanti|merchants?|haendler|händler|comerciantes?|marchands?)[^0-9]{0,20}([0-9]+)[^0-9]{0,5}[/][^0-9]{0,5}([0-9]+)/i
+                    );
+                    const merchants = m
+                        ? { available: parseInt(m[1], 10), total: parseInt(m[2], 10) }
+                        : null;
+
+                    const errText = (
+                        document.querySelector('.error, .none, .warning, .noMerchants, .alert')?.innerText || ''
+                    ).toLowerCase();
+                    const noMerchants = (
+                        (merchants !== null && merchants.total > 0 && merchants.available === 0) ||
+                        errText.includes('nessun mercante') ||
+                        errText.includes('no merchant') ||
+                        errText.includes('no trader') ||
+                        errText.includes('kein händler')
+                    );
+
+                    return {
+                        merchants: merchants,
+                        noMerchants: noMerchants,
+                        inputsCount: findQtyInputs().length,
+                        url: location.href,
+                    };
+                }
+            """)
+            if market_status and market_status.get("inputsCount", 0) > 0:
+                break
+            await sleep_human(0.5, 0.9)
 
         # Se i mercanti sono esauriti, segnala senza errori bloccanti
         if market_status and market_status.get("noMerchants"):
@@ -725,64 +773,42 @@ class ActionExecutor:
                 f"nessun mercante disponibile al mercato ({avail}/{total} in viaggio)",
             )
 
-        # Se gli input non sono presenti, clicca il tab 'Invia risorse'
-        if not market_status or market_status.get("inputsCount", 0) == 0:
-            clicked = await self._click_first(
-                page, selectors.MARKET_TAB_SEND, timeout_ms=2000
-            )
-            if not clicked:
-                clicked = await page.evaluate("""
-                                              () => {
-                                                  const re = /invia risorse|send resources|invia|send|gestione|management/i;
-                                                  const els = document.querySelectorAll(
-                                                      '#content button, #content [role="tab"], #content .tabItem, ' +
-                                                      '#content a, #content li, .navigation a, .navigation button, ' +
-                                                      'nav button, nav a, nav li'
-                                                  );
-                                                  for (const el of els) {
-                                                      const t = (el.innerText || '').trim();
-                                                      if (t.length > 0 && t.length < 60 && re.test(t) &&
-                                                          !el.disabled && el.offsetParent !== null) {
-                                                          el.click();
-                                                          return true;
-                                                      }
-                                                  }
-                                                  return false;
-                                              }
-                                              """)
-            if clicked:
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=3000)
-                except Exception:
-                    pass
-                await sleep_human(0.8, 1.5)
-
         # Guardia critica: prosegui SOLO se esiste il vero form di invio mercato
         has_form = False
         for _ in range(6):
             has_form = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
-                () => {
-                    const f = findSendForm();
-                    if (!f) return false;
-                    f.setAttribute('data-tts-sendform', '1');
-                    return true;
-                }
-            """)
+                                () => {
+                                    const f = findSendForm();
+                                    if (!f) return false;
+                                    f.setAttribute('data-tts-sendform', '1');
+                                    return true;
+                                }
+                            """)
             if has_form:
                 break
             await sleep_human(0.5, 0.9)
+
         if not has_form:
-            await self._dump_market_html(page)
+            # Salva l'HTML della pagina per analizzare la struttura esatta dei tab e dei form
+            try:
+                html_content = await page.content()
+                logger.error("DEBUG MERCATO [Vibo Valentia]: Form non trovato. Dump HTML salvato o stampato.")
+                # Se hai una funzione di dump dedicata, viene chiamata qui:
+                if hasattr(self, '_dump_market_html'):
+                    await self._dump_market_html(page)
+            except Exception as e:
+                logger.error("Errore durante il dump HTML del mercato: %s", e)
+
             return ActionResult(
                 False,
                 "form di invio mercato non caricato (tab 'Invia risorse' assente?)",
             )
         send_scope = "[data-tts-sendform='1']"
 
-        # Snapshot del nome del villaggio attivo per sicurezza
+        # Snapshot del nome del villaggio attivo per sicurezza anti-rinomina
         village_name_before = await self._active_village_name(page)
 
-        # 2. Compila le quantità di risorse
+        # 3. Compila le quantità di risorse
         filled = 0
         for rtype, sel_list in selectors.MARKET_SEND_INPUTS.items():
             amount = int(resources.get(rtype, 0) or 0)
@@ -827,18 +853,16 @@ class ActionExecutor:
         if filled == 0:
             return ActionResult(False, "form di invio mercato non trovato o campi non compilabili")
 
-        # 3. COMPILAZIONE DESTINAZIONE BLINDATA (Esclude categoricamente i campi di rinomina)
+        # 4. COMPILAZIONE DESTINAZIONE BLINDATA (Esclude categoricamente i campi di rinomina)
         target_filled = False
 
         for sel in selectors.MARKET_TARGET_INPUT:
-            # Filtro di sicurezza: ignora se il selettore contiene parole legate alla rinomina
             if any(bad in sel.lower() for bad in ["rename", "dname", "renamer"]):
                 continue
             locator = page.locator(f"{send_scope} {sel}").first
             try:
                 if await locator.count() == 0 or await locator.is_disabled():
                     continue
-                # Controllo extra sull'attributo name dell'elemento trovato
                 name_attr = (await locator.get_attribute("name") or "").lower()
                 if "dname" in name_attr or "rename" in name_attr:
                     continue
@@ -902,13 +926,13 @@ class ActionExecutor:
 
         await sleep_human(self.settings.action_delay_min, self.settings.action_delay_max)
 
-        # 4. Submit del form di invio
+        # 5. Submit del form di invio
         send_buttons = [f"{send_scope} {s}" for s in selectors.MARKET_SEND_BUTTON]
         if not await self._click_first(page, send_buttons):
             return ActionResult(False, "pulsante di invio mercato non trovato")
         await sleep_human(1.0, 2.0)
 
-        # 5. CONTROLLO FINALE ANTIRINOMINA: se il nome del villaggio attivo è cambiato, blocca tutto
+        # 6. CONTROLLO FINALE ANTIRINOMINA: se il nome del villaggio attivo è cambiato, blocca tutto
         if village_name_before:
             village_name_after = await self._active_village_name(page)
             if village_name_after and village_name_after != village_name_before:
