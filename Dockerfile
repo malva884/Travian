@@ -10,10 +10,15 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Dipendenze Python + browser Chromium con le librerie di sistema necessarie.
-# (playwright install --with-deps usa apt per installare le dipendenze OS)
+# libatomic1 va installato PRIMA: il driver node di playwright non parte senza
+# (libatomic.so.1 mancante su python:*-slim). --with-deps installa il resto.
 COPY requirements.txt .
-RUN pip install -r requirements.txt \
-    && python -m playwright install --with-deps chromium
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && pip install -r requirements.txt \
+    && python -m playwright install --with-deps chromium \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
