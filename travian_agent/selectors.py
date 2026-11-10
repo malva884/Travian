@@ -113,10 +113,10 @@ MARKET_TAB_SEND: list[str] = [
     ".contentNavi a:first-child",
 ]
 MARKET_SEND_INPUTS: dict[str, list[str]] = {
-    "wood": ["input[name='r1']", "input#r1", "input[id*='r1']", "input[name*='r1']"],
-    "clay": ["input[name='r2']", "input#r2", "input[id*='r2']", "input[name*='r2']"],
-    "iron": ["input[name='r3']", "input#r3", "input[id*='r3']", "input[name*='r3']"],
-    "crop": ["input[name='r4']", "input#r4", "input[id*='r4']", "input[name*='r4']"],
+    "wood": ["input[name='lumber']", "input[name='r1']", "input#r1", "input#lumber", "input[id*='lumber']", "input[id*='r1']", "input[name*='r1']"],
+    "clay": ["input[name='clay']", "input[name='r2']", "input#r2", "input#clay", "input[id*='clay']", "input[id*='r2']", "input[name*='r2']"],
+    "iron": ["input[name='iron']", "input[name='r3']", "input#r3", "input#iron", "input[id*='iron']", "input[id*='r3']", "input[name*='r3']"],
+    "crop": ["input[name='crop']", "input[name='r4']", "input#r4", "input#crop", "input[id*='crop']", "input[id*='r4']", "input[name*='r4']"],
 }
 # ATTENZIONE: questi selettori vanno usati SEMPRE scoped dentro il form di
 # invio marcato ([data-tts-sendform]). Il campo 'rinomina villaggio' in
@@ -477,10 +477,53 @@ VILLAGE_ENTRY_NAME: list[str] = [".name", ".villageName", "a"]
 # Parametro URL per cambiare villaggio attivo
 PARAM_NEWDID = "newdid"
 
+# Questmaster / Task giornaliere: pannello premi riscattabili.
+# T4.x: l'icona #questmasterButton apre un dialog; le task completate
+# mostrano un pulsante "Riscuoti"/"Claim reward" nella lista.
+QUEST_MASTER_BUTTON: list[str] = [
+    "#questmasterButton",
+    "a[href*='questmaster']",
+    "#questmaster a",
+    ".questmasterButton",
+    "a[onclick*='questmaster']",
+]
+# Pulsanti di riscossione premio dentro il dialog/pagina task
+QUEST_CLAIM_BUTTON: list[str] = [
+    "#dialogContent .quest button:has-text('Riscuoti')",
+    "#dialogContent .quest button:has-text('Claim')",
+    "#dialogContent button:has-text('Riscuoti premio')",
+    "#dialogContent button:has-text('Claim reward')",
+    ".quest button:has-text('Riscuoti')",
+    ".quest button:has-text('Claim')",
+    "button:has-text('Riscuoti premio')",
+    "button:has-text('Claim reward')",
+    "button:has-text('Riscuoti')",
+    "button:has-text('Claim reward')",
+    "a:has-text('Riscuoti premio')",
+    "a:has-text('Claim reward')",
+]
+# Contenitori del dialog task/questmaster
+QUEST_DIALOG: list[str] = [
+    "#dialogContent",
+    ".questmaster",
+    "#questmasterDialog",
+    ".dialog",
+    "#modal",
+]
+QUEST_DIALOG_CLOSE: list[str] = [
+    "#dialogContent .close",
+    ".dialog .close",
+    "#modal .close",
+    "button:has-text('Chiudi')",
+    "button:has-text('Close')",
+    ".dialogButtonCancel",
+]
+
 # Path interni del gioco
 PATH_DORF1 = "dorf1.php"
 PATH_DORF2 = "dorf2.php"
 PATH_BUILD = "build.php"
 PATH_MAP = "karte.php"
+PATH_QUESTMASTER = "questmaster.php"
 PATH_LOGIN = "login.php"
 PATH_INDEX = "index.php"

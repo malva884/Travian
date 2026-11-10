@@ -15,6 +15,7 @@ from .models import (
     BuildQueueItem,
     Field,
     GameState,
+    IncomingAttack,
     Resources,
     ResourceType,
     Village,
@@ -382,6 +383,19 @@ class TravianParser:
                         return text;
                     };
 
+                    // Estrae (x, y) da un link mappa karte.php?x=..&y=.. dentro lo scope
+                    const parseKarteCoords = (scopeEl) => {
+                        if (!scopeEl || !scopeEl.querySelectorAll) return null;
+                        const links = scopeEl.querySelectorAll('a[href*="karte.php"]');
+                        for (const a of links) {
+                            const href = a.href || a.getAttribute('href') || '';
+                            const mx = href.match(/[?&]x=([-+]?\\d+)/);
+                            const my = href.match(/[?&]y=([-+]?\\d+)/);
+                            if (mx && my) return [parseInt(mx[1], 10), parseInt(my[1], 10)];
+                        }
+                        return null;
+                    };
+
                     // Chiudi eventuali modali/banner di benvenuto che oscurano i dati
                     try {
                         const dismissBtn = document.querySelector('.dialogCloseButton, button.dialogButtonCancel, a.dialogCloseButton, .modalClose, button.cmp-cta-accept');
@@ -411,6 +425,7 @@ class TravianParser:
                             const nameEl = entry.querySelector('.name, .villageName, .entryName, label, .headline') || linkEl || entry;
                             const rawText = nameEl?.innerText || nameEl?.textContent || entry.innerText || '';
                             const coordMatch = rawText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+                            const karteCoords = coordMatch ? null : parseKarteCoords(entry);
                             let nameText = cleanVillageName(rawText);
 
                             const isActive = entry.classList.contains('active') || linkEl?.classList.contains('active') || entry.getAttribute('aria-current') === 'true';
@@ -423,8 +438,8 @@ class TravianParser:
                                     url: finalUrl,
                                     village_id: vid,
                                     is_active: isActive,
-                                    x: coordMatch ? parseInt(coordMatch[1], 10) : null,
-                                    y: coordMatch ? parseInt(coordMatch[2], 10) : null
+                                    x: coordMatch ? parseInt(coordMatch[1], 10) : (karteCoords ? karteCoords[0] : null),
+                                    y: coordMatch ? parseInt(coordMatch[2], 10) : (karteCoords ? karteCoords[1] : null)
                                 });
                             }
                         });
@@ -444,14 +459,16 @@ class TravianParser:
                             const nameEl = el.querySelector('.name, .villageName') || el;
                             const rawText = nameEl?.innerText || nameEl?.textContent || '';
                             const coordMatch = rawText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+                            const karteScope = el.closest('li, tr, .entry, .listEntry, [data-did]') || el;
+                            const karteCoords = coordMatch ? null : parseKarteCoords(karteScope);
                             let nameText = cleanVillageName(rawText);
                             list.push({
                                 name: nameText && nameText !== 'Villaggio' ? nameText : `Villaggio_${vid}`,
                                 url: href || `dorf1.php?newdid=${vid}`,
                                 village_id: vid,
                                 is_active: el.classList.contains('active'),
-                                x: coordMatch ? parseInt(coordMatch[1], 10) : null,
-                                y: coordMatch ? parseInt(coordMatch[2], 10) : null
+                                x: coordMatch ? parseInt(coordMatch[1], 10) : (karteCoords ? karteCoords[0] : null),
+                                y: coordMatch ? parseInt(coordMatch[2], 10) : (karteCoords ? karteCoords[1] : null)
                             });
                         }
                     });
@@ -887,6 +904,133 @@ class TravianParser:
             except Exception:  # noqa: BLE001
                 continue
         return ""
+
+    async def get_incoming_attacks(
+        self, rally_slot: int = 0, village_id: int = 0
+    ) -> list[IncomingAttack]:
+        """Elenca i movimenti in arrivo dalla panoramica del Punto di Raduno.
+
+        Naviga a build.php?id=<rally_slot> e legge le righe 'in' delle
+        tabelle movimenti: tipo (icona att/def), countdown all'impatto,
+        eventuale conteggio truppe leggibile e nome attaccante.
+        Restituisce una lista vuota se il Punto di Raduno non esiste o
+        il parse fallisce.
+        """
+        if not self.page or not rally_slot:
+            return []
+        url = f"{selectors.PATH_BUILD}?id={rally_slot}"
+        if village_id:
+            url += f"&newdid={village_id}"
+        try:
+            if f"id={rally_slot}" not in (self.page.url or ""):
+                await self.page.goto(
+                    url, wait_until="domcontentloaded", timeout=20000
+                )
+            raw = await self.page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    const rows = document.querySelectorAll(
+                        '#content table.troop_details tr.in, ' +
+                        '#content tr.in, table.troop_details tr.in, ' +
+                        '.troop_details tr.in, #content .troop_details tr'
+                    );
+                    rows.forEach(row => {
+                        const img = row.querySelector('img');
+                        const imgKey = (
+                            (img && img.getAttribute('class')) || '' + ' ' +
+                            ((img && img.alt) || '')
+                        ).toLowerCase();
+                        let mtype = 'unknown';
+                        if (/att\\d?|attack/.test(imgKey)) mtype = 'attack';
+                        else if (/def\\d?|defense|reinforce/.test(imgKey)) {
+                            mtype = 'reinforce';
+                        }
+                        const rowCls = (row.className || '').toLowerCase();
+                        if (/def/.test(rowCls) && mtype === 'unknown') {
+                            mtype = 'reinforce';
+                        }
+                        if (/att/.test(rowCls) && mtype === 'unknown') {
+                            mtype = 'attack';
+                        }
+
+                        // Countdown all'impatto (.timer o pattern h:mm:ss)
+                        const rowText = (row.innerText || '').trim();
+                        const timerEl = row.querySelector(
+                            '.timer, span.timer, .dur'
+                        );
+                        const ttxt = timerEl
+                            ? (timerEl.textContent || '')
+                            : rowText;
+                        const m = ttxt.match(/(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/);
+                        let secs = 0;
+                        if (m) {
+                            secs =
+                                parseInt(m[1] || 0, 10) * 86400 +
+                                parseInt(m[2] || 0, 10) * 3600 +
+                                parseInt(m[3] || 0, 10) * 60 +
+                                parseInt(m[4] || 0, 10);
+                        }
+
+                        // Truppe leggibili: cifre accanto alle icone unit.
+                        // In T4.x la composizione nemica e' '?' => 0 = ignoto.
+                        let count = 0;
+                        row.querySelectorAll('td, span').forEach(el => {
+                            const t = (el.innerText || '').trim();
+                            if (/^\\d+$/.test(t) && t.length < 7) {
+                                count += parseInt(t, 10);
+                            }
+                        });
+
+                        // Attaccante/origine, se leggibile dal link giocatore
+                        let attacker = '';
+                        const pLink = row.querySelector(
+                            'a[href*="spieler"], a[href*="profile"], a[href*="karte"]'
+                        );
+                        if (pLink) {
+                            attacker = (pLink.innerText || '').trim();
+                        }
+
+                        out.push({
+                            type: mtype,
+                            seconds: secs,
+                            count: count,
+                            attacker: attacker,
+                            label: rowText.slice(0, 160),
+                        });
+                    });
+                    return out;
+                }
+                """
+            )
+        except Exception as exc:
+            logger.debug("Parse attacchi in arrivo fallito: %s", exc)
+            return []
+
+        now = time.time()
+        attacks: list[IncomingAttack] = []
+        for item in raw or []:
+            secs = int(item.get("seconds") or 0)
+            attacks.append(
+                IncomingAttack(
+                    movement_type=str(item.get("type") or "unknown"),
+                    seconds_remaining=secs,
+                    troop_count=int(item.get("count") or 0),
+                    arrival_ts=now + secs,
+                    attacker=str(item.get("attacker") or ""),
+                    label=str(item.get("label") or ""),
+                )
+            )
+        if attacks:
+            logger.info(
+                "Piazza d'Armi: %d movimenti in arrivo (%s)",
+                len(attacks),
+                ", ".join(
+                    f"{a.movement_type} in {a.seconds_remaining}s"
+                    for a in attacks
+                ),
+            )
+        return attacks
 
     async def _read_incoming_attacks(self) -> int:
         box = await _first_locator(self.page, selectors.TROOP_MOVEMENT_BOX)

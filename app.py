@@ -878,7 +878,7 @@ with tab_modules:
             for idx, vname in enumerate(mod_known):
                 vcfg = mod_acc.villages.get(vname, VillageConfig(name=vname))
                 with st.expander(f"Villaggio: {vname} (Ruolo: {vcfg.role})"):
-                    vc1, vc2 = st.columns(2)
+                    vc1, vc2, vc3 = st.columns(3)
                     with vc1:
                         st.checkbox(
                             "Usa Farm List automatica",
@@ -893,6 +893,14 @@ with tab_modules:
                             "Unità di truppa designate", unit_choices,
                             index=unit_choices.index(v_unit),
                             key=f"troop_type_{mod_acc.account_id}_{idx}",
+                        )
+                    with vc3:
+                        st.checkbox(
+                            "Reazione anti-attacco (Difesa)",
+                            value=getattr(vcfg, "defense_enabled", True),
+                            key=f"defense_active_{mod_acc.account_id}_{idx}",
+                            help="Se attivo, il villaggio attiva drain risorse "
+                                 "e fuga truppe in caso di attacco reale.",
                         )
 
             st.divider()
@@ -1078,8 +1086,77 @@ with tab_modules:
                     }[a],
                 )
 
+            st.divider()
+
+            # ---------------- DIFESA (Reazione agli attacchi) ----------------
+            # Guardia per oggetti Settings datati senza il campo defense
+            if not hasattr(mod_acc, "defense"):
+                from travian_agent.config import DefenseConfig
+                mod_acc.defense = DefenseConfig()
+            st.markdown("### 🚨 Difesa Intelligente (Reazione agli Attacchi)")
+            defense_enabled = st.toggle(
+                "Abilita Reazione Automatica agli Attacchi",
+                value=mod_acc.defense.enabled,
+                key="defense_toggle",
+                help="Monitora la Piazza d'Armi: sotto attacco reale svuota i "
+                     "magazzini (drain) ed evacua le truppe (dodge).",
+            )
+            d_col1, d_col2, d_col3 = st.columns(3)
+            with d_col1:
+                defense_panic = st.slider(
+                    "Soglia panico (sec all'impatto)",
+                    min_value=30, max_value=900, step=30,
+                    value=int(mod_acc.defense.panic_threshold_seconds),
+                    help="Sotto questo timer un attacco reale attiva "
+                         "drain + fuga. Default 180s.",
+                )
+                defense_fake = st.number_input(
+                    "Truppe max per classificare fake",
+                    min_value=1, max_value=50,
+                    value=int(mod_acc.defense.fake_troop_threshold),
+                    help="Movimenti con <= N truppe visibili vengono "
+                         "ignorati (es. esploratore singolo).",
+                )
+            with d_col2:
+                defense_margin = st.slider(
+                    "Margine fuga (sec prima dell'impatto)",
+                    min_value=5, max_value=300, step=5,
+                    value=int(mod_acc.defense.dodge_margin_seconds),
+                )
+                defense_recall = st.slider(
+                    "Rientro dopo impatto (sec)",
+                    min_value=30, max_value=900, step=30,
+                    value=int(mod_acc.defense.recall_delay_seconds),
+                )
+                defense_min_troops = st.number_input(
+                    "Truppe minime per la fuga",
+                    min_value=0, max_value=1000,
+                    value=int(mod_acc.defense.min_dodge_troops),
+                    help="Sotto questo totale la fuga non vale la pena.",
+                )
+            with d_col3:
+                defense_dodge = st.text_input(
+                    "Destinazione fuga (nome o x|y)",
+                    value=mod_acc.defense.dodge_target,
+                    key="defense_dodge_target",
+                    help="Vuoto = villaggio proprio più vicino. "
+                         "Esempi: 'Hipponion' oppure '-15|72'.",
+                )
+                defense_drain_mkt = st.toggle(
+                    "Spedisci surplus residuo via mercato",
+                    value=mod_acc.defense.drain_via_market,
+                    key="defense_drain_mkt",
+                    help="Dopo coda costruzioni/addestramento, invia il "
+                         "residuo al villaggio indicato sotto.",
+                )
+                defense_drain_target = st.text_input(
+                    "Villaggio sicuro per drain mercato",
+                    value=mod_acc.defense.drain_target_village,
+                    key="defense_drain_target",
+                )
+
             mod_saved = st.form_submit_button(
-                "💾 Salva Configurazione Farming, Espansione & AI Scout", type="primary"
+                "💾 Salva Configurazione Moduli", type="primary"
             )
 
         if mod_saved:
@@ -1099,6 +1176,12 @@ with tab_modules:
                     vcfg = VillageConfig(name=vname)
                 vcfg.farm_enabled = bool(
                     st.session_state[f"farm_active_{mod_acc.account_id}_{idx}"]
+                )
+                vcfg.defense_enabled = bool(
+                    st.session_state.get(
+                        f"defense_active_{mod_acc.account_id}_{idx}",
+                        getattr(vcfg, "defense_enabled", True),
+                    )
                 )
                 sel_unit = st.session_state[f"troop_type_{mod_acc.account_id}_{idx}"]
                 vcfg.farm_unit = "" if sel_unit == unit_choices[0] else sel_unit
@@ -1182,9 +1265,20 @@ with tab_modules:
             mod_acc.hero.min_health_to_adventure = int(hero_min_hp_sel)
             mod_acc.hero.attribute_focus = hero_attr_sel
 
+            # Difesa
+            mod_acc.defense.enabled = defense_enabled
+            mod_acc.defense.panic_threshold_seconds = int(defense_panic)
+            mod_acc.defense.fake_troop_threshold = int(defense_fake)
+            mod_acc.defense.dodge_margin_seconds = int(defense_margin)
+            mod_acc.defense.recall_delay_seconds = int(defense_recall)
+            mod_acc.defense.min_dodge_troops = int(defense_min_troops)
+            mod_acc.defense.dodge_target = defense_dodge.strip()
+            mod_acc.defense.drain_via_market = bool(defense_drain_mkt)
+            mod_acc.defense.drain_target_village = defense_drain_target.strip()
+
             save_accounts(accounts)
             st.success(
-                "Parametri di farming, espansione, AI Scout ed eroe aggiornati e salvati su "
+                "Parametri di farming, espansione, AI Scout, eroe e difesa aggiornati e salvati su "
                 "accounts.json! L'agente li applicherà al prossimo ciclo."
             )
             time.sleep(1)
@@ -1355,7 +1449,8 @@ with tab_accounts:
                     st.write(" ")
                     if st.button("🗑️ Rimuovi Account", key=f"del_{acc.account_id}"):
                         remaining = [a for a in accounts if a.account_id != acc.account_id]
-                        save_accounts(remaining)
+                        # Rimozione esplicita: consentito svuotare la lista
+                        save_accounts(remaining, allow_empty=True)
                         if acc.state_file and acc.state_file.exists():
                             acc.state_file.unlink(missing_ok=True)
                         st.toast(f"Account {acc.account_id} rimosso.")

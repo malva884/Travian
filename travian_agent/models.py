@@ -236,6 +236,45 @@ class ActionType(str, Enum):
 
 
 @dataclass
+class IncomingAttack:
+    """Un movimento di truppe ostile in arrivo, letto dalla Piazza d'Armi.
+
+    In T4.x la composizione nemica e' quasi sempre nascosta ('?'): il
+    conteggio truppe resta 0 (sconosciuto) e la classificazione fake
+    si basa sul tipo di movimento e su eventuali truppe leggibili.
+    """
+
+    movement_type: str = "attack"  # attack|raid|scout|reinforce|unknown
+    seconds_remaining: int = 0     # countdown all'impatto
+    troop_count: int = 0           # 0 = composizione nemica sconosciuta
+    arrival_ts: float = 0.0        # epoch previsto di impatto
+    attacker: str = ""             # nome attaccante/origine, se leggibile
+    label: str = ""                # testo grezzo della riga (debug)
+
+    def is_likely_fake(self, troop_threshold: int = 5) -> bool:
+        """True se l'allarme e' probabilmente un fake/basso rischio.
+
+        - rinforzi in arrivo: mai una minaccia;
+        - movimento riconosciuto come scouting;
+        - truppe visibili in numero esiguo (es. esploratore singolo).
+        Se la composizione e' sconosciuta (troop_count == 0) NON si puo'
+        escludere la minaccia: meglio trattare come reale.
+        """
+        if self.movement_type == "reinforce":
+            return True
+        if self.movement_type == "scout":
+            return True
+        if 0 < self.troop_count <= troop_threshold:
+            return True
+        return False
+
+    @property
+    def is_threat(self) -> bool:
+        """True se il movimento puo' essere ostile (attacco/raid/ignoto)."""
+        return self.movement_type in ("attack", "raid", "unknown")
+
+
+@dataclass
 class ScoutTarget:
     """Target di saccheggio rilevato dal radar mappa o storico report."""
 

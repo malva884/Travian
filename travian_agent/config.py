@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 try:
     from dotenv import load_dotenv
@@ -51,6 +55,7 @@ class VillageConfig:
     market_slot: int = 0            # slot dorf2 del Mercato (0 = auto-detect via gid=17)
     x: int | None = None            # coordinata X del villaggio
     y: int | None = None            # coordinata Y del villaggio
+    defense_enabled: bool = True    # include questo villaggio nella reazione anti-attacco
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:
@@ -120,6 +125,26 @@ class HeroConfig:
 
 
 @dataclass
+class DefenseConfig:
+    """Modulo difesa: reazione intelligente agli attacchi in arrivo.
+
+    Ciclo per villaggio: classificazione fake/reale -> resource drain
+    (coda costruzioni/addestramento massivo) -> troop dodging verso una
+    destinazione sicura -> rientro automatico dopo l'impatto.
+    """
+
+    enabled: bool = False
+    panic_threshold_seconds: int = 180   # sotto questo timer -> emergenza
+    fake_troop_threshold: int = 5        # <= N truppe visibili => fake
+    dodge_margin_seconds: int = 30       # esegui la fuga N sec prima dell'impatto
+    recall_delay_seconds: int = 120      # rientro N sec dopo l'impatto
+    min_dodge_troops: int = 10           # sotto questo totale non vale la fuga
+    drain_via_market: bool = False       # surplus residuo -> mercato verso alleato
+    drain_target_village: str = ""       # nome destinazione drain (vuoto = nessuna)
+    dodge_target: str = ""               # nome villaggio o "x|y" (vuoto = proprio piu' vicino)
+
+
+@dataclass
 class Settings:
     server_url: str
     username: str = ""
@@ -154,6 +179,7 @@ class Settings:
     expansion: ExpansionConfig = field(default_factory=ExpansionConfig)
     scout_brain: ScoutBrainConfig = field(default_factory=ScoutBrainConfig)
     hero: HeroConfig = field(default_factory=HeroConfig)
+    defense: DefenseConfig = field(default_factory=DefenseConfig)
 
     def __post_init__(self) -> None:
         if not self.account_id:
@@ -188,19 +214,18 @@ class Settings:
         return "standard"
 
 
-def load_accounts() -> list[Settings]:
-    """Carica la lista di tutti gli account configurati.
+def _read_accounts_json(path: Path) -> list | None:
+    """Legge e valida un file accounts.json; None se assente/corrotto."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else None
+    except Exception:  # noqa: BLE001
+        return None
 
-    Se accounts.json esiste, carica quelli; altrimenti ricade su .env.
-    """
-    if ACCOUNTS_FILE.exists():
-        try:
-            data = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, list) and data:
-                res = []
-                for item in data:
-                    res.append(
-                        Settings(
+
+def _parse_account_item(item: dict) -> Settings:
+    """Costruisce un Settings da una voce di accounts.json."""
+    return Settings(
                             account_id=item.get("account_id") or _slugify(item.get("server_url", "acc")),
                             server_url=item.get("server_url", "").rstrip("/"),
                             username=item.get("username", ""),
@@ -235,6 +260,13 @@ def load_accounts() -> list[Settings]:
                                     k: v
                                     for k, v in dict(item.get("hero_settings") or {}).items()
                                     if k in HeroConfig.__dataclass_fields__
+                                }
+                            ),
+                            defense=DefenseConfig(
+                                **{
+                                    k: v
+                                    for k, v in dict(item.get("defense_settings") or {}).items()
+                                    if k in DefenseConfig.__dataclass_fields__
                                 }
                             ),
                             expansion=ExpansionConfig(
@@ -279,6 +311,7 @@ def load_accounts() -> list[Settings]:
                                     building_focus=list(cfg.get("building_focus", [])),
                                     farm_enabled=bool(cfg.get("farm_enabled", True)),
                                     farm_unit=str(cfg.get("farm_unit", "")),
+                                    defense_enabled=bool(cfg.get("defense_enabled", True)),
                                     market_slot=int(cfg.get("market_slot", 0) or 0),
                                     x=int(cfg["x"]) if cfg.get("x") is not None else None,
                                     y=int(cfg["y"]) if cfg.get("y") is not None else None,
@@ -286,11 +319,41 @@ def load_accounts() -> list[Settings]:
                                 for key, cfg in (item.get("villages") or {}).items()
                                 if isinstance(cfg, dict)
                             },
-                        )
+    )
+
+
+def load_accounts() -> list[Settings]:
+    """Carica la lista di tutti gli account configurati.
+
+    Se accounts.json esiste, carica quelli; altrimenti ricade su .env.
+    Resiliente: file corrotto -> tenta il backup .bak; singola voce
+    malformata -> la salta con un warning, senza perdere le altre.
+    """
+    if ACCOUNTS_FILE.exists():
+        data = _read_accounts_json(ACCOUNTS_FILE)
+        if data is None:
+            bak = ACCOUNTS_FILE.with_name(ACCOUNTS_FILE.name + ".bak")
+            data = _read_accounts_json(bak)
+            if data is not None:
+                logger.warning(
+                    "%s corrotto/illeggibile: lista account recuperata dal backup %s",
+                    ACCOUNTS_FILE.name, bak.name,
+                )
+        if data:
+            res: list[Settings] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    res.append(_parse_account_item(item))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Voce account ignorata in accounts.json (%s): %s",
+                        item.get("account_id", "?"),
+                        exc,
                     )
+            if res:
                 return res
-        except Exception:
-            pass
 
     # Fallback su .env
     try:
@@ -300,8 +363,23 @@ def load_accounts() -> list[Settings]:
         return []
 
 
-def save_accounts(accounts: list[Settings]) -> None:
-    """Salva la lista di account in accounts.json."""
+def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
+    """Salva la lista di account in accounts.json.
+
+    Guardia anti-perdita: una lista vuota non sovrascrive mai un file
+    gia' popolato salvo `allow_empty=True` (rimozione esplicita dell'ultimo
+    account). Evita che un load fallito (es. fallback .env vuoto o
+    parsing parziale) azzeri la configurazione.
+    """
+    if not accounts and not allow_empty:
+        existing = _read_accounts_json(ACCOUNTS_FILE)
+        if existing:
+            logger.warning(
+                "save_accounts: rifiutato il salvataggio di una lista vuota "
+                "su %s popolato (%d account preservati)",
+                ACCOUNTS_FILE.name, len(existing),
+            )
+            return
     data = []
     for acc in accounts:
         data.append({
@@ -344,6 +422,17 @@ def save_accounts(accounts: list[Settings]) -> None:
                 "min_health_to_adventure": acc.hero.min_health_to_adventure,
                 "attribute_focus": acc.hero.attribute_focus,
             },
+            "defense_settings": {
+                "enabled": acc.defense.enabled,
+                "panic_threshold_seconds": acc.defense.panic_threshold_seconds,
+                "fake_troop_threshold": acc.defense.fake_troop_threshold,
+                "dodge_margin_seconds": acc.defense.dodge_margin_seconds,
+                "recall_delay_seconds": acc.defense.recall_delay_seconds,
+                "min_dodge_troops": acc.defense.min_dodge_troops,
+                "drain_via_market": acc.defense.drain_via_market,
+                "drain_target_village": acc.defense.drain_target_village,
+                "dodge_target": acc.defense.dodge_target,
+            },
             "expansion_settings": {
                 "auto_expand": acc.expansion.auto_expand,
                 "founder_village": acc.expansion.founder_village,
@@ -368,6 +457,7 @@ def save_accounts(accounts: list[Settings]) -> None:
                     "building_focus": list(cfg.building_focus),
                     "farm_enabled": cfg.farm_enabled,
                     "farm_unit": cfg.farm_unit,
+                    "defense_enabled": cfg.defense_enabled,
                     "market_slot": int(cfg.market_slot or 0),
                     "x": cfg.x,
                     "y": cfg.y,
@@ -376,7 +466,22 @@ def save_accounts(accounts: list[Settings]) -> None:
             },
         })
     ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ACCOUNTS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+
+    # Scrittura atomica: tmp + rename; backup del file precedente in .bak
+    # (un kill a meta' scrittura lasciava un JSON troncato e gli account
+    # sparivano al load successivo, silenziosamente rimpiazzati dal .env)
+    tmp_path = ACCOUNTS_FILE.with_name(ACCOUNTS_FILE.name + ".tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    if ACCOUNTS_FILE.exists():
+        try:
+            shutil.copy2(
+                ACCOUNTS_FILE,
+                ACCOUNTS_FILE.with_name(ACCOUNTS_FILE.name + ".bak"),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    os.replace(tmp_path, ACCOUNTS_FILE)
 
 
 def get_raw_env(env_path: str | Path | None = None) -> dict[str, str]:

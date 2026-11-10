@@ -68,8 +68,18 @@ _JS_MARKET_QTY_INPUTS = """
                 !!Array.from(scope.querySelectorAll('select')).find(isVillageSelect);
             if (hasTarget) return scope;
         }
-        // Fallback di ultima istanza: restituisce il body se contiene input risorsa e target
-        return document.body;
+        // Fallback di ultima istanza: ancora al form/contenitore che ospita
+        // un input risorse (lumber/r1...). MAI document.body: i selettori
+        // "scoped" cercherebbero in tutta la pagina e il campo nome
+        // destinazione potrebbe agganciare l'input di rinomina villaggio.
+        const resInp = document.querySelector(
+            'input[name="lumber"], input[name="r1"], input#r1, ' +
+            'input[name="clay"], input[name="r2"], input#r2'
+        );
+        if (resInp) {
+            return resInp.closest('form') || resInp.parentElement || null;
+        }
+        return null;
     };
     const findQtyInputs = () => {
         const scope = findSendForm();
@@ -659,11 +669,33 @@ class ActionExecutor:
             logger.debug("Dump HTML mercato fallito: %s", exc)
 
     async def _select_send_resources_tab(self, page) -> bool:
-        """Clicca sul tab 'Invia risorse' (secondo tab) nel mercato se non e' gia' attivo."""
+        """Clicca sul tab 'Invia risorse' (secondo tab, t=5) nel mercato se non e' gia' attivo."""
+        # Se siamo già sulla scheda t=5, la consideriamo già aperta
+        current_url = page.url or ""
+        if "t=5" in current_url:
+            return True
+
+        # 1. Prova prima con selettori specifici per la scheda send (t=5, ecc.)
+        for sel in selectors.MARKET_TAB_SEND:
+            try:
+                tab_loc = page.locator(sel).first
+                if await tab_loc.count() > 0 and await tab_loc.is_visible():
+                    await tab_loc.click(timeout=1500)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+
+        # 2. Fallback JS avanzato (ricerca per href 't=5', per testo, o per posizione)
         try:
             clicked = await page.evaluate(
                 """
                 () => {
+                    const linkT5 = document.querySelector('a[href*="t=5"]');
+                    if (linkT5) {
+                        linkT5.click();
+                        return true;
+                    }
+
                     const tabs = Array.from(document.querySelectorAll(
                         '.tabItem, .container.tabItem, a, button, div, .tab, div[class*="tab"]'
                     ));
@@ -676,7 +708,6 @@ class ActionExecutor:
                         return needles.some(n => text === n || text.includes(n));
                     });
                     if (sendTab) {
-                        // Gia' attivo: non serve ricliccare ma segnala successo
                         if (/active|selected|current/i.test(sendTab.className || '') ||
                             sendTab.getAttribute('aria-selected') === 'true') {
                             return true;
@@ -838,6 +869,17 @@ class ActionExecutor:
                                 return [parseInt(m[1], 10), parseInt(m[2], 10)];
                             }
 
+                            // B2) Link mappa karte.php?x=..&y=.. dentro l'entry
+                            const karteLink = entry.querySelector('a[href*="karte.php"]');
+                            if (karteLink) {
+                                const kh = karteLink.href || karteLink.getAttribute('href') || '';
+                                const kx = kh.match(/[?&]x=([-+]?\\d+)/);
+                                const ky = kh.match(/[?&]y=([-+]?\\d+)/);
+                                if (kx && ky) {
+                                    return [parseInt(kx[1], 10), parseInt(ky[1], 10)];
+                                }
+                            }
+
                             // C) Controlla attributi data (data-x, data-y)
                             const dataX = entry.getAttribute('data-x');
                             const dataY = entry.getAttribute('data-y');
@@ -891,13 +933,36 @@ class ActionExecutor:
         page = self.browser.page
         assert page is not None
 
-        # 1. Naviga all'URL del mercato associato tramite lo slot configurato
-        build_url = f"{selectors.PATH_BUILD}?id={market_slot}&gid=17"
+        # Risoluzione preventiva coordinate target (se passate in params o da configurazione)
+        tx = params.get("target_x")
+        ty = params.get("target_y")
+        if tx is None or ty is None:
+            try:
+                t_cfg = self.settings.village_config_for(str(target))
+                if t_cfg and t_cfg.x is not None and t_cfg.y is not None:
+                    tx, ty = t_cfg.x, t_cfg.y
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 1. Naviga all'URL del mercato associato (t=5 = Invia risorse; con x e y precompila nativamente)
+        build_url = f"{selectors.PATH_BUILD}?id={market_slot}&gid=17&t=5"
+        if tx is not None and ty is not None:
+            build_url += f"&x={tx}&y={ty}"
         if village_id > 0:
             build_url += f"&newdid={village_id}"
 
         await self.browser.goto(build_url)
         await sleep_human(1.0, 1.5)
+
+        # Identita' del mittente per i log (nome + coordinate se note)
+        sender_name = await self._active_village_name(page) or f"newdid {village_id}"
+        sender_coords = ""
+        try:
+            s_cfg = self.settings.village_config_for(village_id=village_id)
+            if s_cfg and s_cfg.x is not None and s_cfg.y is not None:
+                sender_coords = f"({s_cfg.x}|{s_cfg.y})"
+        except Exception:  # noqa: BLE001
+            pass
 
         # Verifica preventiva presenza edificio mercato
         is_market_valid = await page.evaluate("""
@@ -1039,6 +1104,16 @@ class ActionExecutor:
             try:
                 if await locator.count() == 0 or await locator.is_disabled():
                     continue
+                # Mai compilare input dentro header/sidebar/liste villaggi:
+                # ospitano il campo di rinomina del villaggio attivo.
+                in_bad_container = await locator.evaluate(
+                    "el => !!el.closest("
+                    "'#sidebarBoxVillagelist, #sidebarBoxVillageList, "
+                    ".villageList, .sidebar, header, .topBar, "
+                    ".topNavigation, #villageNameField, .villageName')"
+                )
+                if in_bad_container:
+                    continue
                 name_attr = (await locator.get_attribute("name") or "").lower()
                 if "dname" in name_attr or "rename" in name_attr:
                     continue
@@ -1112,6 +1187,44 @@ class ActionExecutor:
         if "build.php" not in (page.url or ""):
             return ActionResult(False, "selezione destinazione uscita dal mercato - invio annullato")
 
+        # Guard antironima: se il fill del target ha alterato un campo di
+        # rinomina fuori dal form mercato (header/sidebar/topbar), ripristina
+        # il valore originale prima che l'autosave lo confermi.
+        if village_name_before:
+            try:
+                renamed_fields = await page.evaluate(
+                    """
+                    (expected) => {
+                        const fields = document.querySelectorAll(
+                            '#sidebarBoxVillagelist input, #sidebarBoxVillageList input, ' +
+                            '.villageList input, .sidebar input, header input, ' +
+                            '.topBar input, .topNavigation input, #villageNameField, ' +
+                            '.villageName input'
+                        );
+                        const changed = [];
+                        for (const el of fields) {
+                            const t = (el.type || 'text').toLowerCase();
+                            if (t !== 'text' && t !== 'search' && t !== '') continue;
+                            if (el.value && el.value.trim() !== expected.trim()) {
+                                el.value = expected;
+                                el.dispatchEvent(new Event('input', {bubbles: true}));
+                                el.dispatchEvent(new Event('change', {bubbles: true}));
+                                changed.push(el.name || el.id || '?');
+                            }
+                        }
+                        return changed;
+                    }
+                    """,
+                    village_name_before,
+                )
+                if renamed_fields:
+                    logger.error(
+                        "Campi rinomina villaggio alterati dal fill mercato: %s - valori ripristinati",
+                        renamed_fields,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
         # 4. INSERIMENTO RISORSE CAPPED (Calcolo capienza mercanti e popolamento r1-r4)
         capped_resources = await self._calculate_capped_resources(page, resources_dict)
         if not capped_resources or sum(int(v or 0) for v in capped_resources.values()) <= 0:
@@ -1125,8 +1238,10 @@ class ActionExecutor:
             amount = int(capped_resources.get(rtype, 0) or 0)
             if amount <= 0:
                 continue
-            for sel in sel_list:
-                field = page.locator(f"{send_scope} {sel}").first
+            # Prova prima con selettori scoped al form, poi a livello di pagina
+            candidate_selectors = [f"{send_scope} {s}" for s in sel_list] + sel_list
+            for sel in candidate_selectors:
+                field = page.locator(sel).first
                 try:
                     if await field.count() == 0 or await field.is_disabled():
                         continue
@@ -1137,23 +1252,38 @@ class ActionExecutor:
                     continue
 
         if filled == 0:
-            filled = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
+            filled = await page.evaluate("""
                 (res) => {
-                    const form = findSendForm();
-                    if (!form) return 0;
                     let cnt = 0;
-                    const map = { wood: 1, clay: 2, iron: 3, crop: 4 };
+                    const map = { wood: 'lumber', clay: 'clay', iron: 'iron', crop: 'crop' };
+                    const mapIdx = { wood: 1, clay: 2, iron: 3, crop: 4 };
                     for (const [k, v] of Object.entries(res)) {
                         const num = parseInt(v, 10);
                         if (!num || num <= 0) continue;
-                        const idx = map[k];
-                        const inp = form.querySelector(
-                            `#r${idx}, input[name="r${idx}"], input[name="m2[${idx}]"], #m2_${idx}`
-                        );
+                        const resName = map[k];
+                        const idx = mapIdx[k];
+                        const selectors = [
+                            `input[name="${resName}"]`,
+                            `input#${resName}`,
+                            `#r${idx}`,
+                            `input[name="r${idx}"]`,
+                            `input#r${idx}`,
+                            `input[name="m2[${idx}]"]`,
+                            `#m2_${idx}`,
+                            `input[id*="r${idx}"]`,
+                            `input[name*="r${idx}"]`
+                        ];
+                        let inp = null;
+                        for (const s of selectors) {
+                            inp = document.querySelector(s);
+                            if (inp && !inp.disabled) break;
+                        }
                         if (inp && !inp.disabled) {
+                            inp.focus();
                             inp.value = num;
                             inp.dispatchEvent(new Event('input', { bubbles: true }));
                             inp.dispatchEvent(new Event('change', { bubbles: true }));
+                            inp.dispatchEvent(new Event('blur', { bubbles: true }));
                             cnt++;
                         }
                     }
@@ -1162,13 +1292,45 @@ class ActionExecutor:
             """, capped_resources)
 
         if filled == 0:
-            return ActionResult(False, "form di invio mercato non trovato o campi non compilabili")
+            # Dump diagnostico del DOM per capire perche' gli input non si compilano
+            dump_note = ""
+            try:
+                dbg_dir = getattr(self.settings, "debug_dir", None)
+                if dbg_dir:
+                    dbg_dir.mkdir(parents=True, exist_ok=True)
+                    dump_path = dbg_dir / "market_form_dump.html"
+                    dump_path.write_text(await page.content(), encoding="utf-8")
+                    dump_note = f" (dump DOM: {dump_path})"
+            except Exception:  # noqa: BLE001
+                pass
+            return ActionResult(
+                False,
+                f"form di invio mercato non trovato o campi non compilabili "
+                f"(mittente '{sender_name}' -> '{target}' ({tx}|{ty})){dump_note}",
+            )
 
         await sleep_human(self.settings.action_delay_min, self.settings.action_delay_max)
 
         # 5. CONFERMA FINALE: Clic sul pulsante verde "Invia risorse" in fondo alla sezione
-        send_buttons = [f"{send_scope} {s}" for s in selectors.MARKET_SEND_BUTTON]
-        if not await self._click_first(page, send_buttons):
+        send_buttons = [f"{send_scope} {s}" for s in selectors.MARKET_SEND_BUTTON] + selectors.MARKET_SEND_BUTTON
+        clicked_send = await self._click_first(page, send_buttons)
+        if not clicked_send:
+            # Fallback JavaScript mirato al pulsante con testo 'Invia risorse' o 'Send resources'
+            clicked_send = await page.evaluate("""
+                () => {
+                    const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                    const btn = buttons.find(b => {
+                        const t = ((b.innerText || b.value || '')).trim().toLowerCase();
+                        return t.includes('invia risorse') || t.includes('send resources');
+                    });
+                    if (btn && !btn.disabled) {
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                }
+            """)
+        if not clicked_send:
             return ActionResult(False, "pulsante di invio mercato non trovato")
         await sleep_human(1.0, 2.0)
 
@@ -1323,6 +1485,8 @@ class ActionExecutor:
         """
         params = action.params or {}
         rally_slot = params.get("rally_slot")
+        # Tipo movimento: 4=saccheggio (default), 2=rinforzo (dodge), 3=attacco
+        move_type = str(params.get("move_type") or "4")
         raw_targets = params.get("targets") or []
         if not raw_targets and "x" in params and "y" in params:
             raw_targets = [params]
@@ -1357,7 +1521,7 @@ class ActionExecutor:
                 fill_res = await page.evaluate(
                     """
                     (payload) => {
-                        const { x, y, troops } = payload;
+                        const { x, y, troops, moveType } = payload;
 
                         // Coordinate X / Y
                         const xIn = document.querySelector('input[name="x"], input#xCoordInput, #xCoord');
@@ -1365,9 +1529,11 @@ class ActionExecutor:
                         if (xIn) { xIn.value = String(x); xIn.dispatchEvent(new Event('input', {bubbles: true})); }
                         if (yIn) { yIn.value = String(y); yIn.dispatchEvent(new Event('input', {bubbles: true})); }
 
-                        // Radiobutton tipo attacco: 4 = Saccheggio (Raid), 3 = Attacco normale
+                        // Radiobutton tipo movimento: 2=Rinforzo, 3=Attacco, 4=Saccheggio
                         const raidRadio = document.querySelector(
-                            'input[type="radio"][value="4"], input[name="c"][value="4"], label:has(input[value="4"]) input'
+                            `input[type="radio"][value="${moveType}"], ` +
+                            `input[name="c"][value="${moveType}"], ` +
+                            `label:has(input[value="${moveType}"]) input`
                         );
                         if (raidRadio) {
                             raidRadio.checked = true;
@@ -1392,7 +1558,7 @@ class ActionExecutor:
                         return { ok: !!(xIn && yIn && filledAny) };
                     }
                     """,
-                    {"x": tx, "y": ty, "troops": troops},
+                    {"x": tx, "y": ty, "troops": troops, "moveType": move_type},
                 )
 
                 if not fill_res or not fill_res.get("ok"):
@@ -2072,3 +2238,118 @@ class ActionExecutor:
                 except Exception:  # noqa: BLE001
                     continue
         return False
+
+    # ------------------------------------------------------------------
+    # Task giornaliere / questmaster: riscossione premi per villaggio
+    # ------------------------------------------------------------------
+    async def claim_village_tasks(
+        self, village_id: int = 0, village_name: str = ""
+    ) -> int:
+        """Apre il pannello task del villaggio attivo e riscuote i premi.
+
+        Flusso T4.x:
+        1. click sull'icona questmaster (#questmasterButton) se presente;
+        2. click ripetuto su ogni pulsante 'Riscuoti'/'Claim reward'
+           (i premi possono sbloccare task a catena);
+        3. fallback sulla pagina dedicata questmaster.php se il dialog
+           non si apre o non mostra premi;
+        4. chiusura del dialog.
+
+        Ritorna il numero di premi effettivamente riscossi.
+        """
+        if village_id > 0:
+            await self._ensure_village(village_id)
+
+        page = self.browser.page
+        assert page is not None
+
+        claimed = 0
+
+        # 1. Apri il widget task (icona questmaster), se il server la espone
+        opened = await self._click_first(
+            page, selectors.QUEST_MASTER_BUTTON, timeout_ms=2000
+        )
+        if opened:
+            await sleep_human(1.0, 1.8)
+
+        # 2. Riscossione: i pulsanti si rigenerano dopo ogni premio,
+        #    quindi si clicca uno alla volta finche' ce ne sono
+        for _ in range(8):
+            n = await self._claim_task_buttons(page)
+            if n == 0:
+                break
+            claimed += n
+            await sleep_human(0.5, 0.9)
+
+        # 3. Fallback: pagina dedicata questmaster.php (versioni senza overlay)
+        if claimed == 0 and not opened:
+            try:
+                await self.browser.goto(selectors.PATH_QUESTMASTER)
+                await sleep_human(0.8, 1.2)
+                for _ in range(6):
+                    n = await self._claim_task_buttons(page)
+                    if n == 0:
+                        break
+                    claimed += n
+                    await sleep_human(0.5, 0.9)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 4. Chiudi l'eventuale dialog rimasto aperto
+        if opened:
+            await self._click_first(
+                page, selectors.QUEST_DIALOG_CLOSE, timeout_ms=1200
+            )
+            await sleep_human(0.3, 0.6)
+
+        if claimed:
+            logger.info(
+                "Task villaggio '%s': %d premi riscossi",
+                village_name or village_id or "attivo",
+                claimed,
+            )
+        else:
+            logger.info(
+                "Task villaggio '%s': check eseguito, nessun premio da riscuotere",
+                village_name or village_id or "attivo",
+            )
+        return claimed
+
+    async def _claim_task_buttons(self, page) -> int:
+        """Clicca i pulsanti 'Riscuoti'/'Claim reward' attualmente visibili.
+
+        Il DOM viene ricaricato dopo ogni riscossione, quindi il metodo
+        clicca un solo pulsante per valutazione e va richiamato in loop.
+        """
+        clicked = 0
+        for _ in range(3):
+            hit = await page.evaluate(
+                """
+                () => {
+                    const claimRx = /^(riscuoti|claim reward|claim|collect reward|collect|récupérer|belohnung abholen)/i;
+                    const skipRx = /(chiudi|close|cancel|annulla|abbrechen)/i;
+                    const candidates = Array.from(document.querySelectorAll(
+                        '#dialogContent button, #dialogContent a, ' +
+                        '#dialogContent input[type="submit"], ' +
+                        '.quest button, .quest a, .task button, .task a, ' +
+                        '#content button, #content a, ' +
+                        'button, input[type="submit"], a'
+                    ));
+                    for (const el of candidates) {
+                        const text = (el.innerText || el.value || el.textContent || '').trim();
+                        if (!text || !claimRx.test(text) || skipRx.test(text)) continue;
+                        const cls = (el.className || '').toLowerCase();
+                        if (el.disabled || cls.includes('disabled') || cls.includes('inactive')) continue;
+                        if (el.offsetParent === null && el.offsetWidth === 0) continue;
+                        el.click();
+                        return true;
+                    }
+                    return false;
+                }
+                """
+            )
+            if not hit:
+                break
+            clicked += 1
+            await sleep_human(0.5, 0.9)
+        return clicked

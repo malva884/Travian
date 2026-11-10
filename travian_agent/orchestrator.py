@@ -16,6 +16,7 @@ from .ai_scout_brain import AIScoutBrain, assess_account_power
 from .brain import LLMBrain, RuleBasedBrain
 from .browser import TravianBrowser
 from .config import BASE_DIR, Settings, load_accounts
+from .defense import DefenseManager
 from .expansion import ExpansionManager, feeder_surplus, find_market
 from .farming import FarmingManager, find_rally_point
 from .hero import HeroManager
@@ -31,6 +32,7 @@ _farming_managers: dict[str, FarmingManager] = {}
 _expansion_managers: dict[str, ExpansionManager] = {}
 _scout_brains: dict[str, AIScoutBrain] = {}
 _hero_managers: dict[str, HeroManager] = {}
+_defense_managers: dict[str, DefenseManager] = {}
 
 
 def _append_history(account_id: str, state: GameState, action: Action) -> None:
@@ -86,6 +88,7 @@ async def monitor_all_villages(
     expansion_mgr: ExpansionManager | None = None,
     scout_brain: AIScoutBrain | None = None,
     hero_mgr: HeroManager | None = None,
+    defense_mgr: DefenseManager | None = None,
 ) -> None:
     """Ciclo di controllo multi-villaggio per l'account corrente.
 
@@ -193,6 +196,21 @@ async def monitor_all_villages(
                 logger.warning("%s Villaggio '%s' privo di URL newdid, impossibile navigare.", prefix, vname)
                 continue  # senza URL non si può cambiare villaggio
 
+            # 2.5 Riscossione task/premi del villaggio: i premi sono
+            # localizzati per insediamento, quindi va fatto in questo
+            # contesto prima delle routine economiche/militari.
+            try:
+                claimed = await executor.claim_village_tasks(
+                    village_id=village.village_id, village_name=vname
+                )
+                if claimed:
+                    logger.info(
+                        "%s Task completate: %d premi riscattati con successo.",
+                        vprefix, claimed,
+                    )
+            except Exception as t_exc:
+                logger.debug("%s Check task fallito (non bloccante): %s", vprefix, t_exc)
+
             # Assicura di essere sul dorf1 per leggere i campi e la coda correttamente
             if selectors.PATH_DORF1 not in (browser.page.url or ""):
                 await browser.goto(selectors.PATH_DORF1)
@@ -235,6 +253,30 @@ async def monitor_all_villages(
                 len(state.build_queue),
                 state.incoming_attacks,
             )
+
+            # 3.5 Modulo difesa: reazione agli attacchi in arrivo
+            #     (priorita' sulle azioni ordinarie del brain)
+            if defense_mgr is not None and settings.defense.enabled:
+                rally_def = find_rally_point(state.interior_fields())
+                market_def = find_market(state.interior_fields())
+                try:
+                    await defense_mgr.handle_village(
+                        browser=browser,
+                        observer=observer,
+                        executor=executor,
+                        settings=settings,
+                        village=village,
+                        state=state,
+                        villages=villages,
+                        rally_slot=rally_def.slot_id if rally_def else 0,
+                        market_slot=market_def.slot_id if market_def else 0,
+                        prefix=vprefix,
+                    )
+                except Exception as d_exc:
+                    logger.warning(
+                        "%s Errore modulo difesa (non bloccante): %s",
+                        vprefix, d_exc,
+                    )
 
             # 4. Il brain decide e l'esecutore agisce (con validazione newdid)
             if last_states is not None and state.village_name:
@@ -454,6 +496,7 @@ async def run_single_account_loop(
                             settings.expansion = fresh_acc.expansion
                             settings.scout_brain = fresh_acc.scout_brain
                             settings.hero = fresh_acc.hero
+                            settings.defense = fresh_acc.defense
                             break
                 except Exception as hr_err:
                     logger.debug("%s Errore hot-reload config: %s", prefix, hr_err)
@@ -512,6 +555,10 @@ async def run_single_account_loop(
                     _hero_managers[settings.account_id] = HeroManager(
                         settings.account_id
                     )
+                if settings.account_id not in _defense_managers:
+                    _defense_managers[settings.account_id] = DefenseManager(
+                        settings.account_id
+                    )
                 await monitor_all_villages(
                     browser=browser,
                     observer=observer,
@@ -524,6 +571,7 @@ async def run_single_account_loop(
                     expansion_mgr=_expansion_managers[settings.account_id],
                     scout_brain=_scout_brains[settings.account_id],
                     hero_mgr=_hero_managers[settings.account_id],
+                    defense_mgr=_defense_managers[settings.account_id],
                 )
 
                 # Reset del conteggio errori e ripristino al completamento con successo
