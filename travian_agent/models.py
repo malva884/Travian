@@ -74,17 +74,44 @@ class VillageRole(str, Enum):
             return cls.STANDARD
 
 
-# Nomi unita' delle tre tribu' (t1-t10 Romani, t11-t20 Teutoni, t21-t30 Galli)
+# Nomi unità delle tre tribù (t1-t10 Romani, t11-t20 Teutoni, t21-t30 Galli)
+# Nomi ufficiali delle unità delle tre tribù in italiano (t1-t10 Romani, t11-t20 Teutoni, t21-t30 Galli)
 STATIC_TROOP_LABELS: dict[str, str] = {
-    "t1": "Legionario", "t2": "Pretoriano", "t3": "Imperiano",
-    "t4": "Emissario a cavallo", "t5": "Equites Imperatoris", "t6": "Equites Caesaris",
-    "t7": "Ariete", "t8": "Catapulta da fuoco", "t9": "Senatore", "t10": "Colono",
-    "t11": "Combattente", "t12": "Alabardiere", "t13": "Guerriero con ascia",
-    "t14": "Esploratore", "t15": "Paladino", "t16": "Cavaliere Teutonico",
-    "t17": "Ariete", "t18": "Catapulta", "t19": "Comandante", "t20": "Colono",
-    "t21": "Falange", "t22": "Spadaccino", "t23": "Esploratore",
-    "t24": "Fulmine di Teutates", "t25": "Cavaliere Druido", "t26": "Haeduan",
-    "t27": "Ariete", "t28": "Trabucco", "t29": "Capotribù", "t30": "Colono",
+    # --- ROMANI (t1 - t10) ---
+    "t1": "Legionario",
+    "t2": "Pretoriano",
+    "t3": "Imperiano",
+    "t4": "Equites Legatus",
+    "t5": "Equites Imperatoris",
+    "t6": "Equites Caesaris",
+    "t7": "Ariete",
+    "t8": "Catapulta da fuoco",
+    "t9": "Senatore",
+    "t10": "Colono",
+
+    # --- TEUTONI (t11 - t20) ---
+    "t11": "Mazziere",
+    "t12": "Lanciere",
+    "t13": "Guerriero con l'ascia",
+    "t14": "Spia",
+    "t15": "Paladino",
+    "t16": "Cavaliere Teutonico",
+    "t17": "Ariete",
+    "t18": "Catapulta",
+    "t19": "Capotribù",
+    "t20": "Colono",
+
+    # --- GALLI (t21 - t30) ---
+    "t21": "Falange",
+    "t22": "Spadaccino",
+    "t23": "Tracciatore",
+    "t24": "Fulmine di Teutates",
+    "t25": "Cavaliere Druido",
+    "t26": "Eduano",
+    "t27": "Ariete",
+    "t28": "Trabucco",
+    "t29": "Comandante",
+    "t30": "Colono",
 }
 
 
