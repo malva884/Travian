@@ -85,6 +85,30 @@ con suggerimento di rilanciare `--login`.
 .\.venv\Scripts\python.exe main.py --dump --once --headed
 ```
 
+## Deploy su Coolify (Docker)
+
+Il repository include un `Dockerfile` pronto per Coolify (build "Dockerfile" nativo):
+
+- **Tipo di risorsa**: Application → Build pack `Dockerfile`, porta esposta `8501`.
+- **Storage persistente**: monta un volume su `/app/state`
+  (contiene `accounts.json`, sessioni `session_*.json`, storico, PID e `agent.log`).
+  Senza volume, configurazione e sessioni vengono perse a ogni redeploy.
+- **Variabili d'ambiente** (Environment → Coolify): `TRAVIAN_SERVER_URL`,
+  `TRAVIAN_USERNAME`, `TRAVIAN_PASSWORD`, `HEADLESS=true` ecc.
+  (equivalenti a `.env`; servono solo come fallback se `accounts.json` non esiste).
+- **Risorse consigliate**: almeno 1 GB di RAM (Chromium headless).
+
+### Login manuale sul server
+
+Il login assistito (`main.py --login`) apre una finestra del browser: su un
+server headless non c'e' display, quindi la procedura consigliata e':
+
+1. Esegui `python main.py --login --account <id>` **in locale** per generare
+   `state/session_<id>.json`.
+2. Copia il file dentro il volume `/app/state` su Coolify
+   (pulsante "Terminal/File Manager" della risorsa, oppure `docker cp`).
+3. Al prossimo avvio l'agente riutilizza la sessione salvata.
+
 ## Note
 
 - **Selettori fragili**: il markup di Travian cambia tra versioni e server.

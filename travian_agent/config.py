@@ -15,7 +15,17 @@ except ImportError:
         return None
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-ACCOUNTS_FILE = BASE_DIR / "accounts.json"
+
+# Percorso di accounts.json:
+# 1. override esplicito via env ACCOUNTS_FILE (es. deploy personalizzati)
+# 2. root del progetto, se il file esiste gia' (back-compat setup locale)
+# 3. state/accounts.json (default: state/ e' il volume persistente su Docker/Coolify)
+if os.getenv("ACCOUNTS_FILE"):
+    ACCOUNTS_FILE = Path(os.environ["ACCOUNTS_FILE"])
+elif (BASE_DIR / "accounts.json").exists():
+    ACCOUNTS_FILE = BASE_DIR / "accounts.json"
+else:
+    ACCOUNTS_FILE = BASE_DIR / "state" / "accounts.json"
 
 
 def _slugify(text: str) -> str:
@@ -346,6 +356,7 @@ def save_accounts(accounts: list[Settings]) -> None:
                 for key, cfg in acc.villages.items()
             },
         })
+    ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     ACCOUNTS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 

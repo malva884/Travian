@@ -1,0 +1,20 @@
+.git
+.idea
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+pytest-cache-files-*/
+
+# Segreti e stato locale: NON vanno nell'immagine
+.env
+accounts.json
+agent.log
+state/
+debug/
+
+# File non necessari al runtime
+tests/
+*.bat
+Dockerfile
+.dockerignore

@@ -33,7 +33,9 @@ st.set_page_config(
 
 STATE_DIR = BASE_DIR / "state"
 DEBUG_DIR = BASE_DIR / "debug"
-LOG_FILE = BASE_DIR / "agent.log"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = STATE_DIR / "agent.log"
 PYTHON_EXE = sys.executable
 
 if "agent_process" not in st.session_state:
