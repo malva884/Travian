@@ -659,7 +659,7 @@ class ActionExecutor:
             logger.debug("Dump HTML mercato fallito: %s", exc)
 
     async def _select_send_resources_tab(self, page) -> bool:
-        """Clicca sul tab 'Invia risorse' nel mercato se non e' gia' attivo."""
+        """Clicca sul tab 'Invia risorse' (secondo tab) nel mercato se non e' gia' attivo."""
         try:
             clicked = await page.evaluate(
                 """
@@ -676,19 +676,24 @@ class ActionExecutor:
                         return needles.some(n => text === n || text.includes(n));
                     });
                     if (sendTab) {
-                        // Gia' attivo: nessun click necessario
-                        if (/active|selected|current/i.test(sendTab.className || '')) {
-                            return 'already';
+                        // Gia' attivo: non serve ricliccare ma segnala successo
+                        if (/active|selected|current/i.test(sendTab.className || '') ||
+                            sendTab.getAttribute('aria-selected') === 'true') {
+                            return true;
                         }
                         sendTab.click();
-                        return 'clicked';
+                        return true;
                     }
-                    // Fallback posizionale: secondo tab della barra mercato
+                    // Fallback posizionale: secondo tab della barra mercato (Invia risorse)
                     const altTab = document.querySelector(
-                        '.tabItem:nth-child(2), .tabItem.normal:nth-child(2)'
+                        '.tabItem:nth-child(2), .tabItem.normal:nth-child(2), ' +
+                        '.contentNavi .tabItem:nth-child(2), nav.tabItem:nth-child(2)'
                     );
-                    if (altTab) { altTab.click(); return 'fallback'; }
-                    return null;
+                    if (altTab) {
+                        altTab.click();
+                        return true;
+                    }
+                    return false;
                 }
                 """
             )
@@ -766,22 +771,27 @@ class ActionExecutor:
         return capped
 
     async def _send_resources(self, action: Action, village_id: int = 0) -> ActionResult:
-        """Invia l'eccedenza ad un altro villaggio tramite il Mercato.
+        """Invia risorse tramite il Mercato secondo la sequenza obbligatoria.
 
-        Flusso T4.x: build.php?id=<mercato>&gid=17 -> click tab 'Invia risorse' -> autocomplete target
-        + quantità r1-r4 -> submit -> conferma.
+        Sequenza:
+        1. Navigazione all'edificio (build.php?id=<market_slot>&gid=17)
+        2. Selezione del tab 'Invia risorse' (secondo tab, icona frecce di scambio)
+        3. Calcolo capienza mercanti e ridimensionamento carichi (capped_resources)
+        4. Compilazione coordinate / destinazione (nome villaggio target o X/Y)
+        5. Inserimento risorse capped (r1, r2, r3, r4)
+        6. Conferma finale dell'ordine
         """
         params = action.params or {}
-        market_slot = params.get("market_slot")
-        target = params.get("target")
-        resources: dict[str, int] = params.get("resources") or {}
-        if not market_slot or not target or not resources:
+        market_slot = params.get("market_slot", 24)
+        target = params.get("target_village") or params.get("target")
+        resources_dict: dict[str, int] = params.get("resources", {})
+        if not market_slot or not target or not resources_dict:
             return ActionResult(False, "parametri di invio incompleti")
 
         page = self.browser.page
         assert page is not None
 
-        # Apriamo la pagina del mercato usando il gid=17 universale
+        # 1. Naviga all'URL del mercato associato tramite lo slot configurato
         build_url = f"{selectors.PATH_BUILD}?id={market_slot}&gid=17"
         if village_id > 0:
             build_url += f"&newdid={village_id}"
@@ -789,32 +799,33 @@ class ActionExecutor:
         await self.browser.goto(build_url)
         await sleep_human(1.0, 1.5)
 
-        # 0. VERIFICA PREVENTIVA: Controlliamo se in questo slot esiste effettivamente il Mercato (gid=17)
+        # Verifica preventiva presenza edificio mercato
         is_market_valid = await page.evaluate("""
-                                              () => {
-                                                  const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
-                                                  const titleText = ((document.querySelector('h1, h2, .title')?.innerText) || '').toLowerCase();
-
-                                                  if (titleText.includes('edificio') || titleText.includes('costruisci') ||
-                                                      bodyText.includes('questo edificio non esiste') ||
-                                                      bodyText.includes('this building does not exist')) {
-                                                      return false;
-                                                  }
-                                                  return true;
-                                              }
-                                              """)
-
+            () => {
+                const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
+                const titleText = ((document.querySelector('h1, h2, .title')?.innerText) || '').toLowerCase();
+                if (titleText.includes('edificio') || titleText.includes('costruisci') ||
+                    bodyText.includes('questo edificio non esiste') ||
+                    bodyText.includes('this building does not exist')) {
+                    return false;
+                }
+                return true;
+            }
+        """)
         if not is_market_valid:
             logger.info("Villaggio slot %s: Mercato (gid=17) non presente o non valido in questo slot", market_slot)
             return ActionResult(False, "mercato non presente in questo villaggio o slot errato")
 
-        # 1. CLICK ESPLICITO SUL TAB "INVIA RISORSE" (Fondamentale per la schermata T4.x)
-        if await self._select_send_resources_tab(page):
-            await sleep_human(0.8, 1.2)
+        # 2. STEP CRITICO: Clicca sul tab "Invia risorse" (secondo tab)
+        clicked_tab = await self._select_send_resources_tab(page)
+        if not clicked_tab:
+            return ActionResult(False, "impossibile trovare o cliccare il tab 'Invia risorse'")
 
-        # 2. Stato del mercato: verifica dei mercanti e presenza dei campi di input
+        await sleep_human(0.8, 1.2)
+
+        # Verifica preliminare mercanti disponibili
         market_status = None
-        for _ in range(4):
+        for attempt in range(4):
             market_status = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
                 () => {
                     const bodyText = (document.body && document.body.innerText) || '';
@@ -846,9 +857,10 @@ class ActionExecutor:
             """)
             if market_status and market_status.get("inputsCount", 0) > 0:
                 break
+            # Ritenta il click sul tab se il form non si sblocca subito
+            await self._select_send_resources_tab(page)
             await sleep_human(0.5, 0.9)
 
-        # Se i mercanti sono esauriti, segnala senza errori bloccanti
         if market_status and market_status.get("noMerchants"):
             m_info = market_status.get("merchants") or {}
             avail = m_info.get("available", 0)
@@ -859,60 +871,120 @@ class ActionExecutor:
                 f"nessun mercante disponibile al mercato ({avail}/{total} in viaggio)",
             )
 
-        # Guardia critica: prosegui SOLO se esiste il vero form di invio mercato
+        # Attesa del form operativo di invio
         has_form = False
         for attempt in range(6):
             has_form = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
-                                () => {
-                                    const f = findSendForm();
-                                    if (!f) return false;
-                                    f.setAttribute('data-tts-sendform', '1');
-                                    return true;
-                                }
-                            """)
+                () => {
+                    const f = findSendForm();
+                    if (!f) return false;
+                    f.setAttribute('data-tts-sendform', '1');
+                    return true;
+                }
+            """)
             if has_form:
                 break
-            # Retry tab click: a livello 1 il tab 'Invia risorse' puo' non
-            # essere attivo al primo caricamento
             if attempt >= 1:
                 await self._select_send_resources_tab(page)
             await sleep_human(0.5, 0.9)
 
         if not has_form:
-            # Diagnostica immediata nei log di console
             current_url = page.url if page else "N/A"
             page_title = await page.title() if page else "N/A"
             logger.error("DEBUG MERCATO FALLITO -> URL corrente: %s | Titolo pagina: %s", current_url, page_title)
-
-            # Salva l'HTML della pagina per analizzare la struttura esatta
             try:
                 if hasattr(self, '_dump_market_html'):
                     await self._dump_market_html(page)
             except Exception as e:
                 logger.error("Errore durante il dump HTML del mercato: %s", e)
-
             return ActionResult(
                 False,
                 "form di invio mercato non caricato (tab 'Invia risorse' assente?)",
             )
-        send_scope = "[data-tts-sendform='1']"
 
-        # Snapshot del nome del villaggio attivo per sicurezza anti-rinomina
+        send_scope = "[data-tts-sendform='1']"
         village_name_before = await self._active_village_name(page)
 
-        # 2.5 MERCHANT CAPACITY CHECK: le risorse non possono superare la
-        # portata totale dei mercanti liberi (disponibili * portata unitaria)
-        resources = await self._calculate_capped_resources(page, resources)
-        if not resources or sum(int(v or 0) for v in resources.values()) <= 0:
+        # 3. COMPILAZIONE COORDINATE / DESTINAZIONE (Nome villaggio target o X, Y)
+        target_filled = False
+        for sel in selectors.MARKET_TARGET_INPUT:
+            if any(bad in sel.lower() for bad in ["rename", "dname", "renamer"]):
+                continue
+            locator = page.locator(f"{send_scope} {sel}").first
+            try:
+                if await locator.count() == 0 or await locator.is_disabled():
+                    continue
+                name_attr = (await locator.get_attribute("name") or "").lower()
+                if "dname" in name_attr or "rename" in name_attr:
+                    continue
+                await locator.fill("", timeout=500)
+                await locator.press_sequentially(str(target), delay=40, timeout=1500)
+                target_filled = True
+                break
+            except Exception:
+                continue
+
+        if not target_filled:
+            target_filled = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
+                (targetName) => {
+                    const inp = findTargetInput();
+                    if (inp && !inp.disabled) {
+                        const nameAttr = ((inp.name || '') + ' ' + (inp.id || '')).toLowerCase();
+                        if (nameAttr.includes('dname') || nameAttr.includes('rename')) return false;
+
+                        inp.readOnly = false;
+                        inp.focus();
+                        inp.value = targetName;
+                        for (const ev of ['keydown', 'input', 'keyup', 'change']) {
+                            inp.dispatchEvent(new Event(ev, { bubbles: true }));
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+            """, str(target))
+
+        if not target_filled:
+            return ActionResult(False, f"campo destinazione villaggio non trovato (target '{target}')")
+
+        # Clic sul suggerimento dell'autocomplete del mercato (se appare)
+        await sleep_human(0.4, 0.9)
+        await self._pick_target_suggestion(page, str(target))
+
+        # Compilazione coordinate esatte (X, Y) nei campi appositi se fornite
+        tx, ty = params.get("target_x"), params.get("target_y")
+        if tx is not None and ty is not None:
+            await page.evaluate("""
+                ([x, y]) => {
+                    const ix = document.querySelector('input[name="x"], input#xCoord, input[id*="xCoord"], .coordinateX input, input.xCoord');
+                    const iy = document.querySelector('input[name="y"], input#yCoord, input[id*="yCoord"], .coordinateY input, input.yCoord');
+                    if (ix) {
+                        ix.value = String(x);
+                        ix.dispatchEvent(new Event('input', {bubbles: true}));
+                        ix.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                    if (iy) {
+                        iy.value = String(y);
+                        iy.dispatchEvent(new Event('input', {bubbles: true}));
+                        iy.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                }
+            """, [tx, ty])
+
+        if "build.php" not in (page.url or ""):
+            return ActionResult(False, "selezione destinazione uscita dal mercato - invio annullato")
+
+        # 4. INSERIMENTO RISORSE CAPPED (Calcolo capienza mercanti e popolamento r1-r4)
+        capped_resources = await self._calculate_capped_resources(page, resources_dict)
+        if not capped_resources or sum(int(v or 0) for v in capped_resources.values()) <= 0:
             return ActionResult(
                 False,
                 "capacita' mercanti insufficiente per il carico richiesto",
             )
 
-        # 3. Compila le quantità di risorse
         filled = 0
         for rtype, sel_list in selectors.MARKET_SEND_INPUTS.items():
-            amount = int(resources.get(rtype, 0) or 0)
+            amount = int(capped_resources.get(rtype, 0) or 0)
             if amount <= 0:
                 continue
             for sel in sel_list:
@@ -949,91 +1021,20 @@ class ActionExecutor:
                     }
                     return cnt;
                 }
-            """, resources)
+            """, capped_resources)
 
         if filled == 0:
             return ActionResult(False, "form di invio mercato non trovato o campi non compilabili")
 
-        # 4. COMPILAZIONE DESTINAZIONE BLINDATA (Esclude categoricamente i campi di rinomina)
-        target_filled = False
-
-        for sel in selectors.MARKET_TARGET_INPUT:
-            if any(bad in sel.lower() for bad in ["rename", "dname", "renamer"]):
-                continue
-            locator = page.locator(f"{send_scope} {sel}").first
-            try:
-                if await locator.count() == 0 or await locator.is_disabled():
-                    continue
-                name_attr = (await locator.get_attribute("name") or "").lower()
-                if "dname" in name_attr or "rename" in name_attr:
-                    continue
-
-                await locator.fill("", timeout=500)
-                await locator.press_sequentially(str(target), delay=40, timeout=1500)
-                target_filled = True
-                break
-            except Exception:
-                continue
-
-        if not target_filled:
-            target_filled = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
-                (targetName) => {
-                    const inp = findTargetInput();
-                    if (inp && !inp.disabled) {
-                        const nameAttr = ((inp.name || '') + ' ' + (inp.id || '')).toLowerCase();
-                        if (nameAttr.includes('dname') || nameAttr.includes('rename')) return false;
-
-                        inp.readOnly = false;
-                        inp.focus();
-                        inp.value = targetName;
-                        for (const ev of ['keydown', 'input', 'keyup', 'change']) {
-                            inp.dispatchEvent(new Event(ev, { bubbles: true }));
-                        }
-                        return true;
-                    }
-                    return false;
-                }
-            """, str(target))
-
-        if not target_filled:
-            return ActionResult(False, f"campo destinazione villaggio non trovato (target '{target}')")
-
-        # Clic sul suggerimento dell'autocomplete del mercato
-        await sleep_human(0.4, 0.9)
-        await self._pick_target_suggestion(page, str(target))
-
-        # Compilazione coordinate esatte (X, Y) per blindare ulteriormente la richiesta
-        tx, ty = params.get("target_x"), params.get("target_y")
-        if tx is not None and ty is not None:
-            await page.evaluate("""
-                                ([x, y]) => {
-                                    const ix = document.querySelector('input[name="x"], input#xCoord, input[id*="xCoord"], .coordinateX input, input.xCoord');
-                                    const iy = document.querySelector('input[name="y"], input#yCoord, input[id*="yCoord"], .coordinateY input, input.yCoord');
-                                    if (ix) {
-                                        ix.value = String(x);
-                                        ix.dispatchEvent(new Event('input', {bubbles: true}));
-                                        ix.dispatchEvent(new Event('change', {bubbles: true}));
-                                    }
-                                    if (iy) {
-                                        iy.value = String(y);
-                                        iy.dispatchEvent(new Event('input', {bubbles: true}));
-                                        iy.dispatchEvent(new Event('change', {bubbles: true}));
-                                    }
-                                }
-                                """, [tx, ty])
-
-        if "build.php" not in (page.url or ""):
-            return ActionResult(False, "selezione destinazione uscita dal mercato - invio annullato")
-
         await sleep_human(self.settings.action_delay_min, self.settings.action_delay_max)
 
-        # 5. Submit del form di invio
+        # 5. CONFERMA FINALE: Clic sul pulsante verde "Invia risorse" in fondo alla sezione
         send_buttons = [f"{send_scope} {s}" for s in selectors.MARKET_SEND_BUTTON]
         if not await self._click_first(page, send_buttons):
             return ActionResult(False, "pulsante di invio mercato non trovato")
         await sleep_human(1.0, 2.0)
 
-        # 6. CONTROLLO FINALE ANTIRINOMINA: se il nome del villaggio attivo è cambiato, blocca tutto
+        # Controllo di sicurezza antironima
         if village_name_before:
             village_name_after = await self._active_village_name(page)
             if village_name_after and village_name_after != village_name_before:
@@ -1043,12 +1044,12 @@ class ActionExecutor:
                 )
                 return ActionResult(False, "blocco di sicurezza: impedita modifica nome villaggio")
 
-        # Conferma finale T4.x (riepilogo)
+        # Click di conferma riepilogo T4.x se richiesto dal gioco
         await self._click_first(page, selectors.MARKET_CONFIRM_BUTTON)
         await sleep_human(0.5, 1.0)
 
         logger.info("Risorse inviate con successo a '%s' dal mercato slot %s", target, market_slot)
-        return ActionResult(True, f"risorse inviate a '{target}'")
+        return ActionResult(True, "risorse inviate con successo tramite il mercato")
 
     async def _send_raid(self, action: Action, village_id: int = 0) -> ActionResult:
         """Lancia un raid dalla farm list del Punto di Raduno (gid 16).
