@@ -789,11 +789,13 @@ class ActionExecutor:
             await sleep_human(0.5, 0.9)
 
         if not has_form:
-            # Salva l'HTML della pagina per analizzare la struttura esatta dei tab e dei form
+            # Diagnostica immediata nei log di console
+            current_url = page.url if page else "N/A"
+            page_title = await page.title() if page else "N/A"
+            logger.error("DEBUG MERCATO FALLITO -> URL corrente: %s | Titolo pagina: %s", current_url, page_title)
+
+            # Salva l'HTML della pagina per analizzare la struttura esatta
             try:
-                html_content = await page.content()
-                logger.error("DEBUG MERCATO [Vibo Valentia]: Form non trovato. Dump HTML salvato o stampato.")
-                # Se hai una funzione di dump dedicata, viene chiamata qui:
                 if hasattr(self, '_dump_market_html'):
                     await self._dump_market_html(page)
             except Exception as e:
