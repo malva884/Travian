@@ -331,13 +331,20 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
     )
     target = _best_peer_for_surplus(state, surplus)
     if market_slot and target:
+        send_params: dict = {
+            "market_slot": market_slot,
+            "target_village": target,
+            "target": target,
+            "resources": surplus,
+        }
+        target_cfg = settings.village_config_for(target)
+        if target_cfg and target_cfg.x is not None and target_cfg.y is not None:
+            send_params["target_x"] = target_cfg.x
+            send_params["target_y"] = target_cfg.y
+
         return Action(
             type=ActionType.SEND_RESOURCES,
-            params={
-                "market_slot": market_slot,
-                "target": target,
-                "resources": surplus,
-            },
+            params=send_params,
             reason=(
                 f"Storage pieno: invio {surplus} a '{target}' "
                 f"via Mercato (slot {market_slot})"

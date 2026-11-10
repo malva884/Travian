@@ -589,7 +589,7 @@ with tab_villages:
                         )
                         assigned_target = "" if new_target == "(Nessuno)" else new_target
 
-                    u_col1, u_col2, u_col3 = st.columns([2, 2, 1])
+                    u_col1, u_col2, u_col3, u_col4, u_col5 = st.columns([2, 2, 1, 1, 1])
                     with u_col1:
                         # Opzioni = nomi unita' delle tre tribu' (dedup, ordine
                         # della mappa) + eventuali valori legacy gia' salvati
@@ -631,6 +631,30 @@ with tab_villages:
                             help="Slot dorf2 del Mercato (19-40). "
                                  "0 = rilevamento automatico via gid=17.",
                         )
+                    with u_col4:
+                        parsed_x = st.number_input(
+                            "Coord X:",
+                            min_value=-500,
+                            max_value=500,
+                            value=int(old_cfg.x if old_cfg.x is not None else 0),
+                            step=1,
+                            key=f"coord_x_{cur_acc.account_id}_{idx}",
+                            help="Coordinata X del villaggio (utilizzata per l'invio risorse al mercato).",
+                        )
+                    with u_col5:
+                        parsed_y = st.number_input(
+                            "Coord Y:",
+                            min_value=-500,
+                            max_value=500,
+                            value=int(old_cfg.y if old_cfg.y is not None else 0),
+                            step=1,
+                            key=f"coord_y_{cur_acc.account_id}_{idx}",
+                            help="Coordinata Y del villaggio (utilizzata per l'invio risorse al mercato).",
+                        )
+
+                    # Se X e Y sono entrambi 0 e l'utente non li ha impostati, preserva None se era None
+                    final_x = parsed_x if (parsed_x != 0 or old_cfg.x == 0) else old_cfg.x
+                    final_y = parsed_y if (parsed_y != 0 or old_cfg.y == 0) else old_cfg.y
 
                     updated_villages[vname] = VillageConfig(
                         name=vname,
@@ -641,6 +665,8 @@ with tab_villages:
                         farm_enabled=old_cfg.farm_enabled,
                         farm_unit=old_cfg.farm_unit,
                         market_slot=int(parsed_market_slot),
+                        x=int(final_x) if final_x is not None else None,
+                        y=int(final_y) if final_y is not None else None,
                     )
 
             save_submitted = st.form_submit_button("💾 Salva Ruoli & Strategia (Applicazione a Caldo)", type="primary")

@@ -49,6 +49,8 @@ class VillageConfig:
     farm_enabled: bool = True       # include questo villaggio nei cicli di raid
     farm_unit: str = ""             # unita' da saccheggio (vuoto = truppe leggere auto)
     market_slot: int = 0            # slot dorf2 del Mercato (0 = auto-detect via gid=17)
+    x: int | None = None            # coordinata X del villaggio
+    y: int | None = None            # coordinata Y del villaggio
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:
@@ -278,6 +280,8 @@ def load_accounts() -> list[Settings]:
                                     farm_enabled=bool(cfg.get("farm_enabled", True)),
                                     farm_unit=str(cfg.get("farm_unit", "")),
                                     market_slot=int(cfg.get("market_slot", 0) or 0),
+                                    x=int(cfg["x"]) if cfg.get("x") is not None else None,
+                                    y=int(cfg["y"]) if cfg.get("y") is not None else None,
                                 )
                                 for key, cfg in (item.get("villages") or {}).items()
                                 if isinstance(cfg, dict)
@@ -365,6 +369,8 @@ def save_accounts(accounts: list[Settings]) -> None:
                     "farm_enabled": cfg.farm_enabled,
                     "farm_unit": cfg.farm_unit,
                     "market_slot": int(cfg.market_slot or 0),
+                    "x": cfg.x,
+                    "y": cfg.y,
                 }
                 for key, cfg in acc.villages.items()
             },

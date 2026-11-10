@@ -119,6 +119,21 @@ async def monitor_all_villages(
     states_by_village: dict[str, GameState] = {}
     troops_by_village: dict[str, dict[str, int]] = {}
 
+    # Mappa coordinate note dei villaggi (nome -> (x, y))
+    village_coords_map: dict[str, tuple[int, int]] = {}
+    for v in villages:
+        if v.name and v.x is not None and v.y is not None:
+            village_coords_map[v.name.strip().lower()] = (v.x, v.y)
+        # Aggiorna anche VillageConfig se x/y non erano ancora valorizzati
+        cfg = settings.village_config_for(v.name, v.village_id)
+        if cfg is not None:
+            if v.x is not None and cfg.x is None:
+                cfg.x = v.x
+            if v.y is not None and cfg.y is None:
+                cfg.y = v.y
+            if cfg.x is not None and cfg.y is not None and v.name:
+                village_coords_map[v.name.strip().lower()] = (cfg.x, cfg.y)
+
     # 1.1 Controllo e attivazione automatica del bonus +15% per 8 ore su tutte le risorse (video ad)
     if settings.auto_video_bonus:
         now = time.time()
@@ -228,6 +243,20 @@ async def monitor_all_villages(
             troops_by_village[vname] = state.troops_home
 
             action = brain.decide(state)
+            # Arricchimento coordinate target per invio risorse al mercato
+            if action.type == ActionType.SEND_RESOURCES:
+                act_params = action.params or {}
+                t_name = str(act_params.get("target_village") or act_params.get("target") or "").strip().lower()
+                if t_name and (act_params.get("target_x") is None or act_params.get("target_y") is None):
+                    coords = village_coords_map.get(t_name)
+                    if coords:
+                        action.params["target_x"], action.params["target_y"] = coords
+                    else:
+                        # Fallback su VillageConfig
+                        t_cfg = settings.village_config_for(t_name)
+                        if t_cfg and t_cfg.x is not None and t_cfg.y is not None:
+                            action.params["target_x"], action.params["target_y"] = t_cfg.x, t_cfg.y
+
             target_vid = state.village_id or village.village_id
             result = await executor.execute(action, village_id=target_vid)
             _append_history(settings.account_id, state, action)
@@ -300,19 +329,26 @@ async def monitor_all_villages(
                 )
                 surplus = feeder_surplus(state)
                 if market_slot and surplus:
+                    f_target = expansion_mgr.feed_target
                     founder_v = next(
-                        (v for v in villages if v.name == expansion_mgr.feed_target),
+                        (v for v in villages if v.name == f_target),
                         None,
                     )
                     feed_params: dict = {
                         "market_slot": market_slot,
-                        "target_village": expansion_mgr.feed_target,
-                        "target": expansion_mgr.feed_target,
+                        "target_village": f_target,
+                        "target": f_target,
                         "resources": surplus,
                     }
                     if founder_v is not None and founder_v.x is not None and founder_v.y is not None:
                         feed_params["target_x"] = founder_v.x
                         feed_params["target_y"] = founder_v.y
+                    elif f_target.strip().lower() in village_coords_map:
+                        feed_params["target_x"], feed_params["target_y"] = village_coords_map[f_target.strip().lower()]
+                    else:
+                        t_cfg = settings.village_config_for(f_target)
+                        if t_cfg and t_cfg.x is not None and t_cfg.y is not None:
+                            feed_params["target_x"], feed_params["target_y"] = t_cfg.x, t_cfg.y
 
                     feed_action = Action(
                         type=ActionType.SEND_RESOURCES,

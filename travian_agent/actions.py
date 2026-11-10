@@ -773,36 +773,82 @@ class ActionExecutor:
     async def _resolve_village_coords_from_sidebar(
         self, page, target_name: str
     ) -> tuple[int | None, int | None]:
-        """Cerca nella sidebar dei villaggi le coordinate (X, Y) associate al nome del villaggio target."""
+        """Cerca nella sidebar dei villaggi le coordinate (X, Y) associate al nome del villaggio target.
+
+        Supporta sia Travian T4 classico sia T4.6 con contenitori separati:
+        .coordinates .coordinateX, .coordinateY, span.coordinateBox, etc.
+        Inoltre verifica la configurazione dei villaggi in Settings come fallback primario.
+        """
         if not target_name:
             return None, None
+
+        # 1. Fallback immediato su Settings se il villaggio e' gia' configurato
+        try:
+            if hasattr(self, "settings") and self.settings:
+                vcfg = self.settings.village_config_for(target_name)
+                if vcfg and vcfg.x is not None and vcfg.y is not None:
+                    return vcfg.x, vcfg.y
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2. Ispezione avanzata DOM pagina attiva
         try:
             coords = await page.evaluate(
                 """
                 (needle) => {
                     const norm = (s) => (s || '').trim().toLowerCase();
                     const targetNorm = norm(needle);
+
                     const entries = Array.from(document.querySelectorAll(
                         '#sidebarBoxVillagelist .villageList .entry, ' +
                         '.villageList .entry, .villageList li, ' +
-                        '#sidebarBoxVillagelist li'
+                        '#sidebarBoxVillagelist li, [id*="villagelist" i] li'
                     ));
+
                     for (const entry of entries) {
                         const nameEl = entry.querySelector('.name, .villageName, .entryName, label, .headline') || entry;
-                        const rawText = (nameEl?.innerText || nameEl?.textContent || entry.innerText || '').trim();
-                        const cleaned = rawText
+                        const rawName = (nameEl?.innerText || nameEl?.textContent || '').trim();
+                        const cleaned = rawName
                             .replace(/\\s*\\(\\s*[-+]?\\d+\\s*[|/]\\s*[-+]?\\d+\\s*\\)/g, '')
                             .replace(/\\s+/g, ' ')
                             .trim();
-                        if (norm(cleaned) === targetNorm || norm(rawText).includes(targetNorm)) {
-                            const m = rawText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+
+                        const fullText = (entry.innerText || entry.textContent || '').trim();
+
+                        if (norm(cleaned) === targetNorm || norm(rawName).includes(targetNorm) || norm(fullText).includes(targetNorm)) {
+                            // A) Cerca elementi dedicati coordinate T4.6 (.coordinateX / .coordinateY)
+                            const xEl = entry.querySelector('.coordinateX, [class*="coordinateX"], .x');
+                            const yEl = entry.querySelector('.coordinateY, [class*="coordinateY"], .y');
+                            if (xEl && yEl) {
+                                const parseCoord = (txt) => {
+                                    const m = (txt || '').match(/[-+]?\\d+/);
+                                    return m ? parseInt(m[0], 10) : null;
+                                };
+                                const px = parseCoord(xEl.innerText || xEl.textContent);
+                                const py = parseCoord(yEl.innerText || yEl.textContent);
+                                if (px !== null && py !== null) {
+                                    return [px, py];
+                                }
+                            }
+
+                            // B) Cerca regex standard (X|Y) o (X/Y) nel testo dell'entry
+                            const m = fullText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/) ||
+                                      rawName.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
                             if (m) {
                                 return [parseInt(m[1], 10), parseInt(m[2], 10)];
                             }
+
+                            // C) Controlla attributi data (data-x, data-y)
+                            const dataX = entry.getAttribute('data-x');
+                            const dataY = entry.getAttribute('data-y');
+                            if (dataX !== null && dataY !== null) {
+                                return [parseInt(dataX, 10), parseInt(dataY, 10)];
+                            }
                         }
                     }
-                    // Fallback globale su link contenenti dorf1 con did e testo target
-                    const allLinks = Array.from(document.querySelectorAll('a[href*="newdid="]'));
+
+                    // Fallback globale su qualsiasi link con newdid o testo del villaggio
+                    const allLinks = Array.from(document.querySelectorAll('a[href*="newdid"], a[href*="dorf"]'));
                     for (const a of allLinks) {
                         const text = (a.innerText || a.textContent || '').trim();
                         if (norm(text).includes(targetNorm)) {
