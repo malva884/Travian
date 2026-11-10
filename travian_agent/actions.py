@@ -658,6 +658,113 @@ class ActionExecutor:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Dump HTML mercato fallito: %s", exc)
 
+    async def _select_send_resources_tab(self, page) -> bool:
+        """Clicca sul tab 'Invia risorse' nel mercato se non e' gia' attivo."""
+        try:
+            clicked = await page.evaluate(
+                """
+                () => {
+                    const tabs = Array.from(document.querySelectorAll(
+                        '.tabItem, .container.tabItem, a, button, div, .tab, div[class*="tab"]'
+                    ));
+                    const needles = [
+                        'invia risorse', 'send resources', 'ressourcen senden',
+                        'envoyer des ressources', 'enviar recursos',
+                    ];
+                    const sendTab = tabs.find(el => {
+                        const text = (el.innerText || '').trim().toLowerCase();
+                        return needles.some(n => text === n || text.includes(n));
+                    });
+                    if (sendTab) {
+                        // Gia' attivo: nessun click necessario
+                        if (/active|selected|current/i.test(sendTab.className || '')) {
+                            return 'already';
+                        }
+                        sendTab.click();
+                        return 'clicked';
+                    }
+                    // Fallback posizionale: secondo tab della barra mercato
+                    const altTab = document.querySelector(
+                        '.tabItem:nth-child(2), .tabItem.normal:nth-child(2)'
+                    );
+                    if (altTab) { altTab.click(); return 'fallback'; }
+                    return null;
+                }
+                """
+            )
+            return bool(clicked)
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _calculate_capped_resources(
+        self, page, requested_resources: dict
+    ) -> dict:
+        """Limita le risorse alla portata totale dei mercanti disponibili.
+
+        Legge 'Mercanti disponibili: N' (o il pattern N/M) dalla pagina e
+        moltiplica per la portata unitaria della tribu' (Romani 500,
+        Galli 750, Teutoni 1000 — rilevata dalle icone unit; fallback
+        conservativo 500).
+        """
+        merchant_data = await page.evaluate(
+            """
+            () => {
+                const bodyText = document.body.innerText || '';
+                let match = bodyText.match(/Mercanti disponibili:\\s*(\\d+)/i);
+                let available = match ? parseInt(match[1], 10) : -1;
+                if (available < 0) {
+                    const m2 = bodyText.match(
+                        /(?:mercanti|merchants?|haendler|händler|comerciantes?|marchands?)[^0-9]{0,20}([0-9]+)[^0-9]{0,5}[/][^0-9]{0,5}([0-9]+)/i
+                    );
+                    if (m2) available = parseInt(m2[1], 10);
+                }
+                if (available < 0) available = 1;  // non rilevato: ipotesi minima
+
+                // Tribu' dalle icone unit presenti in pagina (u1-10 Romani,
+                // u11-20 Teutoni, u21-30 Galli)
+                let tribe = '';
+                for (const el of document.querySelectorAll('[class*="unit u"]')) {
+                    const m = (el.getAttribute('class') || '').match(/\\bu(\\d+)\\b/);
+                    if (!m) continue;
+                    const u = parseInt(m[1], 10);
+                    if (u >= 1 && u <= 10) { tribe = 'romans'; break; }
+                    if (u >= 11 && u <= 20) { tribe = 'teutons'; break; }
+                    if (u >= 21 && u <= 30) { tribe = 'gauls'; break; }
+                }
+                const capacityPerMerchant =
+                    tribe === 'teutons' ? 1000 :
+                    tribe === 'gauls' ? 750 : 500;
+
+                return {
+                    available: available,
+                    capacity: available * capacityPerMerchant,
+                };
+            }
+            """
+        ) or {}
+
+        max_capacity = int(merchant_data.get("capacity") or 0)
+        total_requested = sum(int(v or 0) for v in requested_resources.values())
+        if total_requested <= 0:
+            return {}
+        if max_capacity <= 0:
+            return {}
+        if total_requested <= max_capacity:
+            return requested_resources  # un solo viaggio sufficiente
+
+        scale_factor = max_capacity / total_requested
+        capped = {
+            res: int(int(amount or 0) * scale_factor)
+            for res, amount in requested_resources.items()
+        }
+        logger.info(
+            "Carico risorse ridimensionato da %d a %d per rispettare la "
+            "capienza dei mercanti (disponibili %d, capienza %d)",
+            total_requested, sum(capped.values()),
+            int(merchant_data.get("available") or 0), max_capacity,
+        )
+        return capped
+
     async def _send_resources(self, action: Action, village_id: int = 0) -> ActionResult:
         """Invia l'eccedenza ad un altro villaggio tramite il Mercato.
 
@@ -702,30 +809,7 @@ class ActionExecutor:
             return ActionResult(False, "mercato non presente in questo villaggio o slot errato")
 
         # 1. CLICK ESPLICITO SUL TAB "INVIA RISORSE" (Fondamentale per la schermata T4.x)
-        clicked_tab = await page.evaluate("""
-                                          () => {
-                                              // Cerca l'elemento del tab o link "Invia risorse" / "Send resources"
-                                              const elements = document.querySelectorAll(
-                                                  '.tabItem, .container.tabItem, a, button, .tab, div[class*="tab"]'
-                                              );
-                                              for (const el of elements) {
-                                                  const text = (el.innerText || '').trim().toLowerCase();
-                                                  if (text === 'invia risorse' || text === 'send resources' || text.includes('invia risorse')) {
-                                                      el.click();
-                                                      return true;
-                                                  }
-                                              }
-                                              // Fallback: cerca tramite selettori generici di tab
-                                              const altTab = document.querySelector('.tabItem:nth-child(2), .tabItem.normal:nth-child(2)');
-                                              if (altTab) {
-                                                  altTab.click();
-                                                  return true;
-                                              }
-                                              return false;
-                                          }
-                                          """)
-
-        if clicked_tab:
+        if await self._select_send_resources_tab(page):
             await sleep_human(0.8, 1.2)
 
         # 2. Stato del mercato: verifica dei mercanti e presenza dei campi di input
@@ -777,7 +861,7 @@ class ActionExecutor:
 
         # Guardia critica: prosegui SOLO se esiste il vero form di invio mercato
         has_form = False
-        for _ in range(6):
+        for attempt in range(6):
             has_form = await page.evaluate(_JS_MARKET_QTY_INPUTS + """
                                 () => {
                                     const f = findSendForm();
@@ -788,6 +872,10 @@ class ActionExecutor:
                             """)
             if has_form:
                 break
+            # Retry tab click: a livello 1 il tab 'Invia risorse' puo' non
+            # essere attivo al primo caricamento
+            if attempt >= 1:
+                await self._select_send_resources_tab(page)
             await sleep_human(0.5, 0.9)
 
         if not has_form:
@@ -811,6 +899,15 @@ class ActionExecutor:
 
         # Snapshot del nome del villaggio attivo per sicurezza anti-rinomina
         village_name_before = await self._active_village_name(page)
+
+        # 2.5 MERCHANT CAPACITY CHECK: le risorse non possono superare la
+        # portata totale dei mercanti liberi (disponibili * portata unitaria)
+        resources = await self._calculate_capped_resources(page, resources)
+        if not resources or sum(int(v or 0) for v in resources.values()) <= 0:
+            return ActionResult(
+                False,
+                "capacita' mercanti insufficiente per il carico richiesto",
+            )
 
         # 3. Compila le quantità di risorse
         filled = 0
