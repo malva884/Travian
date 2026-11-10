@@ -198,6 +198,7 @@ class ActionType(str, Enum):
     UPGRADE_FIELD = "upgrade_field"
     SEND_RESOURCES = "send_resources"  # invio risorse ad un altro villaggio
     TRAIN_TROOPS = "train_troops"      # addestramento truppe
+    TRAIN_SETTLERS = "train_settlers"  # addestramento coloni in Residenza/Palazzo
     CLAIM_VIDEO_BONUS = "claim_video_bonus"  # riscatto bonus +15% per 8 ore (video ad)
     SEND_RAID = "send_raid"          # invio raid da farm list (Punto di Raduno)
     SEND_CUSTOM_RAID = "send_custom_raid"  # invio raid dinamico a coordinate libere (AI Scout Brain)

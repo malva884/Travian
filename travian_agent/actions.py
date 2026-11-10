@@ -285,6 +285,8 @@ class ActionExecutor:
                 return await self._found_village(action, village_id=vid_int)
             case ActionType.TRAIN_TROOPS:
                 return await self._train_troops(action, village_id=vid_int)
+            case ActionType.TRAIN_SETTLERS:
+                return await self._train_settlers(action, village_id=vid_int)
             case ActionType.CLAIM_VIDEO_BONUS:
                 return await self._claim_video_bonus(action)
             case ActionType.ALERT:
@@ -1267,6 +1269,105 @@ class ActionExecutor:
             x, y, village_id,
         )
         return ActionResult(True, f"fondazione avviata a ({x}|{y})")
+
+    async def _train_settlers(self, action: Action, village_id: int = 0) -> ActionResult:
+        """Verifica e addestra i coloni mancanti (fino a 3) in Residenza/Palazzo.
+
+        Naviga a build.php?id=<expansion_slot>, individua l'input di
+        addestramento coloni della tribu' (t10 Romani, t20 Teutoni,
+        t30 Galli), calcola quanti coloni mancano rispetto al target e
+        compila + invia il form.
+        """
+        params = action.params or {}
+        expansion_slot = int(params.get("expansion_slot") or params.get("trainer_slot") or 0)
+        if expansion_slot <= 0:
+            return ActionResult(False, "slot Residenza/Palazzo mancante (expansion_slot)")
+        target_count = int(params.get("settlers_target") or 3)
+        already = int(params.get("already_trained") or 0)
+
+        page = self.browser.page
+        assert page is not None
+
+        url = f"{selectors.PATH_BUILD}?id={expansion_slot}"
+        if village_id > 0:
+            url += f"&newdid={village_id}"
+        await self.browser.goto(url)
+        await sleep_human(1.0, 1.5)
+
+        # 1. Individua l'input coloni della tribu' e quelli in coda
+        settlers_status = await page.evaluate(
+            """
+            () => {
+                const inputs = Array.from(
+                    document.querySelectorAll(
+                        'input[name="t10"], input[name="t20"], input[name="t30"]'
+                    )
+                );
+                const input = inputs.find(i => !i.disabled);
+                // Coloni in coda di addestramento: cerca icone unit u10/u20/u30
+                // nelle tabelle di progresso della pagina
+                let inTraining = 0;
+                document.querySelectorAll(
+                    'img.unit, span.unit, i.unit, [class*="unit u"]'
+                ).forEach(icon => {
+                    const cls = icon.getAttribute('class') || '';
+                    const m = cls.match(/u(10|20|30)\\b/);
+                    if (!m) return;
+                    const row = icon.closest('tr, li, .buildingRow, .troop') || icon.parentElement;
+                    const txt = (row && row.innerText) || '';
+                    const num = txt.match(/(\\d+)/);
+                    if (num && /in (?:addestramento|training)|durata|duration|termina|finished/i.test(txt)) {
+                        inTraining += parseInt(num[1], 10) || 0;
+                    }
+                });
+                return {
+                    hasInput: !!input,
+                    inputName: input ? input.name : null,
+                    inTraining: inTraining,
+                };
+            }
+            """
+        ) or {}
+
+        if not settlers_status.get("hasInput"):
+            return ActionResult(
+                False,
+                "impossibile addestrare coloni: slot errato o livello "
+                "Residenza/Palazzo insufficiente",
+            )
+
+        # 2. Quanti coloni mancano al target (presenti + in coda contano)
+        in_training = int(settlers_status.get("inTraining") or 0)
+        missing = max(0, target_count - already - in_training)
+        if missing <= 0:
+            return ActionResult(
+                True,
+                f"coloni gia' sufficienti ({already} pronti, {in_training} in coda)",
+            )
+
+        # 3. Compila l'input coloni e invia il form
+        input_name = settlers_status["inputName"]
+        try:
+            field = page.locator(f"input[name='{input_name}']").first
+            await field.fill(str(missing), timeout=2000)
+        except Exception as exc:  # noqa: BLE001
+            return ActionResult(False, f"input coloni '{input_name}' non compilabile: {exc}")
+
+        await sleep_human(
+            self.settings.action_delay_min, self.settings.action_delay_max
+        )
+        if await self._click_first(page, selectors.TRAIN_SUBMIT, timeout_ms=2000):
+            await sleep_human(1.0, 2.0)
+            logger.info(
+                "Addestramento %d colono/i avviato nello slot %s (villaggio %s)",
+                missing, expansion_slot, village_id,
+            )
+            return ActionResult(
+                True,
+                f"addestramento di {missing} colono/i avviato (slot {expansion_slot})",
+            )
+
+        return ActionResult(False, "errore invio form addestramento coloni")
 
     async def _train_troops(self, action: Action, village_id: int = 0) -> ActionResult:
         """Addestra truppe nella caserma/scuderia per smaltire il surplus.

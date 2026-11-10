@@ -409,7 +409,9 @@ class TravianParser:
                             }
 
                             const nameEl = entry.querySelector('.name, .villageName, .entryName, label, .headline') || linkEl || entry;
-                            let nameText = cleanVillageName(nameEl?.innerText || nameEl?.textContent || '');
+                            const rawText = nameEl?.innerText || nameEl?.textContent || entry.innerText || '';
+                            const coordMatch = rawText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+                            let nameText = cleanVillageName(rawText);
 
                             const isActive = entry.classList.contains('active') || linkEl?.classList.contains('active') || entry.getAttribute('aria-current') === 'true';
 
@@ -420,7 +422,9 @@ class TravianParser:
                                     name: nameText && nameText !== 'Villaggio' ? nameText : `Villaggio_${vid}`,
                                     url: finalUrl,
                                     village_id: vid,
-                                    is_active: isActive
+                                    is_active: isActive,
+                                    x: coordMatch ? parseInt(coordMatch[1], 10) : null,
+                                    y: coordMatch ? parseInt(coordMatch[2], 10) : null
                                 });
                             }
                         });
@@ -438,12 +442,16 @@ class TravianParser:
                         if (vid && !seenIds.has(vid)) {
                             seenIds.add(vid);
                             const nameEl = el.querySelector('.name, .villageName') || el;
-                            let nameText = cleanVillageName(nameEl?.innerText || nameEl?.textContent || '');
+                            const rawText = nameEl?.innerText || nameEl?.textContent || '';
+                            const coordMatch = rawText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+                            let nameText = cleanVillageName(rawText);
                             list.push({
                                 name: nameText && nameText !== 'Villaggio' ? nameText : `Villaggio_${vid}`,
                                 url: href || `dorf1.php?newdid=${vid}`,
                                 village_id: vid,
-                                is_active: el.classList.contains('active')
+                                is_active: el.classList.contains('active'),
+                                x: coordMatch ? parseInt(coordMatch[1], 10) : null,
+                                y: coordMatch ? parseInt(coordMatch[2], 10) : null
                             });
                         }
                     });
@@ -471,6 +479,8 @@ class TravianParser:
                     url=v["url"],
                     village_id=int(v["village_id"]) if str(v.get("village_id", "")).isdigit() else 0,
                     is_active=bool(v.get("is_active", False)),
+                    x=int(v["x"]) if v.get("x") is not None else None,
+                    y=int(v["y"]) if v.get("y") is not None else None,
                 )
                 for v in (villages_data or [])
             ]

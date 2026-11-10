@@ -22,11 +22,19 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .config import BASE_DIR, ExpansionTarget, Settings
+from .config import BASE_DIR, ExpansionConfig, ExpansionTarget, Settings
+from .cropper import (
+    SCAN_COOLDOWN_SECONDS,
+    CropperStore,
+    MapScanner,
+    STATUS_APPROVED,
+    STATUS_SETTLED,
+    STATUS_SETTLING,
+)
 from .models import (
     Action,
     ActionType,
@@ -46,6 +54,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 STATE_DIR = BASE_DIR / "state"
+# Config runtime modificabile da dashboard (spec: state/expansion_config.json)
+EXPANSION_CONFIG_PATH = STATE_DIR / "expansion_config.json"
 
 # Coloni richiesti per la fondazione
 SETTLERS_REQUIRED = 3
@@ -57,6 +67,16 @@ FEED_CAP_PER_RESOURCE = 2000
 FEEDER_KEEP_RATIO = 0.55
 # Cooldown tra tentativi di fondazione falliti (evita spam di navigazione)
 FOUND_RETRY_SECONDS = 900.0
+
+# Store condiviso dei candidati cropper (human-in-the-loop)
+_cropper_stores: dict[str, CropperStore] = {}
+
+
+def cropper_store(account_id: str) -> CropperStore:
+    """CropperStore condiviso per account (dashboard + agente)."""
+    if account_id not in _cropper_stores:
+        _cropper_stores[account_id] = CropperStore()
+    return _cropper_stores[account_id]
 
 
 def find_residence(interior: list[Field], min_level: int = 1) -> Field | None:
@@ -104,6 +124,58 @@ def count_settlers(troops: dict[str, int]) -> int:
     return sum(int(troops.get(k, 0) or 0) for k in SETTLER_ICONS)
 
 
+async def get_available_settlers(
+    observer: "GameObserver", residence_slot: int, village_id: int
+) -> int:
+    """Coloni pronti nel villaggio (icone u10/u20/u30 dal box truppe)."""
+    troops = await observer.read_troops_home(residence_slot, village_id)
+    return count_settlers(troops)
+
+
+def load_expansion_overrides(account_id: str) -> dict:
+    """Regole di espansione runtime da state/expansion_config.json.
+
+    Struttura attesa (spec):
+        {"<account_id>": {
+            "auto_expansion_enabled": true,
+            "source_village": "Hipponion",
+            "expansion_slot": 26,
+            "target_coordinates": {"x": -15, "y": 72}
+        }}
+    """
+    try:
+        if EXPANSION_CONFIG_PATH.exists():
+            data = json.loads(EXPANSION_CONFIG_PATH.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                entry = data.get(account_id)
+                if isinstance(entry, dict):
+                    return entry
+    except Exception:
+        logger.debug("Lettura expansion_config.json fallita", exc_info=True)
+    return {}
+
+
+def effective_expansion_config(cfg: ExpansionConfig, account_id: str) -> ExpansionConfig:
+    """Merge di accounts.json con gli override di state/expansion_config.json."""
+    ov = load_expansion_overrides(account_id)
+    if not ov:
+        return cfg
+    slots = list(cfg.target_slots)
+    coords = ov.get("target_coordinates")
+    if isinstance(coords, dict):
+        tx, ty = int(coords.get("x") or 0), int(coords.get("y") or 0)
+        if (tx or ty) and (tx, ty) not in {(t.x, t.y) for t in slots}:
+            # Coordinate dashboard = target primario
+            slots.insert(0, ExpansionTarget(x=tx, y=ty, note="dashboard"))
+    return replace(
+        cfg,
+        auto_expand=bool(ov.get("auto_expansion_enabled", cfg.auto_expand)),
+        founder_village=str(ov.get("source_village") or cfg.founder_village),
+        expansion_slot=int(ov.get("expansion_slot") or cfg.expansion_slot),
+        target_slots=slots,
+    )
+
+
 @dataclass
 class ExpansionManager:
     """Planner di fondazione per un account; stato su state/expansion_<id>.json."""
@@ -113,6 +185,7 @@ class ExpansionManager:
     founded_tiles: list[dict] = field(default_factory=list)
     feed_target: str = ""          # nome del villaggio che deve ricevere risorse
     next_found_attempt: float = 0.0  # cooldown anti-spam dopo fallimenti
+    next_map_scan: float = 0.0       # cooldown tra scansioni cropper di mappa
 
     def __post_init__(self) -> None:
         if self.state_path is None:
@@ -130,6 +203,7 @@ class ExpansionManager:
                 self.founded_tiles = list(data.get("founded_tiles") or [])
                 self.feed_target = str(data.get("feed_target") or "")
                 self.next_found_attempt = float(data.get("next_found_attempt") or 0.0)
+                self.next_map_scan = float(data.get("next_map_scan") or 0.0)
         except Exception:
             pass
 
@@ -143,6 +217,7 @@ class ExpansionManager:
                         "founded_tiles": self.founded_tiles,
                         "feed_target": self.feed_target,
                         "next_found_attempt": self.next_found_attempt,
+                        "next_map_scan": self.next_map_scan,
                     },
                     indent=2,
                 ),
@@ -156,18 +231,39 @@ class ExpansionManager:
     # ------------------------------------------------------------------
     def _pick_founder(
         self,
-        settings: Settings,
+        cfg: ExpansionConfig,
         villages: list["Village"],
         interior_map: dict[str, list[Field]],
     ) -> tuple["Village | None", Field | None]:
-        """Villaggio fondatore e suo edificio Residenza/Palazzo."""
-        cfg_name = (settings.expansion.founder_village or "").strip()
+        """Villaggio fondatore e suo edificio Residenza/Palazzo.
+
+        Se `cfg.expansion_slot` e' impostato (es. 26/31/32), usa quello
+        slot designato per l'addestramento coloni, verificando che sia
+        un edificio di tipo Residenza/Palazzo quando rilevato.
+        """
+        cfg_name = (cfg.founder_village or "").strip()
+        slot = int(cfg.expansion_slot or 0)
         vkey = lambda v: v.name or str(v.village_id)  # noqa: E731
+
+        def _residence_for(v: "Village") -> Field | None:
+            interior = interior_map.get(vkey(v), [])
+            if slot > 0:
+                for f in interior:
+                    if f.slot_id == slot and (
+                        f.gid in (GID_RESIDENCE, GID_PALACE) or f.gid < 0
+                    ):
+                        return f
+                # Slot designato ma non rilevato: usalo comunque (URL by-slot)
+                return Field(
+                    slot_id=slot, name="Residenza/Palazzo", level=0,
+                    gid=GID_RESIDENCE,
+                )
+            return find_residence(interior)
+
         if cfg_name:
             for v in villages:
                 if v.name == cfg_name or str(v.village_id) == cfg_name:
-                    res = find_residence(interior_map.get(vkey(v), []))
-                    return v, res
+                    return v, _residence_for(v)
             logger.warning(
                 "Espansione: founder_village '%s' non trovato tra i villaggi.",
                 cfg_name,
@@ -176,20 +272,54 @@ class ExpansionManager:
         # Auto: primo villaggio con residenza/palazzo >= 10 (fallback >= 1)
         for min_level in (10, 1):
             for v in villages:
-                res = find_residence(
-                    interior_map.get(vkey(v), []), min_level=min_level
-                )
+                res = _residence_for(v)
+                if res is not None and res.level >= min_level:
+                    return v, res
+        # Ultimo fallback: qualunque residenza trovata dallo slot designato
+        if slot > 0:
+            for v in villages:
+                res = _residence_for(v)
                 if res is not None:
                     return v, res
         return None, None
 
     async def _pick_target(
-        self, observer: "GameObserver", settings: Settings, prefix: str
+        self,
+        observer: "GameObserver",
+        cfg: ExpansionConfig,
+        prefix: str,
+        store: CropperStore,
     ) -> ExpansionTarget | None:
-        """Primo tile configurato libero con campi grano >= crop_min."""
+        """Primo tile libero valido tra target configurati e cropper approved.
+
+        Regola di sicurezza (spec): se le coordinate esistono nel
+        candidates store, si procede SOLO con status 'approved';
+        pending/rejected/settling/settled vengono saltate.
+        """
         done = {(t.get("x"), t.get("y")) for t in self.founded_tiles}
-        for target in settings.expansion.target_slots:
+        # I cropper approved dalla dashboard hanno priorita' sui target manuali
+        ordered: list[ExpansionTarget] = [
+            ExpansionTarget(
+                x=c.x, y=c.y,
+                note=f"{c.type} +{c.bonus_crop_percent - 100}% oasi "
+                     f"({c.distance_hours}h da {c.nearest_village or '?'}) [approved]",
+            )
+            for c in store.approved_targets(self.account_id)
+        ]
+        ordered += [
+            t for t in cfg.target_slots
+            if (t.x, t.y) not in {(c.x, c.y) for c in store.approved_targets(self.account_id)}
+        ]
+        for target in ordered:
             if (target.x, target.y) in done:
+                continue
+            # Safety gate: record nello store solo se approved
+            rec_status = store.status_at(self.account_id, target.x, target.y)
+            if rec_status is not None and rec_status != STATUS_APPROVED:
+                logger.debug(
+                    "%s Espansione: target (%d, %d) bloccato (status=%s).",
+                    prefix, target.x, target.y, rec_status,
+                )
                 continue
             info = await observer.read_map_tile(target.x, target.y)
             if info.get("occupied"):
@@ -199,10 +329,10 @@ class ExpansionManager:
                 )
                 continue
             crop = int(info.get("crop_fields") or 0)
-            if crop and crop < settings.expansion.crop_min:
+            if crop and crop < cfg.crop_min:
                 logger.info(
                     "%s Espansione: tile (%d, %d) solo %dc, richiesti >= %dc.",
-                    prefix, target.x, target.y, crop, settings.expansion.crop_min,
+                    prefix, target.x, target.y, crop, cfg.crop_min,
                 )
                 continue
             if not (info.get("free") or info.get("settle_link") or crop):
@@ -231,17 +361,40 @@ class ExpansionManager:
         now: float | None = None,
     ) -> None:
         """Valuta lo stato espansione e agisce: coloni -> feed/raid -> fonda."""
-        cfg = settings.expansion
+        cfg = effective_expansion_config(settings.expansion, self.account_id)
+        store = cropper_store(self.account_id)
+        now = now if now is not None else time.time()
+
+        # 0. Cropper Finder: scansione mappa -> candidati pending (dashboard)
+        if cfg.cropper_scan and now >= self.next_map_scan:
+            try:
+                found = await MapScanner(store).scan(
+                    observer=observer,
+                    account_id=self.account_id,
+                    villages=villages,
+                    radius=cfg.scan_radius,
+                    prefix=prefix,
+                )
+                if found:
+                    logger.info(
+                        "%s CropperScanner: %d nuovi candidati in attesa di approvazione.",
+                        prefix, found,
+                    )
+            except Exception:
+                logger.debug("%s Scansione cropper fallita", prefix, exc_info=True)
+            self.next_map_scan = now + SCAN_COOLDOWN_SECONDS
+            self._save()
+
         if not cfg.auto_expand:
             return
-        if not cfg.target_slots:
-            logger.debug("%s Espansione attiva ma nessun target_slots configurato.", prefix)
+        has_approved = bool(store.approved_targets(self.account_id))
+        if not cfg.target_slots and not has_approved:
+            logger.debug("%s Espansione attiva ma nessun target configurato/approvato.", prefix)
             return
-        now = now if now is not None else time.time()
         if now < self.next_found_attempt:
             return
 
-        founder, residence = self._pick_founder(settings, villages, interior_map)
+        founder, residence = self._pick_founder(cfg, villages, interior_map)
         if founder is None or residence is None:
             logger.info(
                 "%s Espansione: nessun villaggio con Residenza/Palazzo trovato.",
@@ -262,20 +415,19 @@ class ExpansionManager:
             return
 
         # 2. Coloni disponibili?
-        troops = await observer.read_troops_home(residence.slot_id, founder.village_id)
-        settlers = count_settlers(troops)
+        settlers = await get_available_settlers(
+            observer, residence.slot_id, founder.village_id
+        )
         if settlers < SETTLERS_REQUIRED:
             # Addestra coloni + attiva rete feeder verso il fondatore
             self.feed_target = founder.name
             self._save()
             train = Action(
-                type=ActionType.TRAIN_TROOPS,
+                type=ActionType.TRAIN_SETTLERS,
                 params={
-                    "trainer_slot": residence.slot_id,
-                    "trainer_gid": residence.gid,
-                    "priority_units": [
-                        "colono", "coloni", "settler", "settlers", "siedler",
-                    ],
+                    "expansion_slot": residence.slot_id,
+                    "settlers_target": SETTLERS_REQUIRED,
+                    "already_trained": settlers,
                 },
                 reason=(
                     f"Espansione: addestramento coloni in "
@@ -289,8 +441,8 @@ class ExpansionManager:
             )
             return
 
-        # 3. Scansione dei tile target
-        target = await self._pick_target(observer, settings, prefix)
+        # 3. Scansione dei tile target (approved + configurati)
+        target = await self._pick_target(observer, cfg, prefix, store)
         if target is None:
             logger.info(
                 "%s Espansione: nessun tile libero valido tra i target configurati.",
@@ -309,15 +461,21 @@ class ExpansionManager:
                 f"({target.x}|{target.y}) {target.note}"
             ),
         )
+        # Il candidato passa a 'settling' mentre i coloni sono in viaggio
+        store.set_status_at(self.account_id, target.x, target.y, STATUS_SETTLING)
         result = await executor.execute(action, village_id=founder.village_id)
         if result.success:
             self.founded_tiles.append({"x": target.x, "y": target.y, "ts": now})
             self.feed_target = ""
+            store.set_status_at(self.account_id, target.x, target.y, STATUS_SETTLED)
             logger.info(
                 "%s Espansione: villaggio fondato a (%d|%d)!",
                 prefix, target.x, target.y,
             )
         else:
+            # Fallimento: il candidato torna 'approved' per un retry futuro
+            if store.status_at(self.account_id, target.x, target.y) == STATUS_SETTLING:
+                store.set_status_at(self.account_id, target.x, target.y, STATUS_APPROVED)
             self.next_found_attempt = now + FOUND_RETRY_SECONDS
             logger.warning(
                 "%s Espansione: fondazione a (%d|%d) fallita: %s",

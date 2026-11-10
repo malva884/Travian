@@ -22,6 +22,14 @@ from travian_agent.config import (
     save_accounts,
     save_env_settings,
 )
+from travian_agent.cropper import (
+    STATUS_APPROVED,
+    STATUS_PENDING,
+    STATUS_REJECTED,
+    STATUS_SETTLED,
+    STATUS_SETTLING,
+    CropperStore,
+)
 from travian_agent.models import STATIC_TROOP_LABELS, VillageRole
 
 st.set_page_config(
@@ -254,12 +262,13 @@ with st.sidebar:
 
 
 # --- CONTENUTO PRINCIPALE ---
-tab_control, tab_villages, tab_warroom, tab_modules, tab_accounts, tab_logs, tab_debug = st.tabs(
+tab_control, tab_villages, tab_warroom, tab_modules, tab_expansion, tab_accounts, tab_logs, tab_debug = st.tabs(
     [
         "🎮 Controllo & Avvio",
         "🏰 Villaggi & Strategia",
         "⚔️ War Room & AI Scout",
         "🌾 Farming & Espansione",
+        "🌍 Espansione & Cropper",
         "👥 Gestione Account / Server",
         "📜 Log Paralleli",
         "🖼️ Debug & Screenshot",
@@ -869,15 +878,58 @@ with tab_modules:
                     format_func=lambda c: {9: "9c (croplog)", 15: "15c (capitale)", 0: "qualunque"}[c],
                 )
 
+            s_col1, s_col2, s_col3 = st.columns(3)
+            with s_col1:
+                exp_slot_input = st.number_input(
+                    "Slot Residenza/Palazzo (dorf2):",
+                    min_value=0, max_value=40,
+                    value=int(mod_acc.expansion.expansion_slot or 0),
+                    help="Slot dell'edificio che addestra i coloni (tipico: 26, 31 o 32). 0 = auto-detect.",
+                )
+            _primary = (
+                mod_acc.expansion.target_slots[0]
+                if mod_acc.expansion.target_slots else None
+            )
+            with s_col2:
+                target_x_input = st.number_input(
+                    "Coordinata X target:", min_value=-400, max_value=400,
+                    value=int(_primary.x) if _primary else 0,
+                    help="Coordinata X del tile su cui fondare il nuovo villaggio.",
+                )
+            with s_col3:
+                target_y_input = st.number_input(
+                    "Coordinata Y target:", min_value=-400, max_value=400,
+                    value=int(_primary.y) if _primary else 0,
+                    help="Coordinata Y del tile su cui fondare il nuovo villaggio.",
+                )
+
+            _extra_slots = mod_acc.expansion.target_slots[1:] \
+                if len(mod_acc.expansion.target_slots) > 1 else []
             slots_text = "\n".join(
-                f"{t.x},{t.y},{t.note}" for t in mod_acc.expansion.target_slots
+                f"{t.x},{t.y},{t.note}" for t in _extra_slots
             )
             targets_raw = st.text_area(
-                "Tile target (uno per riga: x,y,nota):",
+                "Tile target aggiuntivi (uno per riga: x,y,nota):",
                 value=slots_text,
-                height=120,
-                help="Es: -15,72,Futuro Croplog 15c — coordinate verificate sulla mappa.",
+                height=100,
+                help="Es: -15,72,Futuro Croplog 15c — provati in ordine se il tile X/Y sopra e' occupato.",
             )
+
+            c_col1, c_col2 = st.columns(2)
+            with c_col1:
+                cropper_scan_sel = st.toggle(
+                    "Abilita Cropper Finder (scansione mappa 9c/15c)",
+                    value=mod_acc.expansion.cropper_scan,
+                    key="cropper_scan_toggle",
+                    help="Cataloga i tile liberi ad alto rendimento nella scheda 'Espansione & Cropper' per l'approvazione umana.",
+                )
+            with c_col2:
+                scan_radius_sel = st.number_input(
+                    "Raggio scansione mappa (campi):",
+                    min_value=3, max_value=60,
+                    value=int(mod_acc.expansion.scan_radius or 15),
+                    help="Distanza massima dal villaggio per la ricerca dei cropper.",
+                )
 
             st.divider()
 
@@ -1010,19 +1062,62 @@ with tab_modules:
             mod_acc.expansion.founder_village = (
                 "" if founder_sel.startswith("(auto") else founder_sel
             )
+            mod_acc.expansion.expansion_slot = int(exp_slot_input)
             mod_acc.expansion.crop_min = int(crop_min_sel)
+            mod_acc.expansion.cropper_scan = bool(cropper_scan_sel)
+            mod_acc.expansion.scan_radius = int(scan_radius_sel)
             parsed_targets: list[ExpansionTarget] = []
+            # Target primario dai campi X/Y dedicati
+            if int(target_x_input) or int(target_y_input):
+                parsed_targets.append(
+                    ExpansionTarget(
+                        x=int(target_x_input),
+                        y=int(target_y_input),
+                        note="target primario",
+                    )
+                )
             for line in targets_raw.splitlines():
                 parts = [p.strip() for p in line.replace("|", ",").split(",")]
                 if len(parts) >= 2 and parts[0].lstrip("-").isdigit() and parts[1].lstrip("-").isdigit():
+                    tx, ty = int(parts[0]), int(parts[1])
+                    if (tx, ty) in {(t.x, t.y) for t in parsed_targets}:
+                        continue
                     parsed_targets.append(
                         ExpansionTarget(
-                            x=int(parts[0]),
-                            y=int(parts[1]),
+                            x=tx,
+                            y=ty,
                             note=parts[2] if len(parts) > 2 else "",
                         )
                     )
             mod_acc.expansion.target_slots = parsed_targets
+
+            # Mirror runtime per l'agente (spec: state/expansion_config.json)
+            try:
+                _exp_cfg_path = BASE_DIR / "state" / "expansion_config.json"
+                _exp_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                _exp_cfg: dict = {}
+                if _exp_cfg_path.exists():
+                    _exp_cfg = json.loads(
+                        _exp_cfg_path.read_text(encoding="utf-8")
+                    )
+                    if not isinstance(_exp_cfg, dict):
+                        _exp_cfg = {}
+                _primary_t = parsed_targets[0] if parsed_targets else None
+                _exp_cfg[mod_acc.account_id] = {
+                    "auto_expansion_enabled": bool(exp_enabled),
+                    "source_village": mod_acc.expansion.founder_village,
+                    "expansion_slot": int(exp_slot_input),
+                    "target_coordinates": {
+                        "x": _primary_t.x if _primary_t else 0,
+                        "y": _primary_t.y if _primary_t else 0,
+                    },
+                }
+                _exp_cfg_path.write_text(
+                    json.dumps(_exp_cfg, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
 
             # AI Scout Brain
             mod_acc.scout_brain.enabled = scout_enabled
@@ -1047,6 +1142,109 @@ with tab_modules:
             )
             time.sleep(1)
             st.rerun()
+
+
+# 2.6 TAB ESPANSIONE & CROPPER (Human-in-the-Loop)
+with tab_expansion:
+    st.subheader("🌍 Cropper Finder: Candidati in Attesa di Approvazione")
+    st.caption(
+        "Il bot scansiona la mappa attorno ai villaggi e cataloga i tile 9c/15c liberi. "
+        "La fondazione parte SOLO dopo l'approvazione umana (stato `approved`)."
+    )
+
+    if not accounts:
+        st.info("Nessun account configurato.")
+    else:
+        e_opts = [f"{a.account_id} ({a.server_url})" for a in accounts]
+        e_acc_idx = st.selectbox(
+            "Seleziona Account:", range(len(accounts)),
+            format_func=lambda i: e_opts[i], key="cropper_acc_sel",
+        )
+        e_acc = accounts[e_acc_idx]
+        store = CropperStore()
+        candidates = store.list_candidates(e_acc.account_id)
+
+        f_col1, f_col2, f_col3 = st.columns(3)
+        with f_col1:
+            f_type = st.selectbox(
+                "Filtro tipo:", ["Tutti", "15c", "9c"], key="cropper_f_type"
+            )
+        with f_col2:
+            f_status = st.selectbox(
+                "Filtro stato:",
+                ["Tutti", STATUS_PENDING, STATUS_APPROVED, STATUS_REJECTED,
+                 STATUS_SETTLING, STATUS_SETTLED],
+                key="cropper_f_status",
+            )
+        with f_col3:
+            st.write(" ")
+            if st.button("🔄 Aggiorna lista", key="cropper_refresh"):
+                st.rerun()
+
+        filtered = [
+            c for c in candidates
+            if (f_type == "Tutti" or c.type == f_type)
+            and (f_status == "Tutti" or c.status == f_status)
+        ]
+
+        if not filtered:
+            st.info(
+                "Nessun candidato trovato. Lo scanner di mappa popola questa "
+                "lista durante il ciclo dell'agente (richiede `cropper_scan` attivo)."
+            )
+        else:
+            _status_label = {
+                STATUS_PENDING: "🕐 In attesa",
+                STATUS_APPROVED: "✅ Approvato",
+                STATUS_REJECTED: "❌ Scartato",
+                STATUS_SETTLING: "🚀 Coloni in viaggio",
+                STATUS_SETTLED: "🏘️ Fondato",
+            }
+            _type_label = {"15c": "15 Grani", "9c": "9 Grani"}
+            h = st.columns([1.4, 1.1, 1.2, 2.0, 1.4, 2.0])
+            for col, title in zip(h, ("Coordinate", "Tipo", "Distanza", "Oasi Bonus", "Stato", "Azioni")):
+                col.markdown(f"**{title}**")
+            st.divider()
+            for cand in filtered:
+                r = st.columns([1.4, 1.1, 1.2, 2.0, 1.4, 2.0])
+                r[0].write(f"({cand.x} | {cand.y})")
+                r[1].write(_type_label.get(cand.type, cand.type))
+                r[2].write(f"{cand.distance_hours:.1f} ore")
+                oases_txt = ", ".join(
+                    f"+{o.get('bonus', 25)}% {o.get('type', 'crop')}"
+                    for o in (cand.oases or [])
+                ) or "—"
+                r[3].write(oases_txt)
+                r[4].write(_status_label.get(cand.status, cand.status))
+                with r[5]:
+                    if cand.status == STATUS_PENDING:
+                        b1, b2 = st.columns(2)
+                        with b1:
+                            if st.button(
+                                "Approva",
+                                key=f"app_{e_acc.account_id}_{cand.id}",
+                                type="primary",
+                            ):
+                                store.approve(e_acc.account_id, cand.id)
+                                st.rerun()
+                        with b2:
+                            if st.button(
+                                "Scarta",
+                                key=f"rej_{e_acc.account_id}_{cand.id}",
+                            ):
+                                store.reject(e_acc.account_id, cand.id)
+                                st.rerun()
+                    elif cand.status == STATUS_APPROVED:
+                        st.caption("In coda fondazione")
+                    elif cand.status == STATUS_REJECTED:
+                        if st.button(
+                            "Ripristina",
+                            key=f"rst_{e_acc.account_id}_{cand.id}",
+                        ):
+                            store.set_status(
+                                e_acc.account_id, cand.id, STATUS_PENDING
+                            )
+                            st.rerun()
 
 
 # 3. TAB GESTIONE ACCOUNT

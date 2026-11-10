@@ -72,9 +72,13 @@ class ExpansionConfig:
 
     auto_expand: bool = False
     founder_village: str = ""        # nome/newdid del villaggio fondatore (vuoto = auto)
+    expansion_slot: int = 0          # slot dorf2 Residenza/Palazzo (26/31/32; 0 = auto)
     target_slots: list[ExpansionTarget] = field(default_factory=list)
     crop_min: int = 9                # campi grano minimi richiesti sul tile (9c/15c)
     min_culture_margin: int = 0      # margine CP richiesto oltre la soglia
+    # Cropper Finder (human-in-the-loop): scansione mappa -> candidati dashboard
+    cropper_scan: bool = True        # scansione automatica tile 9c/15c liberi
+    scan_radius: int = 15            # raggio di scansione mappa in campi
 
 
 @dataclass
@@ -244,6 +248,12 @@ def load_accounts() -> list[Settings]:
                                 min_culture_margin=int(
                                     dict(item.get("expansion_settings") or {}).get("min_culture_margin", 0)
                                 ),
+                                cropper_scan=bool(
+                                    dict(item.get("expansion_settings") or {}).get("cropper_scan", True)
+                                ),
+                                scan_radius=int(
+                                    dict(item.get("expansion_settings") or {}).get("scan_radius", 15)
+                                ),
                                 target_slots=[
                                     ExpansionTarget(
                                         x=int(t.get("x", 0)),
@@ -333,8 +343,11 @@ def save_accounts(accounts: list[Settings]) -> None:
             "expansion_settings": {
                 "auto_expand": acc.expansion.auto_expand,
                 "founder_village": acc.expansion.founder_village,
+                "expansion_slot": acc.expansion.expansion_slot,
                 "crop_min": acc.expansion.crop_min,
                 "min_culture_margin": acc.expansion.min_culture_margin,
+                "cropper_scan": acc.expansion.cropper_scan,
+                "scan_radius": acc.expansion.scan_radius,
                 "target_slots": [
                     {"x": t.x, "y": t.y, "note": t.note}
                     for t in acc.expansion.target_slots
