@@ -56,7 +56,6 @@ _LIGHT_RAIDERS = {
 }
 
 # Nome -> set di alias accettati per il check 'unità designata presente'
-# Nome -> set di alias accettati (in italiano) per il check 'unità designata presente'
 _UNIT_KEY_ALIASES: dict[str, set[str]] = {
     # --- ROMANI ---
     "legione": {"u1"}, "legionario": {"u1"}, "legionari": {"u1"},
