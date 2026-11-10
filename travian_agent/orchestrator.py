@@ -300,13 +300,23 @@ async def monitor_all_villages(
                 )
                 surplus = feeder_surplus(state)
                 if market_slot and surplus:
+                    founder_v = next(
+                        (v for v in villages if v.name == expansion_mgr.feed_target),
+                        None,
+                    )
+                    feed_params: dict = {
+                        "market_slot": market_slot,
+                        "target_village": expansion_mgr.feed_target,
+                        "target": expansion_mgr.feed_target,
+                        "resources": surplus,
+                    }
+                    if founder_v is not None and founder_v.x is not None and founder_v.y is not None:
+                        feed_params["target_x"] = founder_v.x
+                        feed_params["target_y"] = founder_v.y
+
                     feed_action = Action(
                         type=ActionType.SEND_RESOURCES,
-                        params={
-                            "market_slot": market_slot,
-                            "target": expansion_mgr.feed_target,
-                            "resources": surplus,
-                        },
+                        params=feed_params,
                         reason=(
                             f"Espansione: feeder -> '{expansion_mgr.feed_target}' "
                             f"invia surplus {surplus} per i coloni"

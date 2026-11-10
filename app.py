@@ -508,41 +508,62 @@ with tab_villages:
                 "feeder": "feeder (Economico) — Mercato/Magazzini + Spedizione surplus al Target",
             }
 
-            # Chiavi edificio (salvate in building_focus) -> etichetta italiana
-            building_focus_labels = {
+            # Chiavi edificio (salvate in building_focus) -> etichetta italiana e alias
+            building_focus_labels: dict[str, str] = {
+                # --- CENTRALI / AMMINISTRAZIONE ---
                 "main": "🏛️ Edificio Principale",
+                "main_building": "🏛️ Edificio Principale",
                 "warehouse": "📦 Magazzino",
                 "granary": "🌾 Granaio",
                 "cranny": "🕳️ Nascondiglio",
                 "embassy": "🤝 Ambasciata",
                 "rally_point": "🚩 Punto di Raduno",
                 "marketplace": "⚖️ Mercato",
+                "market": "⚖️ Mercato",
                 "residence": "🏠 Residenza",
                 "palace": "🏰 Palazzo",
                 "treasury": "💰 Tesoreria",
-                "academy": "🎓 Accademia",
-                "smithy": "⚒️ Fucina",
-                "tournament_square": "🏟️ Piazza del Torneo",
+                "town_hall": "🎉 Municipio",
+                "hero_mansion": "🦸 Casa dell'Eroe",
+                "trade_office": "📈 Ufficio Commerciale",
+
+                # --- MILITARI ---
                 "barracks": "⚔️ Caserma",
                 "great_barracks": "⚔️ Grande Caserma",
                 "stable": "🐎 Scuderia",
                 "great_stable": "🐎 Grande Scuderia",
                 "workshop": "🛠️ Officina",
+                "academy": "🎓 Accademia",
+                "smithy": "⚒️ Fucina",
+                "armoury": "🛡️ Armeria",
+                "tournament_square": "🏟️ Piazza del Torneo",
                 "hospital": "🏥 Ospedale",
-                "hero_mansion": "🦸 Casa dell'Eroe",
-                "town_hall": "🎉 Municipio",
-                "trade_office": "📈 Ufficio Commerciale",
+                "trapper": "🪤 Trappolaio",
+
+                # --- DIFESA E MURA ---
+                "city_wall": "🧱 Mura / Staccionata / Terrapieno",
+                "wall": "🧱 Mura",
+                "earth_wall": "🧱 Terrapieno (Teutoni)",
+                "palisade": "🪵 Staccionata (Galli)",
+
+                # --- BONUS RISORSE / EDIFICI SPECIALI ---
                 "brickyard": "🧱 Fabbrica di Mattoni",
                 "sawmill": "🪚 Segheria",
                 "iron_foundry": "⛏️ Fonderia",
                 "grain_mill": "🌾 Mulino",
                 "bakery": "🥖 Panificio",
                 "stonemason_lodge": "🪨 Bottega del Marmista",
-                "trapper": "🪤 Trappolaio",
                 "horse_drinking_trough": "🐴 Abbeveratoio",
                 "great_warehouse": "📦 Grande Magazzino",
                 "great_granary": "🌾 Grande Granaio",
-                "city_wall": "🧱 Mura / Staccionata / Terrapieno",
+                "brewery": "🍺 Birreria",
+                "waterworks": "⛲ Idrovora",
+
+                # --- CAMPI RISORSA (Base) ---
+                "woodcutter": "🌲 Taglialegna",
+                "clay_pit": "🧱 Pozzo d'Argilla",
+                "iron_mine": "⛏️ Miniera di Ferro",
+                "cropland": "🌾 Campo di Grano",
             }
 
             for idx, vname in enumerate(all_known):

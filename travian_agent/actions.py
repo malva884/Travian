@@ -770,23 +770,77 @@ class ActionExecutor:
         )
         return capped
 
+    async def _resolve_village_coords_from_sidebar(
+        self, page, target_name: str
+    ) -> tuple[int | None, int | None]:
+        """Cerca nella sidebar dei villaggi le coordinate (X, Y) associate al nome del villaggio target."""
+        if not target_name:
+            return None, None
+        try:
+            coords = await page.evaluate(
+                """
+                (needle) => {
+                    const norm = (s) => (s || '').trim().toLowerCase();
+                    const targetNorm = norm(needle);
+                    const entries = Array.from(document.querySelectorAll(
+                        '#sidebarBoxVillagelist .villageList .entry, ' +
+                        '.villageList .entry, .villageList li, ' +
+                        '#sidebarBoxVillagelist li'
+                    ));
+                    for (const entry of entries) {
+                        const nameEl = entry.querySelector('.name, .villageName, .entryName, label, .headline') || entry;
+                        const rawText = (nameEl?.innerText || nameEl?.textContent || entry.innerText || '').trim();
+                        const cleaned = rawText
+                            .replace(/\\s*\\(\\s*[-+]?\\d+\\s*[|/]\\s*[-+]?\\d+\\s*\\)/g, '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        if (norm(cleaned) === targetNorm || norm(rawText).includes(targetNorm)) {
+                            const m = rawText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+                            if (m) {
+                                return [parseInt(m[1], 10), parseInt(m[2], 10)];
+                            }
+                        }
+                    }
+                    // Fallback globale su link contenenti dorf1 con did e testo target
+                    const allLinks = Array.from(document.querySelectorAll('a[href*="newdid="]'));
+                    for (const a of allLinks) {
+                        const text = (a.innerText || a.textContent || '').trim();
+                        if (norm(text).includes(targetNorm)) {
+                            const m = text.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+                            if (m) {
+                                return [parseInt(m[1], 10), parseInt(m[2], 10)];
+                            }
+                        }
+                    }
+                    return null;
+                }
+                """,
+                str(target_name),
+            )
+            if coords and len(coords) == 2:
+                return coords[0], coords[1]
+        except Exception:  # noqa: BLE001
+            pass
+        return None, None
+
     async def _send_resources(self, action: Action, village_id: int = 0) -> ActionResult:
         """Invia risorse tramite il Mercato secondo la sequenza obbligatoria.
 
-        Sequenza:
+        Sequenza con validazione rigida nome villaggio & coordinate:
         1. Navigazione all'edificio (build.php?id=<market_slot>&gid=17)
         2. Selezione del tab 'Invia risorse' (secondo tab, icona frecce di scambio)
-        3. Calcolo capienza mercanti e ridimensionamento carichi (capped_resources)
-        4. Compilazione coordinate / destinazione (nome villaggio target o X/Y)
-        5. Inserimento risorse capped (r1, r2, r3, r4)
-        6. Conferma finale dell'ordine
+        3. Controllo parametri obbligatori: sia target_village che coordinate (X, Y)
+           devono essere presenti (se non nei params, risolti dalla sidebar)
+        4. Compilazione contestuale: nome villaggio target E coordinate (X, Y)
+        5. Inserimento risorse capped (r1, r2, r3, r4) filtrate dalla capienza mercanti
+        6. Clic sul pulsante di conferma finale "Invia risorse"
         """
         params = action.params or {}
         market_slot = params.get("market_slot", 24)
         target = params.get("target_village") or params.get("target")
         resources_dict: dict[str, int] = params.get("resources", {})
         if not market_slot or not target or not resources_dict:
-            return ActionResult(False, "parametri di invio incompleti")
+            return ActionResult(False, "parametri di invio incompleti: mercato, target o risorse mancanti")
 
         page = self.browser.page
         assert page is not None
@@ -822,6 +876,30 @@ class ActionExecutor:
             return ActionResult(False, "impossibile trovare o cliccare il tab 'Invia risorse'")
 
         await sleep_human(0.8, 1.2)
+
+        # 2.1 RISOLUZIONE E CONTROLLO DEI PARAMETRI OBBLIGATORI (Nome Villaggio + Coordinate X, Y)
+        # L'agente non deve procedere se manca anche solo uno dei due riferimenti spaziali.
+        tx = params.get("target_x")
+        ty = params.get("target_y")
+        if tx is None or ty is None:
+            resolved_x, resolved_y = await self._resolve_village_coords_from_sidebar(page, str(target))
+            if resolved_x is not None and resolved_y is not None:
+                tx, ty = resolved_x, resolved_y
+                logger.info(
+                    "Coordinate per '%s' risolte dalla sidebar: (%d|%d)",
+                    target, tx, ty
+                )
+
+        if tx is None or ty is None:
+            logger.error(
+                "Invio risorse bloccato: mancano le coordinate (X, Y) per il villaggio target '%s'. "
+                "Entrambi i riferimenti spaziali (nome e coordinate) sono obbligatori.",
+                target,
+            )
+            return ActionResult(
+                False,
+                f"riferimenti spaziali incompleti: coordinate (X, Y) mancanti per il target '{target}'",
+            )
 
         # Verifica preliminare mercanti disponibili
         market_status = None
@@ -905,7 +983,8 @@ class ActionExecutor:
         send_scope = "[data-tts-sendform='1']"
         village_name_before = await self._active_village_name(page)
 
-        # 3. COMPILAZIONE COORDINATE / DESTINAZIONE (Nome villaggio target o X, Y)
+        # 3. COMPILAZIONE CONTESTUALE: NOME VILLAGGIO TARGET & COORDINATE (X, Y)
+        # Compilazione nome villaggio (esclude categoricamente campi di rinomina)
         target_filled = False
         for sel in selectors.MARKET_TARGET_INPUT:
             if any(bad in sel.lower() for bad in ["rename", "dname", "renamer"]):
@@ -944,32 +1023,45 @@ class ActionExecutor:
                 }
             """, str(target))
 
-        if not target_filled:
-            return ActionResult(False, f"campo destinazione villaggio non trovato (target '{target}')")
-
         # Clic sul suggerimento dell'autocomplete del mercato (se appare)
-        await sleep_human(0.4, 0.9)
+        await sleep_human(0.3, 0.6)
         await self._pick_target_suggestion(page, str(target))
 
-        # Compilazione coordinate esatte (X, Y) nei campi appositi se fornite
-        tx, ty = params.get("target_x"), params.get("target_y")
-        if tx is not None and ty is not None:
-            await page.evaluate("""
-                ([x, y]) => {
-                    const ix = document.querySelector('input[name="x"], input#xCoord, input[id*="xCoord"], .coordinateX input, input.xCoord');
-                    const iy = document.querySelector('input[name="y"], input#yCoord, input[id*="yCoord"], .coordinateY input, input.yCoord');
-                    if (ix) {
-                        ix.value = String(x);
-                        ix.dispatchEvent(new Event('input', {bubbles: true}));
-                        ix.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                    if (iy) {
-                        iy.value = String(y);
-                        iy.dispatchEvent(new Event('input', {bubbles: true}));
-                        iy.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
+        # Compilazione contestuale dei box coordinate dedicati (X, Y)
+        coords_filled = await page.evaluate("""
+            ([x, y]) => {
+                const form = document.querySelector('[data-tts-sendform="1"]') || document;
+                const ix = form.querySelector(
+                    'input[name="x"], input#xCoord, input[id*="xCoord"], .coordinateX input, input.xCoord, input#x'
+                ) || document.querySelector('input[name="x"], input#xCoord, input[id*="xCoord"]');
+                const iy = form.querySelector(
+                    'input[name="y"], input#yCoord, input[id*="yCoord"], .coordinateY input, input.yCoord, input#y'
+                ) || document.querySelector('input[name="y"], input#yCoord, input[id*="yCoord"]');
+
+                let filledAny = false;
+                if (ix && !ix.disabled) {
+                    ix.focus();
+                    ix.value = String(x);
+                    ix.dispatchEvent(new Event('input', {bubbles: true}));
+                    ix.dispatchEvent(new Event('change', {bubbles: true}));
+                    filledAny = true;
                 }
-            """, [tx, ty])
+                if (iy && !iy.disabled) {
+                    iy.focus();
+                    iy.value = String(y);
+                    iy.dispatchEvent(new Event('input', {bubbles: true}));
+                    iy.dispatchEvent(new Event('change', {bubbles: true}));
+                    filledAny = true;
+                }
+                return filledAny;
+            }
+        """, [int(tx), int(ty)])
+
+        if not target_filled and not coords_filled:
+            return ActionResult(
+                False,
+                f"impossibile compilare ne' il nome villaggio ne' le coordinate per il target '{target}' ({tx}|{ty})",
+            )
 
         if "build.php" not in (page.url or ""):
             return ActionResult(False, "selezione destinazione uscita dal mercato - invio annullato")
@@ -1048,8 +1140,11 @@ class ActionExecutor:
         await self._click_first(page, selectors.MARKET_CONFIRM_BUTTON)
         await sleep_human(0.5, 1.0)
 
-        logger.info("Risorse inviate con successo a '%s' dal mercato slot %s", target, market_slot)
-        return ActionResult(True, "risorse inviate con successo tramite il mercato")
+        logger.info(
+            "Risorse inviate con successo a '%s' (%s|%s) dal mercato slot %s",
+            target, tx, ty, market_slot
+        )
+        return ActionResult(True, f"risorse inviate con successo a '{target}' ({tx}|{ty}) tramite il mercato")
 
     async def _send_raid(self, action: Action, village_id: int = 0) -> ActionResult:
         """Lancia un raid dalla farm list del Punto di Raduno (gid 16).

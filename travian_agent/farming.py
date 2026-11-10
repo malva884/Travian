@@ -55,21 +55,47 @@ _LIGHT_RAIDERS = {
     "u24", "u25", "u26",
 }
 
-# Nome -> set di alias accettati per il check 'unita' designata presente'
+# Nome -> set di alias accettati per il check 'unità designata presente'
 _UNIT_KEY_ALIASES: dict[str, set[str]] = {
+    # --- ROMANI ---
     "legione": {"u1"}, "legionario": {"u1"}, "legionari": {"u1"}, "legionnaire": {"u1"},
-    "imperiano": {"u3"}, "imperian": {"u3"},
-    "cavaliere": {"u5", "u6", "u15", "u16", "u24", "u25", "u26"},
-    "equites": {"u5", "u6"},
-    "combattente": {"u11"}, "mazziere": {"u11"}, "clubswinger": {"u11"},
-    "ascia": {"u13"}, "axeman": {"u13"},
-    "paladino": {"u15"}, "paladin": {"u15"},
-    "teutonico": {"u16"}, "teutonic": {"u16"},
-    "spadaccino": {"u22"}, "swordsman": {"u22"},
-    "fulmine": {"u24"}, "teutates": {"u24"},
-    "druido": {"u25"}, "druidrider": {"u25"},
-    "haeduan": {"u26"}, "eduano": {"u26"},
-    "falange": {"u21"}, "phalanx": {"u21"},
+    "pretoriano": {"u2"}, "praetorian": {"u2"}, "pretoriani": {"u2"},
+    "imperiano": {"u3"}, "imperian": {"u3"}, "imperiani": {"u3"},
+    "imperatoris": {"u4"}, "cavaliere imperatoris": {"u4"},
+    "cesaris": {"u5"}, "cavaliere cesaris": {"u5"}, "equites cesaris": {"u5"},
+    "legatus": {"u6"}, "equites legatus": {"u6"}, "esploratore romano": {"u6"},
+    "ariete": {"u7"}, "ariete romano": {"u7"}, "battering ram": {"u7"},
+    "catapulta": {"u8"}, "catapulta romana": {"u8"}, "fire catapult": {"u8"},
+    "senatore": {"u9"}, "senator": {"u9"},
+    "colono": {"u10"}, "coloni romani": {"u10"}, "settler": {"u10"},
+
+    # --- TEUTONI ---
+    "combattente": {"u11"}, "mazziere": {"u11"}, "clubswinger": {"u11"}, "mazzieri": {"u11"},
+    "spearman": {"u12"}, "spearmannen": {"u12"}, "lanciere": {"u12"}, "lancieri teutonici": {"u12"},
+    "ascia": {"u13"}, "axeman": {"u13"}, "combattente con l'ascia": {"u13"},
+    "esploratore": {"u14"}, "scout": {"u14"}, "spia teutonica": {"u14"},
+    "paladino": {"u15"}, "paladin": {"u15"}, "paladini": {"u15"},
+    "teutonico": {"u16"}, "teutonic": {"u16"}, "cavaliere teutonico": {"u16"},
+    "ariete teutonico": {"u17"}, "ram teutonico": {"u17"},
+    "catapulta teutonica": {"u18"}, "catapult teutonica": {"u18"},
+    "capo tribù": {"u19"}, "chief": {"u19"}, "chieftain": {"u19"},
+    "colono teutonico": {"u20"}, "settler teutonico": {"u20"},
+
+    # --- GALLI ---
+    "falange": {"u21"}, "phalanx": {"u21"}, "falangi": {"u21"},
+    "spadaccino": {"u22"}, "swordsman": {"u22"}, "spadaccini galli": {"u22"},
+    "esploratore gallo": {"u23"}, "pathfinder": {"u23"}, "tracker": {"u23"},
+    "fulmine": {"u24"}, "teutates": {"u24"}, "cavaliere di teutates": {"u24"},
+    "druido": {"u25"}, "druidrider": {"u25"}, "cavaliere druido": {"u25"},
+    "haeduan": {"u26"}, "eduano": {"u26"}, "cavaliere eduano": {"u26"},
+    "ariete gallo": {"u27"}, "trebuchet": {"u27"},
+    "catapulta gallo": {"u28"}, "gallic catapult": {"u28"},
+    "capo": {"u29"}, "comandante gallo": {"u29"},
+    "colono gallo": {"u30"}, "settler gallo": {"u30"},
+
+    # --- GENERICI / MACRO-GRUPPI ---
+    "cavaliere": {"u4", "u5", "u6", "u15", "u16", "u24", "u25", "u26"},
+    "equites": {"u4", "u5", "u6"},
     "legger": set(_LIGHT_RAIDERS),  # "truppe leggere" generico
     "light": set(_LIGHT_RAIDERS),
 }
