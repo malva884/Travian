@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import streamlit as st
+from travian_agent.builder import load_build_plans
 from travian_agent.config import (
     BASE_DIR,
     ExpansionTarget,
@@ -614,70 +615,183 @@ with tab_villages:
                 "feeder": "feeder (Economico) — Mercato/Magazzini + Spedizione surplus al Target",
             }
 
-            # Chiavi edificio (salvate in building_focus) -> etichetta italiana e alias
-            building_focus_labels: dict[str, str] = {
-                # --- CENTRALI / AMMINISTRAZIONE ---
-                "main": "🏛️ Edificio Principale",
-                "main_building": "🏛️ Edificio Principale",
-                "warehouse": "📦 Magazzino",
-                "granary": "🌾 Granaio",
-                "cranny": "🕳️ Nascondiglio",
-                "embassy": "🤝 Ambasciata",
-                "rally_point": "🚩 Punto di Raduno",
-                "marketplace": "⚖️ Mercato",
-                "market": "⚖️ Mercato",
-                "residence": "🏠 Residenza",
-                "palace": "🏰 Palazzo",
-                "treasury": "💰 Tesoreria",
-                "town_hall": "🎉 Municipio",
-                "hero_mansion": "🦸 Casa dell'Eroe",
-                "trade_office": "📈 Ufficio Commerciale",
+            # Chiavi canoniche uniche degli edifici per il multiselect (senza alias duplicati)
+            canonical_focus_keys: list[str] = [
+                # --- CAMPI RISORSA (Economia base) ---
+                "cropland",
+                "woodcutter",
+                "clay_pit",
+                "iron_mine",
+                # --- STOCCAGGIO & COMMERCIO ---
+                "granary",
+                "warehouse",
+                "great_granary",
+                "great_warehouse",
+                "marketplace",
+                "trade_office",
+                # --- POTENZIAMENTO RISORSE (+25%) ---
+                "grain_mill",
+                "bakery",
+                "sawmill",
+                "brickyard",
+                "iron_foundry",
+                # --- AMMINISTRAZIONE & INFRASTRUTTURE ---
+                "main_building",
+                "rally_point",
+                "residence",
+                "palace",
+                "town_hall",
+                "treasury",
+                "embassy",
+                "hero_mansion",
+                "cranny",
+                "stonemason_lodge",
+                # --- MILITARI & ADDESTRAMENTO ---
+                "barracks",
+                "stable",
+                "workshop",
+                "academy",
+                "smithy",
+                "great_barracks",
+                "great_stable",
+                "tournament_square",
+                "trapper",
+                "hospital",
+                # --- DIFESA E MURA ---
+                "city_wall",
+                "earth_wall",
+                "palisade",
+                # --- EDIFICI SPECIALI ---
+                "horse_drinking_trough",
+                "brewery",
+                "waterworks",
+            ]
 
-                # --- MILITARI ---
-                "barracks": "⚔️ Caserma",
-                "great_barracks": "⚔️ Grande Caserma",
-                "stable": "🐎 Scuderia",
-                "great_stable": "🐎 Grande Scuderia",
-                "workshop": "🛠️ Officina",
-                "academy": "🎓 Accademia",
-                "smithy": "⚒️ Fucina",
-                "armoury": "🛡️ Armeria",
-                "tournament_square": "🏟️ Piazza del Torneo",
-                "hospital": "🏥 Ospedale",
-                "trapper": "🪤 Trappolaio",
+            # Mappa etichette dettagliate in italiano per gli edifici
+            building_focus_labels: dict[str, str] = {
+                # --- CAMPI RISORSA ---
+                "cropland": "🌾 Campi di Grano (Tutti)",
+                "woodcutter": "🌲 Taglialegna (Tutti)",
+                "clay_pit": "🧱 Pozzi d'Argilla (Tutti)",
+                "iron_mine": "⛏️ Miniere di Ferro (Tutti)",
+
+                # --- STOCCAGGIO & COMMERCIO ---
+                "granary": "🌾 Granaio",
+                "warehouse": "📦 Magazzino",
+                "great_granary": "🌾 Grande Granaio (Capitale)",
+                "great_warehouse": "📦 Grande Magazzino (Capitale)",
+                "marketplace": "⚖️ Mercato",
+                "market": "⚖️ Mercato",  # alias retrocompatibile
+                "trade_office": "📈 Ufficio Commerciale (+Capacità mercanti)",
+
+                # --- POTENZIAMENTO RISORSE (+25%) ---
+                "grain_mill": "🌾 Mulino (+25% Grano)",
+                "bakery": "🥖 Panificio (+25% Grano)",
+                "sawmill": "🪚 Segheria (+25% Legno)",
+                "brickyard": "🧱 Fabbrica di Mattoni (+25% Argilla)",
+                "iron_foundry": "⛏️ Fonderia (+25% Ferro)",
+
+                # --- AMMINISTRAZIONE & INFRASTRUTTURE ---
+                "main_building": "🏛️ Edificio Principale (Velocità costruzioni)",
+                "main": "🏛️ Edificio Principale",  # alias retrocompatibile
+                "rally_point": "🚩 Punto di Raduno",
+                "residence": "🏠 Residenza (Espansione / Slot fondazione)",
+                "palace": "🏰 Palazzo (Capitale / Espansione)",
+                "town_hall": "🎉 Municipio (Grandi Feste / Punti Cultura)",
+                "treasury": "💰 Tesoreria (Custodia Artefatti)",
+                "embassy": "🤝 Ambasciata",
+                "hero_mansion": "🦸 Casa dell'Eroe (Annessione Oasi)",
+                "cranny": "🕳️ Nascondiglio (Protezione risorse)",
+                "stonemason_lodge": "🪨 Bottega del Marmista (Stabilità edifici capitale)",
+
+                # --- MILITARI & ADDESTRAMENTO ---
+                "barracks": "⚔️ Caserma (Addestramento Fanteria)",
+                "stable": "🐎 Scuderia (Addestramento Cavalleria)",
+                "workshop": "🛠️ Officina (Arieti & Catapulte)",
+                "academy": "🎓 Accademia (Sblocco Ricerche)",
+                "smithy": "⚒️ Fucina (Potenziamento Armi e Armature)",
+                "armoury": "⚒️ Fucina / Armeria",  # alias retrocompatibile
+                "great_barracks": "⚔️ Grande Caserma (Doppio addestramento capitale)",
+                "great_stable": "🐎 Grande Scuderia (Doppio addestramento capitale)",
+                "tournament_square": "🏟️ Piazza del Torneo (Velocità truppe >20 campi)",
+                "trapper": "🪤 Trappolaio (Galli — Cattura truppe nemiche)",
+                "hospital": "🏥 Ospedale (Cura e recupero feriti)",
 
                 # --- DIFESA E MURA ---
-                "city_wall": "🧱 Mura / Staccionata / Terrapieno",
-                "wall": "🧱 Mura",
+                "city_wall": "🧱 Mura Cittadine (Tutte le tribù)",
+                "wall": "🧱 Mura Cittadine",  # alias retrocompatibile
                 "earth_wall": "🧱 Terrapieno (Teutoni)",
                 "palisade": "🪵 Staccionata (Galli)",
 
-                # --- BONUS RISORSE / EDIFICI SPECIALI ---
-                "brickyard": "🧱 Fabbrica di Mattoni",
-                "sawmill": "🪚 Segheria",
-                "iron_foundry": "⛏️ Fonderia",
-                "grain_mill": "🌾 Mulino",
-                "bakery": "🥖 Panificio",
-                "stonemason_lodge": "🪨 Bottega del Marmista",
-                "horse_drinking_trough": "🐴 Abbeveratoio",
-                "great_warehouse": "📦 Grande Magazzino",
-                "great_granary": "🌾 Grande Granaio",
-                "brewery": "🍺 Birreria",
-                "waterworks": "⛲ Idrovora",
+                # --- EDIFICI SPECIALI ---
+                "horse_drinking_trough": "🐴 Abbeveratoio (Romani — Riduce consumo grano cavalli)",
+                "brewery": "🍺 Birreria (Teutoni — Bonus attacco)",
+                "waterworks": "⛲ Idrovora (Aumento produzione oasi)",
+            }
 
-                # --- CAMPI RISORSA (Base) ---
-                "woodcutter": "🌲 Taglialegna",
-                "clay_pit": "🧱 Pozzo d'Argilla",
-                "iron_mine": "⛏️ Miniera di Ferro",
-                "cropland": "🌾 Campo di Grano",
+            focus_alias_map: dict[str, str] = {
+                "main": "main_building",
+                "market": "marketplace",
+                "wall": "city_wall",
+                "armoury": "smithy",
+            }
+
+            # Mappa etichette dettagliate per le unità con tribù e ruolo tattico
+            unit_display_labels: dict[str, str] = {
+                # --- ROMANI (t1 - t10) ---
+                "Legionario": "🏛️ [Romani] Legionario — Fanteria base / Difesa",
+                "Pretoriano": "🏛️ [Romani] Pretoriano — Difesa anti-fanteria",
+                "Imperiano": "🏛️ [Romani] Imperiano — Fanteria d'attacco",
+                "Equites Legatus": "🏛️ [Romani] Equites Legatus — Esploratore / Spia",
+                "Equites Imperatoris": "🏛️ [Romani] Equites Imperatoris — Cavalleria d'attacco / Raid",
+                "Equites Caesaris": "🏛️ [Romani] Equites Caesaris — Cavalleria pesante",
+                "Ariete": "🪵 Ariete — Macchina d'assedio",
+                "Catapulta da fuoco": "🏛️ [Romani] Catapulta da fuoco — Assedio / Distruzione",
+                "Senatore": "🏛️ [Romani] Senatore — Conquista villaggi",
+                "Colono": "🌾 Colono — Fondazione nuovi villaggi",
+
+                # --- TEUTONI (t11 - t20) ---
+                "Mazziere": "⚔️ [Teutoni] Mazziere — Attacco rapido / Raid economico",
+                "Lanciere": "⚔️ [Teutoni] Lanciere — Difesa anti-cavalleria",
+                "Guerriero con l'ascia": "⚔️ [Teutoni] Guerriero con l'ascia — Fanteria d'attacco",
+                "Spia": "⚔️ [Teutoni] Spia — Esploratore / Ricognizione",
+                "Paladino": "⚔️ [Teutoni] Paladino — Cavalleria difesa / Raid veloce",
+                "Cavaliere Teutonico": "⚔️ [Teutoni] Cavaliere Teutonico — Cavalleria pesante d'assalto",
+                "Catapulta": "⚔️ [Teutoni] Catapulta — Assedio / Distruzione",
+                "Capotribù": "⚔️ [Teutoni] Capotribù — Conquista villaggi",
+
+                # --- GALLI (t21 - t30) ---
+                "Falange": "🏹 [Galli] Falange — Difesa versatile ed economica",
+                "Spadaccino": "🏹 [Galli] Spadaccino — Fanteria d'attacco",
+                "Tracciatore": "🏹 [Galli] Tracciatore — Esploratore a cavallo",
+                "Fulmine di Teutates": "🏹 [Galli] Fulmine di Teutates — Cavalleria velocissima da raid",
+                "Cavaliere Druido": "🏹 [Galli] Cavaliere Druido — Difesa anti-fanteria",
+                "Eduano": "🏹 [Galli] Eduano — Cavalleria pesante",
+                "Trabucco": "🏹 [Galli] Trabucco — Assedio / Distruzione",
+                "Comandante": "🏹 [Galli] Comandante — Conquista villaggi",
+
+                # --- ALIAS E PLURALI RETROCOMPATIBILI ---
+                "Legionari": "🏛️ [Romani] Legionario (Legionari) — Fanteria base / Difesa",
+                "Pretoriani": "🏛️ [Romani] Pretoriano (Pretoriani) — Difesa anti-fanteria",
+                "Imperiani": "🏛️ [Romani] Imperiano (Imperiani) — Fanteria d'attacco",
+                "Mazzieri": "⚔️ [Teutoni] Mazziere (Mazzieri) — Attacco rapido / Raid",
+                "Lancieri": "⚔️ [Teutoni] Lanciere (Lancieri) — Difesa anti-cavalleria",
+                "Falangi": "🏹 [Galli] Falange (Falangi) — Difesa versatile",
+                "Spadaccini": "🏹 [Galli] Spadaccino (Spadaccini) — Fanteria d'attacco",
+            }
+
+            # Nomi sintetici delle unità per i widget di target numerico
+            unit_short_names: dict[str, str] = {
+                k: v.split("—")[0].strip() for k, v in unit_display_labels.items()
             }
 
             for idx, vname in enumerate(all_known):
                 old_cfg = cur_acc.villages.get(vname, VillageConfig(name=vname))
-                # Chiavi widget legate al villaggio (non alla posizione):
-                # lo stato segue il villaggio anche se l'ordine cambia.
                 vkey = "".join(c if c.isalnum() or c in "._-" else "_" for c in vname)
+
                 with st.expander(f"🏰 Configurazione per '{vname}'", expanded=True):
+                    # --- SEZIONE 1: RUOLO STRATEGICO & TARGET FEEDER ---
+                    st.markdown("##### 👑 Ruolo Strategico & Connessioni Rete")
                     r_col1, r_col2 = st.columns([1, 1])
                     with r_col1:
                         cur_role_val = old_cfg.role if old_cfg.role in role_choices else "standard"
@@ -687,6 +801,7 @@ with tab_villages:
                             index=role_choices.index(cur_role_val),
                             format_func=lambda r: role_labels.get(r, r),
                             key=f"role_{cur_acc.account_id}_{vkey}",
+                            help="Determina la logica autonoma di sviluppo del villaggio (VillageBrain).",
                         )
                     with r_col2:
                         cur_target = old_cfg.target_village if old_cfg.target_village in target_options else "(Nessuno)"
@@ -695,101 +810,131 @@ with tab_villages:
                             target_options,
                             index=target_options.index(cur_target) if cur_target in target_options else 0,
                             key=f"target_{cur_acc.account_id}_{vkey}",
+                            help="Se il ruolo è 'feeder', il surplus di risorse viene inviato periodicamente a questo villaggio.",
                         )
                         assigned_target = "" if new_target == "(Nessuno)" else new_target
 
-                    u_col1, u_col2, u_col3, u_col4, u_col5 = st.columns([2, 2, 1, 1, 1])
-                    with u_col1:
-                        # Opzioni = nomi unita' delle tre tribu' (dedup, ordine
-                        # della mappa) + eventuali valori legacy gia' salvati
-                        unit_options = list(dict.fromkeys(STATIC_TROOP_LABELS.values()))
+                    st.divider()
+
+                    # --- SEZIONE 2: PRIORITÀ EDIFICI & ESERCITO (DIVISE A 2 COLONNE CHIARE E LARGHE) ---
+                    p_col1, p_col2 = st.columns([1, 1])
+
+                    with p_col1:
+                        st.markdown("##### 🏗️ Edifici Prioritari")
+                        st.caption("Override della coda: questi edifici avranno precedenza assoluta sullo sviluppo economico.")
+
+                        # Normalizza chiavi legacy per evitare doppioni
+                        current_focus_normalized: list[str] = []
+                        for _f in old_cfg.building_focus:
+                            can_f = focus_alias_map.get(_f, _f)
+                            if can_f not in current_focus_normalized:
+                                current_focus_normalized.append(can_f)
+
+                        focus_options = list(canonical_focus_keys)
+                        for _f in current_focus_normalized:
+                            if _f not in focus_options:
+                                focus_options.append(_f)
+
+                        parsed_focus = st.multiselect(
+                            "Edifici da Privilegiare:",
+                            options=focus_options,
+                            default=[f for f in current_focus_normalized if f in focus_options],
+                            format_func=lambda k: building_focus_labels.get(k, k),
+                            key=f"focus_{cur_acc.account_id}_{vkey}",
+                            help="Seleziona uno o più edifici da costruire o ampliare con priorità prima della normale rotazione dei campi.",
+                        )
+
+                    with p_col2:
+                        st.markdown("##### ⚔️ Unità Addestrabili Consentite")
+                        st.caption("Filtro truppe per questo villaggio: l'ordine stabilisce la priorità di addestramento.")
+
+                        # Opzioni truppe = catalogo unità Travian + eventuali selezioni pregresse
+                        unit_options = list(dict.fromkeys(list(unit_display_labels.keys()) + list(STATIC_TROOP_LABELS.values())))
                         for _u in old_cfg.allowed_units:
                             if _u not in unit_options:
                                 unit_options.append(_u)
+
                         parsed_units = st.multiselect(
-                            "Unità Addestrabili Consentite:",
+                            "Unità Consentite per questo Villaggio:",
                             options=unit_options,
                             default=[u for u in old_cfg.allowed_units if u in unit_options],
+                            format_func=lambda u: unit_display_labels.get(u, u),
                             key=f"units_{cur_acc.account_id}_{vkey}",
-                            help="Ordine = priorita' di addestramento (usato dai ruoli "
-                                 "hammer/defensive). Vuoto = nessun filtro.",
-                        )
-                    with u_col2:
-                        # Le opzioni includono eventuali chiavi legacy gia'
-                        # salvate e non presenti nella mappa (retrocompat).
-                        focus_options = list(building_focus_labels.keys())
-                        for _f in old_cfg.building_focus:
-                            if _f not in focus_options:
-                                focus_options.append(_f)
-                        parsed_focus = st.multiselect(
-                            "Edifici Prioritari:",
-                            options=focus_options,
-                            default=[f for f in old_cfg.building_focus if f in focus_options],
-                            format_func=lambda k: building_focus_labels.get(k, k),
-                            key=f"focus_{cur_acc.account_id}_{vkey}",
-                            help="Edifici a cui dare priorita' di upgrade in questo villaggio",
-                        )
-                    with u_col3:
-                        parsed_market_slot = st.number_input(
-                            "Slot Mercato:",
-                            min_value=0,
-                            max_value=40,
-                            value=int(old_cfg.market_slot or 0),
-                            step=1,
-                            key=f"market_slot_{cur_acc.account_id}_{vkey}",
-                            help="Slot dorf2 del Mercato (19-40). "
-                                 "0 = rilevamento automatico via gid=17.",
-                        )
-                    with u_col4:
-                        parsed_x = st.number_input(
-                            "Coord X:",
-                            min_value=-500,
-                            max_value=500,
-                            value=int(old_cfg.x if old_cfg.x is not None else 0),
-                            step=1,
-                            key=f"coord_x_{cur_acc.account_id}_{vkey}",
-                            help="Coordinata X del villaggio (utilizzata per l'invio risorse al mercato).",
-                        )
-                    with u_col5:
-                        parsed_y = st.number_input(
-                            "Coord Y:",
-                            min_value=-500,
-                            max_value=500,
-                            value=int(old_cfg.y if old_cfg.y is not None else 0),
-                            step=1,
-                            key=f"coord_y_{cur_acc.account_id}_{vkey}",
-                            help="Coordinata Y del villaggio (utilizzata per l'invio risorse al mercato).",
+                            help="Filtra rigorosamente quali unità questo villaggio può addestrare. Lascia vuoto per consentire tutte le unità.",
                         )
 
-                    # --- SMART TROOP REPLENISHMENT: target numerico per unita' ---
-                    # L'utente definisce l'obiettivo per ciascuna unita'
-                    # addestrabile; il modulo riaddestra il deficit
-                    # (target - attuali - in coda) dopo ogni report.
-                    st.markdown(
-                        "**🎯 Target Truppe (Smart Replenishment):** "
-                        "obiettivo per unita' — 0 = non riaddestrare"
-                    )
+                    # --- SOTTOSEZIONE: TARGET TRUPPE (SMART TROOP REPLENISHMENT) ---
                     target_units = list(dict.fromkeys(
                         list(parsed_units) + list(old_cfg.troop_targets.keys())
                     ))
                     troop_targets: dict[str, int] = {}
                     if target_units:
-                        t_cols = st.columns(min(4, len(target_units)))
+                        st.markdown("###### 🎯 Obiettivi Numerici (Smart Troop Replenishment)")
+                        st.caption("Target di truppe stabili (presenti + in coda): il bot colmerà automaticamente il deficit post-battaglia.")
+                        t_cols = st.columns(min(4, max(1, len(target_units))))
                         for t_idx, t_unit in enumerate(target_units):
                             with t_cols[t_idx % len(t_cols)]:
+                                display_name = unit_short_names.get(t_unit, t_unit)
                                 troop_targets[t_unit] = st.number_input(
-                                    f"Target {t_unit}:",
+                                    f"Target {display_name}:",
                                     min_value=0,
                                     max_value=100000,
-                                    value=int(
-                                        old_cfg.troop_targets.get(t_unit, 0) or 0
-                                    ),
+                                    value=int(old_cfg.troop_targets.get(t_unit, 0) or 0),
                                     step=10,
                                     key=f"ttgt_{cur_acc.account_id}_{vkey}_{t_idx}",
+                                    help=f"Quantità minima da mantenere per {t_unit}. 0 = non riaddestrare.",
                                 )
                     troop_targets = {
                         u: q for u, q in troop_targets.items() if int(q) > 0
                     }
+
+                    st.divider()
+
+                    # --- SEZIONE 3: PARAMETRI TECNICI & COORDINATE (4 COLONNE SPAZIOSE E DEDICATE) ---
+                    st.markdown("##### 📍 Coordinate Mappa & Parametri Tecnici")
+                    c_col1, c_col2, c_col3, c_col4 = st.columns(4)
+                    with c_col1:
+                        parsed_x = st.number_input(
+                            "Coordinata X:",
+                            min_value=-500,
+                            max_value=500,
+                            value=int(old_cfg.x if old_cfg.x is not None else 0),
+                            step=1,
+                            key=f"coord_x_{cur_acc.account_id}_{vkey}",
+                            help="Coordinata X sulla mappa del villaggio (utilizzata per rotte mercato e distanze).",
+                        )
+                    with c_col2:
+                        parsed_y = st.number_input(
+                            "Coordinata Y:",
+                            min_value=-500,
+                            max_value=500,
+                            value=int(old_cfg.y if old_cfg.y is not None else 0),
+                            step=1,
+                            key=f"coord_y_{cur_acc.account_id}_{vkey}",
+                            help="Coordinata Y sulla mappa del villaggio (utilizzata per rotte mercato e distanze).",
+                        )
+                    with c_col3:
+                        parsed_market_slot = st.number_input(
+                            "Slot Mercato (dorf2):",
+                            min_value=0,
+                            max_value=40,
+                            value=int(old_cfg.market_slot or 0),
+                            step=1,
+                            key=f"market_slot_{cur_acc.account_id}_{vkey}",
+                            help="Slot dorf2 del Mercato (19-40). 0 = rilevamento automatico via gid=17.",
+                        )
+                    with c_col4:
+                        parsed_net_crop = st.number_input(
+                            "Min Net Crop/h:",
+                            min_value=0.0,
+                            max_value=100000.0,
+                            value=float(old_cfg.min_net_crop_threshold or 0.0),
+                            step=5.0,
+                            key=f"netcrop_{cur_acc.account_id}_{vkey}",
+                            help="Grain Safety Net: margine netto grano minimo (unità/ora). "
+                                 "Sotto soglia sono bloccati upgrade non-grano e addestramenti. "
+                                 "0 = eredita la soglia globale dell'account.",
+                        )
 
                     # Se X e Y sono entrambi 0 e l'utente non li ha impostati, preserva None se era None
                     final_x = parsed_x if (parsed_x != 0 or old_cfg.x == 0) else old_cfg.x
@@ -800,10 +945,13 @@ with tab_villages:
                         role=new_role,
                         target_village=assigned_target,
                         allowed_units=parsed_units,
+                        priority_units=list(parsed_units),
                         building_focus=parsed_focus,
                         farm_enabled=old_cfg.farm_enabled,
                         farm_unit=old_cfg.farm_unit,
+                        defense_enabled=old_cfg.defense_enabled,
                         market_slot=int(parsed_market_slot),
+                        min_net_crop_threshold=float(parsed_net_crop or 0.0),
                         x=int(final_x) if final_x is not None else None,
                         y=int(final_y) if final_y is not None else None,
                         troop_targets=troop_targets,
@@ -1592,6 +1740,41 @@ with tab_expansion:
                             )
                             st.rerun()
 
+    # --- Smart Building planner: prossimi upgrade stimati per villaggio ---
+    st.divider()
+    st.subheader("🏗️ Piano Upgrade Pianificato (Smart Building)")
+    st.caption(
+        "Prossimi upgrade stimati dal planner dinamico "
+        "(storage > grain safety > focus > ruolo > economia). "
+        "Aggiornato a ogni ciclo dell'agente."
+    )
+    plans = load_build_plans(e_acc.account_id)
+    if not plans:
+        st.info(
+            "Nessun piano disponibile: il planner lo genera al prossimo "
+            "ciclo dell'agente."
+        )
+    else:
+        _kind_label = {
+            "storage": "📦 Storage",
+            "grain_safety": "🌾 Grain Safety",
+            "focus": "🎯 Focus Manuale",
+            "role": "🎖️ Ruolo",
+            "economy": "📈 Economia",
+        }
+        for pv_name, entry in plans.items():
+            items = (entry or {}).get("items") or []
+            if not items:
+                continue
+            with st.expander(f"🏰 {pv_name} — {len(items)} upgrade previsti"):
+                for idx, it in enumerate(items, start=1):
+                    st.write(
+                        f"{idx}. **{it.get('name', 'slot ' + str(it.get('slot_id')))}** "
+                        f"→ liv. {it.get('target_level')} "
+                        f"· {_kind_label.get(it.get('kind'), it.get('kind'))} "
+                        f"· _{it.get('reason', '')}_"
+                    )
+
 
 # 3. TAB GESTIONE ACCOUNT
 with tab_accounts:
@@ -1616,14 +1799,33 @@ with tab_accounts:
                 if not new_server_url or new_server_url == "https://":
                     st.error("Inserisci un URL server valido.")
                 else:
-                    new_sett = Settings(
-                        account_id=new_acc_id.strip() or f"acc_{len(accounts)+1}",
-                        server_url=new_server_url.strip().rstrip("/"),
-                        username=new_username.strip(),
-                        password=new_password.strip(),
-                        loop_interval_min=new_loop_min,
-                        loop_interval_max=new_loop_max,
+                    target_id = new_acc_id.strip() or f"acc_{len(accounts)+1}"
+                    existing_sett = next(
+                        (a for a in accounts if a.account_id == target_id), None
                     )
+                    if existing_sett is not None:
+                        # Update: preserva moduli (difesa, farming, scout,
+                        # eroe, replenishment, espansione) e villaggi.
+                        # Username/password vuoti = mantieni i precedenti.
+                        existing_sett.server_url = (
+                            new_server_url.strip().rstrip("/")
+                        )
+                        if new_username.strip():
+                            existing_sett.username = new_username.strip()
+                        if new_password.strip():
+                            existing_sett.password = new_password.strip()
+                        existing_sett.loop_interval_min = new_loop_min
+                        existing_sett.loop_interval_max = new_loop_max
+                        new_sett = existing_sett
+                    else:
+                        new_sett = Settings(
+                            account_id=target_id,
+                            server_url=new_server_url.strip().rstrip("/"),
+                            username=new_username.strip(),
+                            password=new_password.strip(),
+                            loop_interval_min=new_loop_min,
+                            loop_interval_max=new_loop_max,
+                        )
                     # Sostituisci se esiste o aggiungi
                     updated = [a for a in accounts if a.account_id != new_sett.account_id]
                     updated.append(new_sett)

@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import sys
 import time
 from pathlib import Path
 
@@ -31,30 +30,8 @@ from .config import Settings
 
 logger = logging.getLogger(__name__)
 
-# Workaround Windows (WinError 10054): quando il processo Chromium chiude
-# bruscamente la pipe, ProactorEventLoop esegue socket.shutdown() su una
-# connessione gia' morta e asyncio logga "Exception in callback
-# _call_connection_lost" con ConnectionResetError. E' rumore non bloccante
-# (la connessione e' gia' chiusa): lo sopprimiamo.
-if sys.platform.startswith("win"):
-    try:
-        from asyncio.proactor_events import _ProactorBasePipeTransport
-
-        _orig_call_connection_lost = (
-            _ProactorBasePipeTransport._call_connection_lost
-        )
-
-        def _safe_call_connection_lost(self, exc):  # type: ignore[no-untyped-def]
-            try:
-                _orig_call_connection_lost(self, exc)
-            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-                pass
-
-        _ProactorBasePipeTransport._call_connection_lost = (
-            _safe_call_connection_lost
-        )
-    except Exception:  # noqa: BLE001 - patch opzionale, best effort
-        pass
+# Nota: la patch asyncio per WinError 10054 (_ProactorBasePipeTransport)
+# vive in travian_agent/__init__.py: si applica a ogni import del package.
 
 
 def human_delay(min_seconds: float = 0.8, max_seconds: float = 2.5) -> float:

@@ -15,7 +15,14 @@ from .actions import ActionExecutor
 from .ai_scout_brain import AIScoutBrain, assess_account_power
 from .brain import LLMBrain, RuleBasedBrain
 from .browser import TravianBrowser
-from .config import BASE_DIR, Settings, load_accounts
+from .builder import plan_upgrades, save_build_plan
+from .config import (
+    BASE_DIR,
+    Settings,
+    VillageConfig,
+    load_accounts,
+    save_accounts,
+)
 from .defense import DefenseManager
 from .expansion import ExpansionManager, feeder_surplus, find_market
 from .farming import FarmingManager, find_rally_point
@@ -45,6 +52,75 @@ _scout_brains: dict[str, AIScoutBrain] = {}
 _hero_managers: dict[str, HeroManager] = {}
 _defense_managers: dict[str, DefenseManager] = {}
 _replenish_managers: dict[str, TroopReplenishmentManager] = {}
+
+
+def _persist_village_coords(
+    settings: Settings, villages: list[Village]
+) -> None:
+    """Scrive le coordinate rilevate dalla mappa in accounts.json.
+
+    Ricarica gli account dal file (fonte di verita', puo' essere stata
+    toccata dalla dashboard) e aggiorna solo il VillageConfig dei
+    villaggi con x/y note: crea la config se assente.
+    """
+    try:
+        accounts = load_accounts()
+        acc = next(
+            (a for a in accounts if a.account_id == settings.account_id),
+            None,
+        )
+        if acc is None:
+            return
+        # Villaggi omonimi (es. due 'Hipponion'): la chiave nome
+        # colliderebbe. Il primo omonimo usa la chiave nome (eredita la
+        # config utente esistente), i successivi ricevono una voce
+        # separata keyed per newdid — village_config_for preferisce l'id.
+        name_counts: dict[str, int] = {}
+        for v in villages:
+            if v.name:
+                name_counts[v.name] = name_counts.get(v.name, 0) + 1
+        dup_names = {n for n, c in name_counts.items() if c > 1}
+        claimed: set[str] = set()
+        changed = False
+        for v in villages:
+            if v.x is None or v.y is None:
+                continue
+            key_id = str(v.village_id) if v.village_id else ""
+            cfg = acc.villages.get(key_id) if key_id else None
+            if cfg is None and v.name:
+                dup = v.name in dup_names
+                if not dup or v.name not in claimed:
+                    cfg = acc.villages.get(v.name)
+                    if cfg is None:
+                        cfg = next(
+                            (
+                                c
+                                for c in acc.villages.values()
+                                if c.name == v.name
+                            ),
+                            None,
+                        )
+                    if cfg is None:
+                        cfg = VillageConfig(name=v.name)
+                        acc.villages[v.name] = cfg
+                    if dup:
+                        claimed.add(v.name)
+            if cfg is None:
+                if not key_id:
+                    continue
+                cfg = VillageConfig(name=v.name or key_id)
+                acc.villages[key_id] = cfg
+            if cfg.x != v.x or cfg.y != v.y:
+                cfg.x, cfg.y = v.x, v.y
+                changed = True
+        if changed:
+            save_accounts(accounts)
+            logger.info(
+                "[%s] Coordinate villaggi persistite su accounts.json.",
+                settings.account_id,
+            )
+    except Exception:
+        logger.debug("Persistenza coordinate villaggi fallita", exc_info=True)
 
 
 def _append_history(account_id: str, state: GameState, action: Action) -> None:
@@ -138,10 +214,17 @@ async def monitor_all_villages(
     # Mappa coordinate note dei villaggi (nome -> (x, y))
     village_coords_map: dict[str, tuple[int, int]] = {}
     for v in villages:
+        # Backfill da VillageConfig se la sidebar non espone le coordinate:
+        # il CropperScanner ha bisogno di villaggi con x/y come centri scansione.
+        cfg = settings.village_config_for(v.name, v.village_id)
+        if cfg is not None:
+            if v.x is None and cfg.x is not None:
+                v.x = cfg.x
+            if v.y is None and cfg.y is not None:
+                v.y = cfg.y
         if v.name and v.x is not None and v.y is not None:
             village_coords_map[v.name.strip().lower()] = (v.x, v.y)
         # Aggiorna anche VillageConfig se x/y non erano ancora valorizzati
-        cfg = settings.village_config_for(v.name, v.village_id)
         if cfg is not None:
             if v.x is not None and cfg.x is None:
                 cfg.x = v.x
@@ -150,43 +233,88 @@ async def monitor_all_villages(
             if cfg.x is not None and cfg.y is not None and v.name:
                 village_coords_map[v.name.strip().lower()] = (cfg.x, cfg.y)
 
+    # 1.05 Coordinate mancanti: fallback via mappa per i server dove la
+    # sidebar non espone (x|y). Rilevate una tantum e persistite su
+    # accounts.json; serve soprattutto alla scansione cropper.
+    if settings.expansion.cropper_scan or settings.expansion.auto_expand:
+        missing = [
+            v for v in villages
+            if (v.x is None or v.y is None) and v.village_id
+        ]
+        if missing:
+            learned = False
+            for v in missing[:5]:
+                try:
+                    coords = await observer.read_village_coords(v.village_id)
+                except Exception:
+                    coords = None
+                if coords is None:
+                    continue
+                v.x, v.y = coords
+                learned = True
+                # Nota: non si scrive nel VillageConfig live (il fallback
+                # per nome colliderebbe con villaggi omonimi); la
+                # persistenza in _persist_village_coords gestisce il
+                # caso e l'hot-reload la rilegge al ciclo successivo.
+                if v.name:
+                    village_coords_map[v.name.strip().lower()] = coords
+                logger.info(
+                    "%s Coordinate '%s' rilevate via mappa: (%d|%d)",
+                    prefix, v.name, v.x, v.y,
+                )
+            if learned:
+                _persist_village_coords(settings, villages)
+            else:
+                logger.debug(
+                    "%s Coordinate non rilevate per %d villaggi "
+                    "(mappa non leggibile o layout ignoto).",
+                    prefix, len(missing),
+                )
+
     # 1.1 Controllo e attivazione automatica del bonus +15% per 8 ore su tutte le risorse (video ad)
     if settings.auto_video_bonus:
-        now = time.time()
-        last_claim = _last_video_bonus_claim.get(settings.account_id, 0.0)
-        has_notification = await observer.has_video_bonus_available()
-        # Riscatta se sono trascorse ~7.8 ore (28000s) o se l'InfoBox segnala la disponibilità
-        if (now - last_claim >= 28000.0) or has_notification:
-            logger.info(
-                "%s Verifica e riscatto automatico bonus produzione +15%% (8 ore) via video...",
-                prefix,
-            )
-            claim_action = Action(
-                type=ActionType.CLAIM_VIDEO_BONUS,
-                reason="Attivazione automatica bonus +15% produzione risorse per 8 ore (video ad)",
-            )
-            claim_result = await executor.execute(claim_action)
-            # Registra il timer solo se il bonus e' stato davvero accreditato
-            # o era gia' attivo: un fallimento viene ritentato al ciclo dopo.
-            claimed = claim_result.success and (
-                "attivati" in claim_result.message
-                or "già attivi" in claim_result.message
-            )
-            if claimed:
-                _last_video_bonus_claim[settings.account_id] = now
-                logger.info("%s Bonus video +15%% registrato per le prossime 8 ore", prefix)
-            elif claim_result.success:
-                logger.debug(
-                    "%s Bonus video: %s (nessuna attivazione confermata)",
+        try:
+            now = time.time()
+            last_claim = _last_video_bonus_claim.get(settings.account_id, 0.0)
+            has_notification = await observer.has_video_bonus_available()
+            # Riscatta se sono trascorse ~7.8 ore (28000s) o se l'InfoBox segnala la disponibilità
+            if (now - last_claim >= 28000.0) or has_notification:
+                logger.info(
+                    "%s Verifica e riscatto automatico bonus produzione +15%% (8 ore) via video...",
                     prefix,
-                    claim_result.message,
                 )
-            else:
-                logger.warning(
-                    "%s Riscatto bonus video fallito: %s",
-                    prefix,
-                    claim_result.message,
+                claim_action = Action(
+                    type=ActionType.CLAIM_VIDEO_BONUS,
+                    reason="Attivazione automatica bonus +15% produzione risorse per 8 ore (video ad)",
                 )
+                claim_result = await executor.execute(claim_action)
+                # Registra il timer solo se il bonus e' stato davvero accreditato
+                # o era gia' attivo: un fallimento viene ritentato al ciclo dopo.
+                claimed = claim_result.success and (
+                    "attivati" in claim_result.message
+                    or "già attivi" in claim_result.message
+                )
+                if claimed:
+                    _last_video_bonus_claim[settings.account_id] = now
+                    logger.info("%s Bonus video +15%% registrato per le prossime 8 ore", prefix)
+                elif claim_result.success:
+                    logger.debug(
+                        "%s Bonus video: %s (nessuna attivazione confermata)",
+                        prefix,
+                        claim_result.message,
+                    )
+                else:
+                    logger.warning(
+                        "%s Riscatto bonus video fallito: %s",
+                        prefix,
+                        claim_result.message,
+                    )
+        except Exception as vb_exc:
+            # Senza questa guardia un fallimento qui abortirebbe l'intero
+            # ciclo: villaggi, espansione ed eroe non verrebbero mai eseguiti.
+            logger.warning(
+                "%s Errore bonus video (ciclo continua): %s", prefix, vb_exc
+            )
 
     # Edifici interni per villaggio: serve ai moduli farming/espansione
     interior_map: dict[str, list[Field]] = {}
@@ -240,6 +368,25 @@ async def monitor_all_villages(
                 interior_map[village.name or str(village.village_id)] = interior
                 logger.debug(
                     "%s Edifici interni rilevati: %d", vprefix, len(interior)
+                )
+
+            # Produzione oraria e bilancio netto grano (production.php):
+            # serve alla Grain Safety Net dello Smart Building planner.
+            try:
+                prod = await observer.read_production(village.village_id)
+                if prod:
+                    state.resources.production_per_hour = prod.get(
+                        "production", {}
+                    )
+                    cb = prod.get("crop_balance")
+                    if cb is not None:
+                        # None = riga bilancio non letta: NON stimare
+                        # il netto dalla produzione lorda.
+                        state.resources.crop_balance = int(cb)
+            except Exception as prod_exc:
+                logger.debug(
+                    "%s Lettura produzione fallita (non bloccante): %s",
+                    vprefix, prod_exc,
                 )
 
             if village.name:
@@ -298,6 +445,19 @@ async def monitor_all_villages(
             troops_by_village[vname] = state.troops_home
 
             action = brain.decide(state)
+
+            # Smart Building planner: persiste i prossimi upgrade stimati
+            # per la preview in dashboard (state/build_plan_<account>.json).
+            try:
+                plan = plan_upgrades(state, settings)
+                save_build_plan(
+                    settings.account_id, state.village_name or vname, plan
+                )
+            except Exception as plan_exc:
+                logger.debug(
+                    "%s Build plan non salvato: %s", vprefix, plan_exc
+                )
+
             # Arricchimento coordinate target per invio risorse al mercato
             if action.type == ActionType.SEND_RESOURCES:
                 act_params = action.params or {}
@@ -374,7 +534,24 @@ async def monitor_all_villages(
 
             # 4.1.c Smart Troop Replenishment: analisi post-battaglia e
             # rimpiazzo condizionato delle perdite (target - attuali - coda)
-            if replenish_mgr is not None and settings.replenishment.enabled:
+            # Lock temporaneo (spec 4.1): durante l'emergenza difesa il
+            # rimpiazzo e' congelato per non spendere le risorse svuotate.
+            emergency_locked = (
+                defense_mgr is not None
+                and defense_mgr.is_emergency_locked(
+                    village.village_id or state.village_id
+                )
+            )
+            if emergency_locked:
+                logger.info(
+                    "%s Replenishment congelato: emergenza difesa attiva.",
+                    vprefix,
+                )
+            if (
+                replenish_mgr is not None
+                and settings.replenishment.enabled
+                and not emergency_locked
+            ):
                 try:
                     # Scenario 2: il villaggio sotto assedio blocca rimpiazzo
                     # e rinforzi; se la difesa e' stabile si sblocca da solo.
@@ -436,8 +613,22 @@ async def monitor_all_villages(
                         deficit = replenish_mgr.compute_deficit(
                             vcfg_rep.troop_targets, troops_now, queued
                         )
+                        # Anti-saturazione (spec 2.1): se il villaggio e'
+                        # il fondatore designato o la rete feeder gli sta'
+                        # spedendo risorse, la riserva 3x colono e' intoccabile.
+                        founder_cfg = (
+                            settings.expansion.founder_village or ""
+                        ).strip()
+                        reserve_settlers = bool(
+                            founder_cfg
+                            and founder_cfg in (vname, str(target_vid))
+                        ) or bool(
+                            expansion_mgr is not None
+                            and expansion_mgr.feed_target == vname
+                        )
                         plan = replenish_mgr.plan_training(
-                            deficit, state, settings, village_name=vname
+                            deficit, state, settings, village_name=vname,
+                            reserve_settlers=reserve_settlers,
                         )
                         if plan and trainer_slots_rep:
                             rep_action = Action(

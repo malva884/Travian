@@ -54,6 +54,76 @@ RAID_UNIT_PREFERENCE = ("t11", "t24", "t5", "t1", "t22", "t13", "t15", "t6")
 # Chiavi risorsa usate nei costi di addestramento
 _RES_KEYS = ("wood", "clay", "iron", "crop")
 
+# Coloni per tribu' (t10 Romani, t20 Teutoni, t30 Galli) e numero richiesto
+# per la fondazione: la riserva anti-saturazione e' 3 x costo colono.
+SETTLER_UNITS = ("t10", "t20", "t30")
+SETTLERS_REQUIRED = 3
+
+
+def settler_reserve() -> dict[str, int]:
+    """Riserva risorse anti-saturazione: ``3 x Costo Colono``.
+
+    La tribu' del villaggio non e' sempre nota al planner: per sicurezza si
+    prende, risorsa per risorsa, il costo massimo fra i tre tipi di colono.
+    """
+    try:
+        from .actions import STATIC_TROOP_COSTS  # import ritardato: no cicli
+    except Exception:  # noqa: BLE001
+        return {}
+    reserve: dict[str, int] = {}
+    for unit in SETTLER_UNITS:
+        cost = STATIC_TROOP_COSTS.get(unit) or {}
+        for res in _RES_KEYS:
+            reserve[res] = max(
+                reserve.get(res, 0), SETTLERS_REQUIRED * int(cost.get(res, 0) or 0)
+            )
+    return reserve
+
+
+def _troop_costs() -> dict[str, dict[str, int]]:
+    """Costi unitari delle truppe (tabella statica in actions.py)."""
+    try:
+        from .actions import STATIC_TROOP_COSTS  # import ritardato: no cicli
+        return STATIC_TROOP_COSTS
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def clamp_plan_to_budget(
+    plan: dict[str, int],
+    budget: dict[str, int],
+) -> dict[str, int]:
+    """Riduce le quantita' del piano al massimo sostenibile dal budget.
+
+    Itera le unita' in ordine e, per ciascuna, limita la quantita' al
+    minimo intero consentito dalle risorse disponibili (costo unitario x
+    quantita' <= budget residuo). Unita' senza costo noto restano invariate.
+    """
+    if not budget:
+        return {u: q for u, q in plan.items() if q > 0}
+    costs = _troop_costs()
+    remaining = {r: max(0, int(v or 0)) for r, v in budget.items()}
+    out: dict[str, int] = {}
+    for unit, qty in plan.items():
+        if qty <= 0:
+            continue
+        cost = costs.get(normalize_unit_key(unit))
+        if not cost:
+            out[unit] = qty
+            continue
+        affordable = qty
+        for res in _RES_KEYS:
+            unit_cost = int(cost.get(res, 0) or 0)
+            if unit_cost > 0:
+                affordable = min(affordable, remaining.get(res, 0) // unit_cost)
+        if affordable > 0:
+            out[unit] = affordable
+            for res in _RES_KEYS:
+                remaining[res] = remaining.get(res, 0) - (
+                    affordable * int(cost.get(res, 0) or 0)
+                )
+    return out
+
 
 def normalize_unit_key(key: str) -> str:
     """Normalizza 'u5', 'T5', 'unit5' nel formato canonico 't5'."""
@@ -394,13 +464,20 @@ class TroopReplenishmentManager:
         settings: "Settings",
         *,
         village_name: str = "",
+        reserve_settlers: bool = False,
     ) -> dict[str, int]:
         """Filtra il deficit in un piano sostenibile {tN: qty}.
 
         - villaggio congelato (sotto assedio): niente piano;
         - ``skip_while_building``: cede il passo alle code di sviluppo;
-        - guardia grano: se la produzione netta e' <= 0 e le scorte sotto
-          la riserva configurata, il rimpiazzo viene rimandato.
+        - guardia grano: se il bilancio netto ufficiale (crop_balance da
+          production.php) scende sotto la soglia configurata, l'addestramento
+          che consuma grano viene sospeso (Grain Safety Net, spec 1.1);
+        - ``reserve_settlers``: il villaggio e' il fondatore (o la rete
+          feeder e' attiva) — la riserva ``3 x costo colono`` non puo'
+          essere spesa in addestramento (spec 2.1);
+        - il piano e' comunque limitato al surplus disponibile: mai spendere
+          oltre le scorte meno la riserva coloni.
         """
         if not deficit:
             return {}
@@ -413,6 +490,7 @@ class TroopReplenishmentManager:
             return {}
 
         cfg = settings.replenishment
+        res = state.resources
 
         # Priorita' alle code di sviluppo economico
         if cfg.skip_while_building and (
@@ -426,19 +504,41 @@ class TroopReplenishmentManager:
             )
             return {}
 
-        # Guardia grano: mai compromettere la stabilita' alimentare
-        res = state.resources
+        # Grain Safety Net: usa il bilancio netto ufficiale letto da
+        # production.php (crop_balance). None = dato non letto: si ripiega
+        # sulla produzione oraria lorda come stima prudenziale.
+        net_crop = res.crop_balance
+        if net_crop is None:
+            prod = res.production_per_hour or {}
+            try:
+                from .models import ResourceType
+
+                net_crop = int(prod.get(ResourceType.CROP, 0) or 0)
+            except Exception:  # noqa: BLE001
+                net_crop = int(prod.get("crop", 0) or 0)
+        vcfg = settings.village_config_for(
+            village_name or state.village_name, state.village_id
+        )
+        threshold = (
+            float(vcfg.min_net_crop_threshold)
+            if vcfg is not None and vcfg.min_net_crop_threshold > 0
+            else float(getattr(settings, "min_net_crop_threshold", 10.0))
+        )
+        if net_crop <= threshold:
+            logger.debug(
+                "[%s] Replenishment: margine grano netto %d/h <= soglia %g/h "
+                "in '%s': addestramento sospeso (Grain Safety Net)",
+                self.account_id,
+                net_crop,
+                threshold,
+                village_name,
+            )
+            return {}
+
+        # Guardia scorte: mai intaccare la riserva di grano configurata
         granary = res.granary_capacity or 0
         crop_reserve = int(granary * max(0.0, cfg.crop_reserve_pct))
-        prod = res.production_per_hour or {}
-        net_crop = 0
-        try:
-            from .models import ResourceType
-
-            net_crop = int(prod.get(ResourceType.CROP, 0) or 0)
-        except Exception:  # noqa: BLE001
-            net_crop = int(prod.get("crop", 0) or 0)
-        if res.crop < crop_reserve or (net_crop <= 0 and res.crop < 2 * crop_reserve):
+        if res.crop < crop_reserve:
             logger.debug(
                 "[%s] Replenishment: grano insufficiente in '%s' "
                 "(%d < riserva %d, prod netta %d/h)",
@@ -451,11 +551,46 @@ class TroopReplenishmentManager:
             return {}
 
         plan = {u: q for u, q in deficit.items() if q > 0}
-        if plan:
+        if not plan:
+            return {}
+
+        # Anti-saturazione: limita la spesa al surplus. Se il villaggio e'
+        # il fondatore (rete feeder attiva), la riserva 3x colono non si tocca.
+        budget = {
+            "wood": res.wood,
+            "clay": res.clay,
+            "iron": res.iron,
+            "crop": max(0, res.crop - crop_reserve),
+        }
+        if reserve_settlers:
+            reserve = settler_reserve()
+            for k, v in reserve.items():
+                budget[k] = max(0, budget.get(k, 0) - v)
+            logger.debug(
+                "[%s] Replenishment: riserva coloni attiva in '%s' (%s) — "
+                "budget addestramento %s",
+                self.account_id,
+                village_name,
+                reserve,
+                budget,
+            )
+        clamped = clamp_plan_to_budget(plan, budget)
+        if len(clamped) < len(plan) or any(
+            clamped.get(u, 0) < q for u, q in plan.items()
+        ):
+            logger.info(
+                "[%s] Replenishment: piano per '%s' ridotto al surplus %s "
+                "(richiesto %s)",
+                self.account_id,
+                village_name,
+                clamped,
+                plan,
+            )
+        elif clamped:
             logger.info(
                 "[%s] Replenishment: piano rimpiazzo per '%s': %s",
                 self.account_id,
                 village_name,
-                plan,
+                clamped,
             )
-        return plan
+        return clamped

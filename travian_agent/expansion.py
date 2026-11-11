@@ -67,6 +67,9 @@ FEED_CAP_PER_RESOURCE = 2000
 FEEDER_KEEP_RATIO = 0.55
 # Cooldown tra tentativi di fondazione falliti (evita spam di navigazione)
 FOUND_RETRY_SECONDS = 900.0
+# Retry breve quando la scansione mappa non legge tile (layout/pagina ko):
+# il cooldown pieno di 3h si applica solo a scansioni andate a buon fine.
+MAP_SCAN_RETRY_SECONDS = 600.0
 
 # Store condiviso dei candidati cropper (human-in-the-loop)
 _cropper_stores: dict[str, CropperStore] = {}
@@ -367,8 +370,17 @@ class ExpansionManager:
 
         # 0. Cropper Finder: scansione mappa -> candidati pending (dashboard)
         if cfg.cropper_scan and now >= self.next_map_scan:
+            pending = len(store.list_candidates(self.account_id))
+            approved = len(store.approved_targets(self.account_id))
+            logger.info(
+                "%s CropperScanner: avvio — scan_radius=%d, target_slots=%d, "
+                "candidati pending=%d, approved=%d, cooldown=%dh",
+                prefix, cfg.scan_radius, len(cfg.target_slots), pending,
+                approved, int(SCAN_COOLDOWN_SECONDS // 3600),
+            )
+            tiles_seen = 0
             try:
-                found = await MapScanner(store).scan(
+                found, tiles_seen = await MapScanner(store).scan(
                     observer=observer,
                     account_id=self.account_id,
                     villages=villages,
@@ -380,9 +392,22 @@ class ExpansionManager:
                         "%s CropperScanner: %d nuovi candidati in attesa di approvazione.",
                         prefix, found,
                     )
+                elif tiles_seen == 0:
+                    logger.info(
+                        "%s CropperScanner: nessun tile letto dalla mappa "
+                        "(layout non riconosciuto o pagina non caricata). "
+                        "Riprovo tra %d min.",
+                        prefix, int(MAP_SCAN_RETRY_SECONDS // 60),
+                    )
             except Exception:
-                logger.debug("%s Scansione cropper fallita", prefix, exc_info=True)
-            self.next_map_scan = now + SCAN_COOLDOWN_SECONDS
+                logger.warning(
+                    "%s Scansione cropper fallita", prefix, exc_info=True
+                )
+            # Cooldown pieno solo se la scansione ha letto tile; su vuoto/
+            # errore si riprova al ciclo successivo con un retry breve.
+            self.next_map_scan = now + (
+                SCAN_COOLDOWN_SECONDS if tiles_seen else MAP_SCAN_RETRY_SECONDS
+            )
             self._save()
 
         if not cfg.auto_expand:

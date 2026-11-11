@@ -93,6 +93,10 @@ class DefenseManager:
     state_path: Path | None = None
     dodges: dict[str, PendingDodge] = field(default_factory=dict)   # key: village_id
     recalls: list[PendingRecall] = field(default_factory=list)
+    # Lock temporaneo (spec 4.1): village_id -> ts di fine emergenza.
+    # Mentre attivo, replenishment.py viene congelato dall'orchestrator per
+    # evitare conflitti sulla spesa delle risorse appena svuotate.
+    emergency_until: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.state_path is None:
@@ -117,9 +121,14 @@ class DefenseManager:
                     for v in (data.get("recalls") or [])
                     if isinstance(v, dict)
                 ]
+                self.emergency_until = {
+                    str(k): float(v)
+                    for k, v in (data.get("emergency_until") or {}).items()
+                }
         except Exception:
             self.dodges = {}
             self.recalls = []
+            self.emergency_until = {}
 
     def _save(self) -> None:
         try:
@@ -130,6 +139,7 @@ class DefenseManager:
                     {
                         "dodges": {k: vars(v) for k, v in self.dodges.items()},
                         "recalls": [vars(r) for r in self.recalls],
+                        "emergency_until": self.emergency_until,
                     },
                     indent=2,
                 ),
@@ -137,6 +147,26 @@ class DefenseManager:
             )
         except Exception:
             logger.debug("Salvataggio stato difesa fallito", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Lock temporaneo: congela il replenishment durante l'emergenza
+    # ------------------------------------------------------------------
+    def is_emergency_locked(
+        self, village_id: int | str, now: float | None = None
+    ) -> bool:
+        """True se il villaggio e' in lock d'emergenza difesa.
+
+        Il lock copre la finestra tra l'allarme sotto soglia di panico e
+        l'impatto + recall_delay: in quel periodo il modulo di rimpiazzo
+        non deve spendere le risorse appena svuotate dal drain.
+        """
+        now = time.time() if now is None else now
+        until = self.emergency_until.get(str(village_id), 0.0)
+        return now < until
+
+    def _lock_village(self, village_id: int | str, until_ts: float) -> None:
+        self.emergency_until[str(village_id)] = until_ts
+        self._save()
 
     # ------------------------------------------------------------------
     # Entry point: chiamato dall'orchestrator per ogni villaggio del ciclo
@@ -230,6 +260,12 @@ class DefenseManager:
         logger.warning(
             "%s ATTACCO REALE IMMINENTE (%ds): avvio contromisure.",
             prefix, secs,
+        )
+
+        # Lock temporaneo: replenishment congelato fino a impatto + recall
+        self._lock_village(
+            village.village_id,
+            nearest.arrival_ts + cfg.recall_delay_seconds,
         )
 
         # Fase 2: resource drain

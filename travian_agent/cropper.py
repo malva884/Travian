@@ -253,20 +253,46 @@ class MapScanner:
         radius: int = 15,
         prefix: str = "",
         max_detail_checks: int = MAX_DETAIL_CHECKS_PER_SCAN,
-    ) -> int:
+    ) -> tuple[int, int]:
         """Scansiona la mappa e registra i cropper liberi come pending.
 
-        Ritorna il numero di candidati nuovi/aggiornati.
+        Ritorna ``(nuovi_candidati, tile_letti)``: ``tile_letti == 0``
+        indica che la griglia mappa non ha prodotto dati (layout non
+        riconosciuto o pagina non caricata), non che non ci siano cropper.
         """
         centers = [
             v for v in villages
             if v.x is not None and v.y is not None
         ]
+        skipped = [v.name for v in villages if v.x is None or v.y is None]
+        if skipped:
+            logger.info(
+                "%s[Cropper Finder] %d villaggi senza coordinate "
+                "(x/y None) saltati: %s",
+                prefix, len(skipped), ", ".join(skipped),
+            )
         if not centers:
-            logger.debug("%s CropperScanner: nessun villaggio con coordinate.", prefix)
-            return 0
+            logger.info(
+                "%s CropperScanner: nessun villaggio con coordinate, "
+                "scansione saltata.",
+                prefix,
+            )
+            return 0, 0
+
+        centers_desc = ", ".join(
+            f"{c.name}({c.x}|{c.y})" for c in centers
+        )
+        logger.info(
+            "%s CropperScanner: avvio scansione — centri: %s, "
+            "raggio: %d campi, filtri: cropper %s, raggio oasi: %.0f, "
+            "max dettagli per scansione: %d",
+            prefix, centers_desc, radius,
+            "/".join(f"{n}c" for n in CROPPER_FIELD_COUNTS),
+            OASIS_INFLUENCE_RADIUS, max_detail_checks,
+        )
 
         new_found = 0
+        tiles_seen = 0
         details_done = 0
         seen_tiles: set[tuple[int, int]] = set()
         oases_tiles: list[dict] = []
@@ -275,29 +301,64 @@ class MapScanner:
             tiles = await self._scan_grid(
                 observer, center.x or 0, center.y or 0, radius
             )
+            tiles_seen += len(tiles)
             oases_tiles.extend(t for t in tiles if t.get("is_oasis"))
             free_tiles = [
                 t for t in tiles
                 if not t.get("is_oasis") and not t.get("occupied")
             ]
+            logger.info(
+                "%s CropperScanner: '%s' -> %d tile letti, %d liberi, %d oasi.",
+                prefix, center.name, len(tiles), len(free_tiles),
+                sum(1 for t in tiles if t.get("is_oasis")),
+            )
 
+            total_free = len(free_tiles)
             for tile in free_tiles:
                 if details_done >= max_detail_checks:
+                    logger.debug(
+                        "%s CropperScanner: raggiunto limite dettagli (%d), "
+                        "%d tile liberi non verificati.",
+                        prefix, max_detail_checks,
+                        total_free - len(seen_tiles),
+                    )
                     break
                 tx, ty = int(tile["x"]), int(tile["y"])
                 if (tx, ty) in seen_tiles:
                     continue
                 seen_tiles.add((tx, ty))
                 # Gia' catalogato (qualunque stato): non ri-dettagliare
-                if self.store.status_at(account_id, tx, ty) is not None:
+                known_status = self.store.status_at(account_id, tx, ty)
+                if known_status is not None:
+                    logger.debug(
+                        "%s CropperScanner: tile (%d|%d) gia' catalogato "
+                        "(status=%s), salto.",
+                        prefix, tx, ty, known_status,
+                    )
                     continue
 
+                logger.debug(
+                    "%s CropperScanner [%s]: dettaglio tile %d/%d "
+                    "(limite %d) a (%d|%d)...",
+                    prefix, center.name, len(seen_tiles), total_free,
+                    max_detail_checks, tx, ty,
+                )
                 info = await observer.read_map_tile(tx, ty)
                 details_done += 1
                 if info.get("occupied"):
+                    logger.debug(
+                        "%s CropperScanner: tile (%d|%d) occupato, scarto.",
+                        prefix, tx, ty,
+                    )
                     continue
                 crop = int(info.get("crop_fields") or 0)
                 if crop not in CROPPER_FIELD_COUNTS:
+                    logger.debug(
+                        "%s CropperScanner: tile (%d|%d) ha %dc, non e' un "
+                        "cropper %s, scarto.",
+                        prefix, tx, ty, crop,
+                        "/".join(f"{n}c" for n in CROPPER_FIELD_COUNTS),
+                    )
                     continue
 
                 candidate = self._build_candidate(
@@ -306,14 +367,23 @@ class MapScanner:
                 self.store.upsert(account_id, candidate)
                 new_found += 1
                 logger.info(
-                    "%s CropperScanner: trovato %s a (%d|%d), bonus %d%%, "
-                    "distanza %.1fh da '%s'.",
+                    "%s[Cropper Finder] Trovato %s a (%d|%d) | "
+                    "Bonus Oasi: +%d%% | Stato: Pending",
                     prefix, candidate.type, tx, ty,
-                    candidate.bonus_crop_percent, candidate.distance_hours,
+                    max(0, candidate.bonus_crop_percent - 100),
+                )
+                logger.debug(
+                    "%s[Cropper Finder]   distanza %.1fh da '%s'.",
+                    prefix, candidate.distance_hours,
                     candidate.nearest_village,
                 )
 
-        return new_found
+        logger.info(
+            "%s CropperScanner: scansione completata — tile letti: %d, "
+            "dettagli effettuati: %d, nuovi candidati: %d.",
+            prefix, tiles_seen, details_done, new_found,
+        )
+        return new_found, tiles_seen
 
     async def _scan_grid(
         self, observer: "GameObserver", cx: int, cy: int, radius: int

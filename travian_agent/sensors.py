@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import timedelta
 from typing import Any, Dict, List
 from urllib.parse import urljoin
@@ -374,11 +375,16 @@ class TravianParser:
                     const list = [];
                     const seenIds = new Set();
 
+                    // Normalizza il segno meno Unicode (U+2212 '−' e trattini
+                    // U+2010-U+2015) usato da Travian: parseInt('−15') -> NaN.
+                    const toInt = (s) => parseInt(String(s).replace(/[\\u2212\\u2010-\\u2015]/g, '-'), 10);
+                    const coordRe = /\\(\\s*([+\\u2212\\u2010-\\u2015\\-]?\\d+)\\s*[|/]\\s*([+\\u2212\\u2010-\\u2015\\-]?\\d+)\\s*\\)/;
+
                     const cleanVillageName = (raw) => {
                         if (!raw) return '';
                         let text = raw.replace(/[\\u202d\\u202c\\r\\n]/g, ' ');
-                        // Rimuove coordinate tipo (10|20), (-5|12), ( 10 | 20 )
-                        text = text.replace(/\\(\\s*[-+]?\\d+\\s*[|/]\\s*[-+]?\\d+\\s*\\)/g, ' ');
+                        // Rimuove coordinate tipo (10|20), (-5|12), (−5|12), ( 10 | 20 )
+                        text = text.replace(new RegExp(coordRe.source, 'g'), ' ');
                         text = text.replace(/\\s+/g, ' ').trim();
                         return text;
                     };
@@ -424,7 +430,7 @@ class TravianParser:
 
                             const nameEl = entry.querySelector('.name, .villageName, .entryName, label, .headline') || linkEl || entry;
                             const rawText = nameEl?.innerText || nameEl?.textContent || entry.innerText || '';
-                            const coordMatch = rawText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+                            const coordMatch = rawText.match(coordRe);
                             const karteCoords = coordMatch ? null : parseKarteCoords(entry);
                             let nameText = cleanVillageName(rawText);
 
@@ -438,8 +444,8 @@ class TravianParser:
                                     url: finalUrl,
                                     village_id: vid,
                                     is_active: isActive,
-                                    x: coordMatch ? parseInt(coordMatch[1], 10) : (karteCoords ? karteCoords[0] : null),
-                                    y: coordMatch ? parseInt(coordMatch[2], 10) : (karteCoords ? karteCoords[1] : null)
+                                    x: coordMatch ? toInt(coordMatch[1]) : (karteCoords ? karteCoords[0] : null),
+                                    y: coordMatch ? toInt(coordMatch[2]) : (karteCoords ? karteCoords[1] : null)
                                 });
                             }
                         });
@@ -458,7 +464,7 @@ class TravianParser:
                             seenIds.add(vid);
                             const nameEl = el.querySelector('.name, .villageName') || el;
                             const rawText = nameEl?.innerText || nameEl?.textContent || '';
-                            const coordMatch = rawText.match(/\\(\\s*([-+]?\\d+)\\s*[|/]\\s*([-+]?\\d+)\\s*\\)/);
+                            const coordMatch = rawText.match(coordRe);
                             const karteScope = el.closest('li, tr, .entry, .listEntry, [data-did]') || el;
                             const karteCoords = coordMatch ? null : parseKarteCoords(karteScope);
                             let nameText = cleanVillageName(rawText);
@@ -467,8 +473,8 @@ class TravianParser:
                                 url: href || `dorf1.php?newdid=${vid}`,
                                 village_id: vid,
                                 is_active: el.classList.contains('active'),
-                                x: coordMatch ? parseInt(coordMatch[1], 10) : (karteCoords ? karteCoords[0] : null),
-                                y: coordMatch ? parseInt(coordMatch[2], 10) : (karteCoords ? karteCoords[1] : null)
+                                x: coordMatch ? toInt(coordMatch[1]) : (karteCoords ? karteCoords[0] : null),
+                                y: coordMatch ? toInt(coordMatch[2]) : (karteCoords ? karteCoords[1] : null)
                             });
                         }
                     });
@@ -815,6 +821,90 @@ class TravianParser:
             logger.debug("Errore nella lettura degli edifici interni: %s", exc)
             return []
 
+    async def read_production(self, village_id: int = 0) -> dict:
+        """Legge produzione oraria e bilancio netto grano da production.php.
+
+        Ritorna {"production": {ResourceType: int}, "crop_balance": int}.
+        La tabella #production di T4.x ha una riga per risorsa (produzione
+        oraria) e una riga finale col bilancio del grano al netto
+        dell'upkeep truppe (valore anche negativo). Se la pagina non
+        e' raggiungibile o la tabella non c'e', ritorna {}.
+        """
+        page = self.page
+        if page is None:
+            return {}
+        try:
+            current_url = page.url or ""
+            if "production.php" not in current_url:
+                match = _NEWDID.search(current_url)
+                target_url = urljoin(current_url, "production.php")
+                if match:
+                    target_url += f"?newdid={match.group(1)}"
+                await page.goto(target_url, wait_until="domcontentloaded")
+
+            data = await page.evaluate("""
+                () => {
+                    const out = { production: {}, crop_balance: null };
+                    const resKeys = {
+                        wood: ['wood', 'legno', 'holz', 'bois', 'madera'],
+                        clay: ['clay', 'argilla', 'lehm', 'argile', 'barro'],
+                        iron: ['iron', 'ferro', 'eisen', 'fer', 'hierro'],
+                        crop: ['crop', 'grano', 'getreide', 'cereale',
+                               'cereal', 'wheat', 'blé', 'trigo'],
+                    };
+                    const balKeys = ['bilancio', 'balance', 'saldo',
+                                     'equilibrio', 'equilibre', 'crop balance'];
+                    const toInt = (s) => parseInt(
+                        String(s)
+                            .replace(/[\\u2212\\u2010-\\u2015]/g, '-')
+                            .replace(/[\\s.]/g, ''),
+                        10
+                    );
+                    const rows = document.querySelectorAll(
+                        '#production tr, table.production tr, ' +
+                        '.productionTable tr, #content table tr'
+                    );
+                    rows.forEach(row => {
+                        const txt = (row.innerText || '').toLowerCase();
+                        const nums = (txt.match(/[+\\u2212\\u2010-\\u2015\\-]?\\d[\\d.\\s]*/g) || [])
+                            .map(toInt)
+                            .filter(n => !isNaN(n));
+                        if (!nums.length) return;
+                        if (balKeys.some(k => txt.includes(k))) {
+                            // Bilancio netto grano: ultimo numero della riga
+                            out.crop_balance = nums[nums.length - 1];
+                            if (/[\\u2212\\u2010-\\u2015]/.test(txt) || /-\\d/.test(txt)) {
+                                out.crop_balance = -Math.abs(out.crop_balance);
+                            }
+                            return;
+                        }
+                        for (const [key, words] of Object.entries(resKeys)) {
+                            if (words.some(w => txt.includes(w))) {
+                                if (!(key in out.production)) {
+                                    out.production[key] = Math.abs(nums[0]);
+                                }
+                                return;
+                            }
+                        }
+                    });
+                    return out;
+                }
+            """)
+            prod: dict[ResourceType, int] = {}
+            for key, val in (data or {}).get("production", {}).items():
+                try:
+                    prod[ResourceType(key)] = int(val)
+                except (ValueError, TypeError):
+                    continue
+            raw_balance = (data or {}).get("crop_balance")
+            balance = int(raw_balance) if raw_balance is not None else None
+            if not prod and balance is None:
+                return {}
+            return {"production": prod, "crop_balance": balance}
+        except Exception as exc:
+            logger.debug("Errore lettura production.php: %s", exc)
+            return {}
+
     async def read_build_queue(self) -> list[BuildQueueItem]:
         """Restituisce gli elementi in coda con timer in secondi."""
         items: list[BuildQueueItem] = []
@@ -924,7 +1014,9 @@ class TravianParser:
         try:
             if f"id={rally_slot}" not in (self.page.url or ""):
                 await self.page.goto(
-                    url, wait_until="domcontentloaded", timeout=20000
+                    urljoin(self.page.url or "", url),
+                    wait_until="domcontentloaded",
+                    timeout=20000,
                 )
             raw = await self.page.evaluate(
                 """
@@ -1284,20 +1376,39 @@ class TravianParser:
     async def read_map_tile(self, x: int, y: int) -> dict:
         """Legge le info del tile mappa (x, y): occupato, tipo campi grano.
 
-        Naviga a karte.php?x=X&y=Y e ritorna:
-        {occupied: bool, crop_fields: int, text: str, settle_link: bool}
+        Naviga a position_details.php?x=X&y=Y (pagina dettagli tile in T4,
+        con distribuzione campi e link 'Fonda'); se il pannello dettagli non
+        viene trovato, fa un secondo tentativo su karte.php?x=X&y=Y.
+
+        Ritorna: {occupied, free, crop_fields, text, settle_link}
         """
         if not self.page:
             return {"occupied": True, "crop_fields": 0, "text": "", "settle_link": False}
-        try:
-            await self.page.goto(
-                urljoin(self.page.url or "", f"{selectors.PATH_MAP}?x={x}&y={y}"),
-                wait_until="domcontentloaded",
-            )
-        except Exception:
+        data: dict | None = None
+        for path in ("position_details.php", selectors.PATH_MAP):
+            try:
+                await self.page.goto(
+                    urljoin(self.page.url or "", f"{path}?x={x}&y={y}"),
+                    wait_until="domcontentloaded",
+                )
+            except Exception:
+                continue
+            try:
+                data = await self._eval_map_tile()
+            except Exception:
+                data = None
+            # Se il pannello dettagli e' stato trovato il dato e' affidabile;
+            # altrimenti riprova sulla pagina mappa (position_details assente).
+            if data and data.get("panel"):
+                break
+        if not data:
             return {"occupied": True, "crop_fields": 0, "text": "", "settle_link": False}
-        try:
-            data = await self.page.evaluate("""
+        data.pop("panel", None)
+        return data
+
+    async def _eval_map_tile(self) -> dict | None:
+        """Estrae occupazione/campi grano dalla pagina dettagli tile corrente."""
+        return await self.page.evaluate("""
                 () => {
                     const body = (document.body && document.body.innerText) || '';
                     const panel = document.querySelector(
@@ -1306,7 +1417,7 @@ class TravianParser:
                     const text = (panel && panel.innerText) || body;
 
                     // Distribuzione campi "3-3-3-9" (9c) o "1-1-1-15" (15c)
-                    const dist = text.match(/(\\d)\\s*[-–]\\s*(\\d)\\s*[-–]\\s*(\\d)\\s*[-–]\\s*(\\d+)/);
+                    const dist = text.match(/(\\d)\\s*[-\\u2212\\u2010-\\u2015]\\s*(\\d)\\s*[-\\u2212\\u2010-\\u2015]\\s*(\\d)\\s*[-\\u2212\\u2010-\\u2015]\\s*(\\d+)/);
                     let cropFields = 0;
                     if (dist) {
                         cropFields = parseInt(dist[4], 10) || 0;
@@ -1322,20 +1433,100 @@ class TravianParser:
                     );
                     const occupied = /(?:abitato|occupied|village|villaggio|player|giocatore|inhabitant|oasis|oasi)/i.test(text)
                         && !settle;
-                    const freeTile = /(?:valley|valle|unoccupied|libero|free|terra libera|abandoned)/i.test(text);
+                    const freeTile = /(?:valley|valle|unoccupied|libero|libera|free|terra libera|abandoned|disabitata|non occupat|uninhabited)/i.test(text);
 
                     return {
                         occupied: occupied && !freeTile,
                         free: freeTile || settle,
                         crop_fields: cropFields,
                         settle_link: settle,
+                        panel: !!panel,
                         text: text.slice(0, 300),
                     };
                 }
             """)
-            return data or {"occupied": True, "crop_fields": 0, "text": "", "settle_link": False}
+
+    async def read_village_coords(self, village_id: int = 0) -> tuple[int, int] | None:
+        """Recupera le coordinate (x, y) di un villaggio tramite la mappa.
+
+        Fallback per i server dove la sidebar non espone le coordinate:
+        naviga ``karte.php?newdid=<id>`` (la mappa si centra sul villaggio)
+        e legge gli input X/Y del form "vai a coordinate" o, in subordine,
+        il tile centrale della griglia.
+        """
+        if not self.page or not village_id:
+            return None
+        try:
+            await self.page.goto(
+                urljoin(
+                    self.page.url or "",
+                    f"{selectors.PATH_MAP}?newdid={village_id}",
+                ),
+                wait_until="domcontentloaded",
+            )
         except Exception:
-            return {"occupied": True, "crop_fields": 0, "text": "", "settle_link": False}
+            return None
+        try:
+            coords = await self.page.evaluate("""
+                () => {
+                    const toInt = (s) => parseInt(
+                        String(s)
+                            .replace(/[\\u2212\\u2010-\\u2015]/g, '-')
+                            .replace(/[^0-9+-]/g, ''),
+                        10
+                    );
+                    const pick = (sels) => {
+                        for (const s of sels) {
+                            const el = document.querySelector(s);
+                            if (!el) continue;
+                            const raw = (el.value !== undefined && el.value !== '')
+                                ? el.value
+                                : (el.textContent || '');
+                            const n = toInt(raw);
+                            if (!isNaN(n)) return n;
+                        }
+                        return null;
+                    };
+                    // Form "vai a coordinate" della mappa (T4.4/T4.5/T4.6)
+                    const x = pick([
+                        '#xCoordInput', 'input#xCoordInput',
+                        '#mapCoordX input', '#mapCoordX',
+                        'input[name="x"]', '.coordinateX input',
+                    ]);
+                    const y = pick([
+                        '#yCoordInput', 'input#yCoordInput',
+                        '#mapCoordY input', '#mapCoordY',
+                        'input[name="y"]', '.coordinateY input',
+                    ]);
+                    if (x !== null && y !== null) return {x: x, y: y};
+                    // Fallback: tile centrale della griglia -> link dettagli
+                    const center = document.querySelector(
+                        '#mapContainer .tile.center a, ' +
+                        '#mapContainer a.center, ' +
+                        '#mapContainer a[class*="own"]'
+                    );
+                    if (center) {
+                        const m = (center.href || '').match(/x=(-?\\d+).*?y=(-?\\d+)/)
+                            || (center.title || '').match(
+                                /\\(\\s*(-?\\d+)\\s*[|/]\\s*(-?\\d+)\\s*\\)/
+                            );
+                        if (m) return {x: toInt(m[1]), y: toInt(m[2])};
+                    }
+                    return null;
+                }
+            """)
+            if (
+                isinstance(coords, dict)
+                and isinstance(coords.get("x"), int)
+                and isinstance(coords.get("y"), int)
+            ):
+                return int(coords["x"]), int(coords["y"])
+        except Exception:
+            logger.debug(
+                "read_village_coords: estrazione fallita per %s",
+                village_id, exc_info=True,
+            )
+        return None
 
     async def scan_map_area(self, center_x: int, center_y: int, radius: int = 5) -> list[dict]:
         """Scansiona la mappa attorno al villaggio attivo (karte.php).
@@ -1349,6 +1540,17 @@ class TravianParser:
                 urljoin(self.page.url or "", f"{selectors.PATH_MAP}?x={center_x}&y={center_y}"),
                 wait_until="domcontentloaded",
             )
+            # T4.5/T4.6: la griglia mappa e' renderizzata via JS dopo il
+            # DOMContentLoaded — attendiamo la comparsa di almeno un tile
+            # (timeout breve, non fatale: il dump diagnostico copre i casi ko).
+            try:
+                await self.page.wait_for_selector(
+                    "a[href*='position_details.php'], a[href*='karte.php?x='], "
+                    "map area, #mapContainer a, [id*='tile' i], [data-x][data-y]",
+                    timeout=6000,
+                )
+            except Exception:
+                pass
         except Exception:
             return []
 
@@ -1359,6 +1561,11 @@ class TravianParser:
                     const results = [];
                     const seen = new Set();
 
+                    // Normalizza il segno meno Unicode (U+2212 '−' e trattini
+                    // U+2010-U+2015) usato da Travian nelle coordinate
+                    const toInt = (s) => parseInt(String(s).replace(/[\\u2212\\u2010-\\u2015]/g, '-'), 10);
+                    const coordRe = /\\(([+\\u2212\\u2010-\\u2015\\-]?\\d+)\\s*[|/]\\s*([+\\u2212\\u2010-\\u2015\\-]?\\d+)\\)/;
+
                     // T4.4/T4.5/T4.6: estrazione dai blocchi tile o link con coordinate
                     const mapLinks = document.querySelectorAll(
                         '#mapContainer a, #map_details a, #mapContainer area, #mapCoordX, .mapBlock, a[href*="position_details.php"], a[href*="karte.php?x="]'
@@ -1367,22 +1574,55 @@ class TravianParser:
                     mapLinks.forEach(el => {
                         const href = el.getAttribute('href') || el.getAttribute('onclick') || '';
                         const title = el.getAttribute('title') || el.innerText || '';
-                        const xMatch = href.match(/[?&]x=([-\\d]+)/) || title.match(/\\(([-\\d]+)\\s*\\|\\s*([-\\d]+)\\)/);
+                        const xMatch = href.match(/[?&]x=([-\\d]+)/) || title.match(coordRe);
                         const yMatch = href.match(/[?&]y=([-\\d]+)/);
 
                         let x = null, y = null;
                         if (xMatch && yMatch) {
-                            x = parseInt(xMatch[1], 10);
-                            y = parseInt(yMatch[1], 10);
+                            x = toInt(xMatch[1]);
+                            y = toInt(yMatch[1]);
                         } else if (title) {
-                            const cMatch = title.match(/\\(([-\\d]+)\\s*\\|\\s*([-\\d]+)\\)/);
+                            const cMatch = title.match(coordRe);
                             if (cMatch) {
-                                x = parseInt(cMatch[1], 10);
-                                y = parseInt(cMatch[2], 10);
+                                x = toInt(cMatch[1]);
+                                y = toInt(cMatch[2]);
                             }
                         }
 
-                        if (x === null || y === null) return;
+                        if (x === null || y === null) {
+                            // Attributi data-x/data-y (tile div T4.5+)
+                            const dx = el.getAttribute('data-x') || el.getAttribute('data-tile-x');
+                            const dy = el.getAttribute('data-y') || el.getAttribute('data-tile-y');
+                            if (dx !== null && dy !== null) {
+                                x = toInt(dx); y = toInt(dy);
+                            }
+                        }
+                        if (x === null || y === null) {
+                            // id="tile_X_Y" / "tile-X-Y"
+                            const idm = (el.id || '').match(/tile[_-]?(-?\\d+)[_-](-?\\d+)/i);
+                            if (idm) { x = toInt(idm[1]); y = toInt(idm[2]); }
+                        }
+                        if (x === null || y === null) {
+                            // Handler inline con coordinate (x: .., y: ..)
+                            const oc = (el.getAttribute('onclick') || '') + ' ' +
+                                (el.getAttribute('onmouseover') || '');
+                            const om = oc.match(/x\\s*[:=]\\s*(-?\\d+)\\D{0,20}?y\\s*[:=]\\s*(-?\\d+)/);
+                            if (om) { x = toInt(om[1]); y = toInt(om[2]); }
+                        }
+                        if (x === null || y === null) {
+                            // Link figlio con coordinate dentro il contenitore tile
+                            const inner = el.querySelector && el.querySelector(
+                                'a[href*="x="][href*="y="], area[href*="x="][href*="y="]'
+                            );
+                            if (inner) {
+                                const ih = inner.getAttribute('href') || '';
+                                const ix = ih.match(/[?&]x=([-\\d]+)/);
+                                const iy = ih.match(/[?&]y=([-\\d]+)/);
+                                if (ix && iy) { x = toInt(ix[1]); y = toInt(iy[1]); }
+                            }
+                        }
+
+                        if (x === null || y === null || isNaN(x) || isNaN(y)) return;
                         const key = `${x}_${y}`;
                         if (seen.has(key)) return;
                         seen.add(key);
@@ -1397,7 +1637,7 @@ class TravianParser:
                         const pop = popMatch ? parseInt(popMatch[1], 10) : 0;
 
                         const isOasis = /(?:oasis|oasi)/i.test(title) || /(?:oasis|oasi)/i.test(href);
-                        const name = title.split('\\n')[0].replace(/\\([-\\d|\\s]+\\)/g, '').trim() || (isOasis ? 'Oasi' : `Tile (${x}|${y})`);
+                        const name = title.split('\\n')[0].replace(/\\([\\d\\s|\\-+\\u2212\\u2010-\\u2015]+\\)/g, '').trim() || (isOasis ? 'Oasi' : `Tile (${x}|${y})`);
 
                         results.push({
                             x: x,
@@ -1412,7 +1652,34 @@ class TravianParser:
                     return results;
                 }
             """, {"centerX": center_x, "centerY": center_y, "rad": radius})
-            return [t for t in (tiles or []) if isinstance(t, dict)]
+            out = [t for t in (tiles or []) if isinstance(t, dict)]
+            if not out:
+                # Dump diagnostico: rivela il markup reale della pagina mappa
+                # (container presenti, iframe, tile alternativi) al prossimo run.
+                try:
+                    dbg = await self.page.evaluate("""
+                        () => ({
+                            url: location.href,
+                            links: document.querySelectorAll('a').length,
+                            areas: document.querySelectorAll('area').length,
+                            tileIds: document.querySelectorAll('[id*="tile" i]').length,
+                            mapContainer: !!document.getElementById('mapContainer'),
+                            map: !!document.getElementById('map'),
+                            mapBlocks: document.querySelectorAll(
+                                '.mapBlock, .mapWrapper, #map_details, .tile'
+                            ).length,
+                            iframes: document.querySelectorAll('iframe').length,
+                            text: ((document.body && document.body.innerText) || '')
+                                .slice(0, 200),
+                        })
+                    """)
+                    logger.debug(
+                        "scan_map_area (%s|%s): 0 tile estratti, dump=%s",
+                        center_x, center_y, dbg,
+                    )
+                except Exception:
+                    pass
+            return out
         except Exception:
             return []
 
@@ -1435,6 +1702,9 @@ class TravianParser:
             reports: list = await self.page.evaluate("""
                 (maxCount) => {
                     const results = [];
+                    // Normalizza il segno meno Unicode (U+2212 '−' e trattini
+                    // U+2010-U+2015) usato da Travian nelle coordinate
+                    const toInt = (s) => parseInt(String(s).replace(/[\\u2212\\u2010-\\u2015]/g, '-'), 10);
                     const rows = document.querySelectorAll(
                         '#overview tbody tr, table.reports tbody tr, #reports tbody tr, tr:has(.subject)'
                     );
@@ -1449,11 +1719,11 @@ class TravianParser:
                         const title = subjectEl.getAttribute('title') || row.innerText || '';
 
                         // Estrae coordinate se presenti nel testo del report: es. "raid su Villaggio (12|-34)"
-                        const coordMatch = (text + ' ' + title).match(/\\(([-\\d]+)\\s*\\|\\s*([-\\d]+)\\)/);
+                        const coordMatch = (text + ' ' + title).match(/\\(([+\\u2212\\u2010-\\u2015\\-]?\\d+)\\s*[|/]\\s*([+\\u2212\\u2010-\\u2015\\-]?\\d+)\\)/);
                         if (!coordMatch) return;
 
-                        const x = parseInt(coordMatch[1], 10);
-                        const y = parseInt(coordMatch[2], 10);
+                        const x = toInt(coordMatch[1]);
+                        const y = toInt(coordMatch[2]);
 
                         // Icona esito saccheggio / perdite:
                         // classe 'iReport1' = bottino pieno/verde, 'iReport2' = parziale, 'iReport3' = vuoto

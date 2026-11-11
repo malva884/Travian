@@ -26,6 +26,9 @@ class Resources:
     granary_capacity: int = 0
     # Produzione oraria, se il parser riesce a leggerla
     production_per_hour: dict[ResourceType, int] = field(default_factory=dict)
+    # Bilancio netto del grano (produzione - upkeep truppe) da production.php;
+    # None = non letto / non disponibile (la produzione lorda NON e' il netto).
+    crop_balance: int | None = None
 
     def amount(self, res_type: ResourceType) -> int:
         return getattr(self, res_type.value)

@@ -55,6 +55,9 @@ class VillageConfig:
     market_slot: int = 0            # slot dorf2 del Mercato (0 = auto-detect via gid=17)
     x: int | None = None            # coordinata X del villaggio
     y: int | None = None            # coordinata Y del villaggio
+    # Grain Safety Net: margine netto grano minimo (unita'/ora).
+    # 0 = eredita la soglia globale dell'account.
+    min_net_crop_threshold: float = 0.0
     defense_enabled: bool = True    # include questo villaggio nella reazione anti-attacco
     # Smart Troop Replenishment: obiettivo numerico per unita' (chiave 'tN'
     # o nome unita'). deficit = target - (truppe a casa + truppe in coda).
@@ -190,6 +193,9 @@ class Settings:
     allow_parallel_build: bool = True
     # True = attiva automaticamente il bonus +15% sulle risorse guardando il video alla scadenza (8h)
     auto_video_bonus: bool = True
+    # Grain Safety Net: margine netto grano minimo globale (unita'/ora);
+    # sotto soglia gli upgrade non-grano sono bloccati.
+    min_net_crop_threshold: float = 10.0
     state_file: Path | None = None
     debug_dir: Path | None = None
     browser_locale: str = "it-IT"
@@ -268,6 +274,7 @@ def _parse_account_item(item: dict) -> Settings:
                             max_interior_queue=int(item.get("max_interior_queue", 1)),
                             allow_parallel_build=bool(item.get("allow_parallel_build", True)),
                             auto_video_bonus=bool(item.get("auto_video_bonus", True)),
+                            min_net_crop_threshold=float(item.get("min_net_crop_threshold", 10.0)),
                             strategy_profile=str(item.get("strategy_profile", "balanced")),
                             farming=FarmingConfig(
                                 **{
@@ -348,6 +355,7 @@ def _parse_account_item(item: dict) -> Settings:
                                     farm_unit=str(cfg.get("farm_unit", "")),
                                     defense_enabled=bool(cfg.get("defense_enabled", True)),
                                     market_slot=int(cfg.get("market_slot", 0) or 0),
+                                    min_net_crop_threshold=float(cfg.get("min_net_crop_threshold", 0.0) or 0.0),
                                     x=int(cfg["x"]) if cfg.get("x") is not None else None,
                                     y=int(cfg["y"]) if cfg.get("y") is not None else None,
                                     troop_targets={
@@ -437,6 +445,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
             "max_interior_queue": acc.max_interior_queue,
             "allow_parallel_build": acc.allow_parallel_build,
             "auto_video_bonus": acc.auto_video_bonus,
+            "min_net_crop_threshold": acc.min_net_crop_threshold,
             "strategy_profile": acc.strategy_profile,
             "farming_settings": {
                 "enabled": acc.farming.enabled,
@@ -507,6 +516,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                     "farm_unit": cfg.farm_unit,
                     "defense_enabled": cfg.defense_enabled,
                     "market_slot": int(cfg.market_slot or 0),
+                    "min_net_crop_threshold": float(cfg.min_net_crop_threshold or 0.0),
                     "x": cfg.x,
                     "y": cfg.y,
                     "troop_targets": dict(cfg.troop_targets),

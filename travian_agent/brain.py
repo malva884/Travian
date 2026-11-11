@@ -13,6 +13,7 @@ import logging
 from typing import Callable, Protocol
 
 from .config import Settings
+from . import builder
 from .models import (
     GID_BARRACKS,
     GID_GRANARY,
@@ -23,6 +24,7 @@ from .models import (
     GID_WORKSHOP,
     Action,
     ActionType,
+
     Field,
     GameState,
     ResourceType,
@@ -66,14 +68,12 @@ _FIELD_MAX_CAPITAL = 21
 
 def _is_capital(state: GameState) -> bool:
     """True se nel dorf2 esiste il Palazzo (presente solo in capitale)."""
-    return any(f.gid == GID_PALACE for f in state.interior_fields())
+    return builder.is_capital(state)
 
 
 def _field_max_level(state: GameState, f: Field) -> int:
     """Livello massimo raggiungibile dal field (stima conservativa)."""
-    if f.is_resource_field:
-        return _FIELD_MAX_CAPITAL if _is_capital(state) else _FIELD_MAX_NORMAL
-    return _BUILDING_MAX_LEVEL.get(f.gid, 20)
+    return builder.field_max_level(state, f)
 
 
 def _queued_slot_ids(state: GameState) -> set[int]:
@@ -88,12 +88,22 @@ def _upgradeable_fields(state: GameState, fields: list[Field]) -> list[Field]:
     letto dalla coda) e i field gia' al livello massimo, cosi' l'azione
     contiene solo upgrade realmente avviabili.
     """
-    queued = _queued_slot_ids(state)
-    return [
-        f
-        for f in fields
-        if f.slot_id not in queued and f.level < _field_max_level(state, f)
-    ]
+    return builder.upgradeable_fields(state, fields)
+
+
+def _queue_free(state: GameState, settings: Settings, resource_field: bool) -> bool:
+    """True se la coda pertinente (campi o interni) puo' accettare un upgrade."""
+    if settings.allow_parallel_build:
+        if resource_field:
+            return (
+                len(state.resource_queue()) < settings.max_resource_queue
+                and len(state.build_queue) < settings.max_build_queue
+            )
+        return (
+            len(state.interior_queue()) < settings.max_interior_queue
+            and len(state.build_queue) < settings.max_build_queue
+        )
+    return not state.build_queue
 
 
 def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action | None:
@@ -103,6 +113,10 @@ def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action |
     gia' un edificio interno in costruzione nel dorf2 ma nessun campo
     risorsa nel dorf1, l'upgrade del campo puo' comunque partire.
     """
+    # Grain safety: margine netto sotto soglia -> niente upgrade non-grano
+    if builder.crop_safety_needed(state, settings):
+        return None
+
     if settings.allow_parallel_build:
         if (
             len(state.resource_queue()) >= settings.max_resource_queue
@@ -151,15 +165,7 @@ _STORAGE_KEYWORDS: dict[int, tuple[str, ...]] = {
 
 def _storage_needed(state: GameState, threshold: float = 0.90) -> list[int]:
     """Gid degli storage da potenziare perche' quasi pieni (10=mag., 11=granaio)."""
-    res = state.resources
-    needed: list[int] = []
-    if res.warehouse_capacity > 0 and (
-        max(res.wood, res.clay, res.iron) >= res.warehouse_capacity * threshold
-    ):
-        needed.append(GID_WAREHOUSE)
-    if res.granary_capacity > 0 and res.crop >= res.granary_capacity * threshold:
-        needed.append(GID_GRANARY)
-    return needed
+    return builder.storage_needed(state, threshold)
 
 
 def rule_upgrade_storage(state: GameState, settings: Settings) -> Action | None:
@@ -202,10 +208,18 @@ def rule_upgrade_storage(state: GameState, settings: Settings) -> Action | None:
         )
         candidates.extend(by_name)
 
+    # Storage del tipo richiesto assente del tutto: nuova costruzione su
+    # area vuota (magazzino/granaio non hanno prerequisiti).
+    candidates.extend(
+        builder.new_building_intents(
+            state, needed, {f.slot_id for f in candidates}
+        )
+    )
+
     if not candidates:
         logger.info(
-            "[%s] Storage al limite ma nessun magazzino/granaio trovato nel "
-            "dorf2: costruzione su area vuota non ancora supportata.",
+            "[%s] Storage al limite ma nessun magazzino/granaio ne' area "
+            "vuota trovati nel dorf2.",
             state.village_name,
         )
         return None
@@ -216,6 +230,7 @@ def rule_upgrade_storage(state: GameState, settings: Settings) -> Action | None:
         params={
             "candidates": [f.slot_id for f in candidates],
             "storage": True,
+            "construct": builder.construct_gids(state, candidates),
         },
         reason=(
             f"Storage quasi pieno: upgrade di '{target.name or 'slot ' + str(target.slot_id)}' "
@@ -304,10 +319,11 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
     sprecata. La regola interviene SOLO quando rule_upgrade_storage non
     puo' agire (coda piena o nessuno storage trovato), provando in ordine:
 
-    1. invio dell'eccedenza al villaggio con piu' capienza libera
-       (richiede un Mercato nel dorf2 e snapshot dei peer);
-    2. addestramento di una truppa nella Caserma/Scuderia se presente;
-    3. ALERT: notifica il problema senza azioni rischiose.
+    1. spesa locale: upgrade interno costoso (smaltimento diretto);
+    2. addestramento di una truppa nella Caserma/Scuderia/Officina;
+    3. invio dell'eccedenza al villaggio con piu' capienza libera
+       (fallback finale, richiede Mercato e snapshot dei peer);
+    4. ALERT: notifica il problema senza azioni rischiose.
     """
     if not _storage_full(state):
         return None
@@ -320,7 +336,51 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
     if not surplus:
         return None
 
-    # --- 1) Mercato: invia l'eccedenza al peer con piu' spazio ---
+    # --- 1) Spesa locale: l'upgrade interno piu' costoso smaltisce subito ---
+    if _queue_free(state, settings, resource_field=False):
+        spenders = builder.local_spend_intents(state)
+        if spenders:
+            head = spenders[0]
+            return Action(
+                type=ActionType.UPGRADE_FIELD,
+                params={
+                    "candidates": [f.slot_id for f in spenders],
+                    "construct": builder.construct_gids(state, spenders),
+                },
+                reason=(
+                    f"Storage pieno: spesa locale su "
+                    f"'{head.name or 'slot ' + str(head.slot_id)}' "
+                    f"(livello {head.level}) per smaltire {surplus}"
+                ),
+            )
+
+    # --- 2) Caserma/Scuderia/Officina: addestra truppe autorizzate ---
+    trainers = _find_all_interiors_by_gid(
+        state, (GID_BARRACKS, GID_STABLE, GID_WORKSHOP)
+    )
+    if trainers:
+        trainer = trainers[0]
+        vcfg = settings.village_config_for(state.village_name, state.village_id)
+        priority_units = (
+            list(vcfg.priority_units or vcfg.allowed_units)
+            if vcfg is not None
+            else []
+        )
+        return Action(
+            type=ActionType.TRAIN_TROOPS,
+            params={
+                "trainer_slot": trainer.slot_id,
+                "trainer_gid": trainer.gid,
+                "trainer_slots": [t.slot_id for t in trainers],
+                "priority_units": priority_units,
+            },
+            reason=(
+                f"Storage pieno: addestramento in '{trainer.name or 'slot ' + str(trainer.slot_id)}' "
+                f"(slot {trainer.slot_id}) per smaltire risorse"
+            ),
+        )
+
+    # --- 3) Mercato: invia l'eccedenza al peer con piu' spazio ---
     # Slot manuale (dashboard) ha priorita' sull'auto-detect gid=17
     vcfg = settings.village_config_for(state.village_name, state.village_id)
     market = _find_interior_by_gid(state, (GID_MARKETPLACE,))
@@ -351,33 +411,7 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
             ),
         )
 
-    # --- 2) Caserma/Scuderia/Officina: addestra truppe autorizzate ---
-    trainers = _find_all_interiors_by_gid(
-        state, (GID_BARRACKS, GID_STABLE, GID_WORKSHOP)
-    )
-    if trainers:
-        trainer = trainers[0]
-        vcfg = settings.village_config_for(state.village_name, state.village_id)
-        priority_units = (
-            list(vcfg.priority_units or vcfg.allowed_units)
-            if vcfg is not None
-            else []
-        )
-        return Action(
-            type=ActionType.TRAIN_TROOPS,
-            params={
-                "trainer_slot": trainer.slot_id,
-                "trainer_gid": trainer.gid,
-                "trainer_slots": [t.slot_id for t in trainers],
-                "priority_units": priority_units,
-            },
-            reason=(
-                f"Storage pieno: addestramento in '{trainer.name or 'slot ' + str(trainer.slot_id)}' "
-                f"(slot {trainer.slot_id}) per smaltire risorse"
-            ),
-        )
-
-    # --- 3) Nessuna via d'uscita: alert esplicito ---
+    # --- 4) Nessuna via d'uscita: alert esplicito ---
     missing = "mercato" if market is None else ""
     logger.warning(
         "[%s] EMERGENZA storage al 100%% (eccesso %s), coda occupata e "
@@ -392,6 +426,90 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
         reason=(
             f"Storage al 100% (eccesso {surplus}): nessuna azione possibile, "
             "produzione in spreco"
+        ),
+    )
+
+
+def rule_grain_safety(state: GameState, settings: Settings) -> Action | None:
+    """Grain Safety Net: margine netto grano sotto soglia -> solo grano.
+
+    Prima di ogni costruzione si verifica che il bilancio netto
+    (produzione - upkeep, letto da production.php) resti sopra la
+    soglia configurata; in caso contrario gli unici upgrade ammessi
+    sono campi di grano, poi Mulino/Forno.
+    """
+    if not builder.crop_safety_needed(state, settings):
+        return None
+    intents = builder.grain_safety_intents(state)
+    if not intents:
+        return None
+    head = intents[0]
+    if not _queue_free(state, settings, head.is_resource_field):
+        return None
+    return Action(
+        type=ActionType.UPGRADE_FIELD,
+        params={
+            "candidates": [f.slot_id for f in intents],
+            "construct": builder.construct_gids(state, intents),
+        },
+        reason=(
+            f"Grain safety: margine {builder.net_crop(state)}/h sotto soglia "
+            f"{builder.crop_threshold(state, settings):g}/h — upgrade di "
+            f"'{head.name or 'slot ' + str(head.slot_id)}' (livello {head.level})"
+        ),
+    )
+
+
+def rule_building_focus(state: GameState, settings: Settings) -> Action | None:
+    """Override manuale: building_focus da dashboard batte la logica ruolo."""
+    # Grain safety ha la precedenza anche sul focus manuale
+    if builder.crop_safety_needed(state, settings):
+        return None
+    intents = builder.focus_intents(state, settings)
+    if not intents:
+        return None
+    head = intents[0]
+    if not _queue_free(state, settings, head.is_resource_field):
+        return None
+    return Action(
+        type=ActionType.UPGRADE_FIELD,
+        params={
+            "candidates": [f.slot_id for f in intents],
+            "construct": builder.construct_gids(state, intents),
+        },
+        reason=(
+            f"Focus manuale: upgrade di '{head.name or 'slot ' + str(head.slot_id)}' "
+            f"(livello {head.level}, slot {head.slot_id})"
+        ),
+    )
+
+
+def rule_role_buildings(state: GameState, settings: Settings) -> Action | None:
+    """Infrastrutture di ruolo bilanciate (hammer/defensive/croplog/feeder).
+
+    Sviluppo coordinato: tra gli edifici del ruolo si upgrade quello al
+    livello piu' basso, cosi' Caserma/Scuderia/Officina avanzano insieme.
+    La capitale (auto-rilevata) somma granaio/mulino/forno al profilo.
+    """
+    if builder.crop_safety_needed(state, settings):
+        return None
+    intents = builder.role_intents(state, settings)
+    if not intents:
+        return None
+    head = intents[0]
+    if not _queue_free(state, settings, head.is_resource_field):
+        return None
+    role = settings.village_role_for(state.village_name, state.village_id)
+    return Action(
+        type=ActionType.UPGRADE_FIELD,
+        params={
+            "candidates": [f.slot_id for f in intents],
+            "construct": builder.construct_gids(state, intents),
+        },
+        reason=(
+            f"Sviluppo ruolo '{role}': upgrade di "
+            f"'{head.name or 'slot ' + str(head.slot_id)}' "
+            f"(livello {head.level}, slot {head.slot_id})"
         ),
     )
 
@@ -421,7 +539,10 @@ class RuleBasedBrain:
     DEFAULT_RULES: tuple[Rule, ...] = (
         rule_alert_under_attack,
         rule_upgrade_storage,
+        rule_grain_safety,
         rule_emergency_overflow,
+        rule_building_focus,
+        rule_role_buildings,
         rule_upgrade_weakest_field,
         rule_wait,
     )

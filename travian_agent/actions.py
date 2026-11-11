@@ -366,18 +366,35 @@ class ActionExecutor:
         edifici interni (slot 19-40, dorf2): build.php?id=N apre
         direttamente il contratto di upgrade dell'edificio esistente.
         Su un'area vuota la pagina mostra invece il catalogo edifici e
-        UPGRADE_BUTTON non e' presente, quindi lo slot viene saltato.
+        UPGRADE_BUTTON non e' presente: per le NUOVE costruzioni il brain
+        passa params['construct'] = {slot_id: gid} e si apre il contratto
+        diretto dorf2.php?a=<gid>&id=<slot> (T4.x), dove il pulsante di
+        avvio costruzione e' lo stesso UPGRADE_BUTTON.
         """
         candidates: list[int] = action.params.get("candidates") or []
         if not candidates:
             return ActionResult(False, "nessun candidato per l'upgrade")
+
+        # slot_id -> gid per le nuove costruzioni su aree vuote
+        construct_raw = action.params.get("construct") or {}
+        construct: dict[int, int] = {}
+        for k, v in construct_raw.items():
+            try:
+                construct[int(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
 
         page = self.browser.page
         assert page is not None
 
         for slot_id in candidates:
             # Costruisce l'URL di build includendo il newdid per garantire l'isolamento del villaggio
-            build_url = f"{selectors.PATH_BUILD}?id={slot_id}"
+            gid = construct.get(int(slot_id), 0)
+            if gid > 0:
+                # Nuova costruzione su area vuota: contratto diretto del gid
+                build_url = f"{selectors.PATH_DORF2}?a={gid}&id={slot_id}"
+            else:
+                build_url = f"{selectors.PATH_BUILD}?id={slot_id}"
             if village_id > 0:
                 build_url += f"&newdid={village_id}"
 
@@ -1389,11 +1406,18 @@ class ActionExecutor:
             """
             (args) => {
                 const [rowsSelectors, wanted] = args;
+                // La sidebar villaggi usa le stesse classi .listEntry:
+                // va esclusa per non confonderla con le righe farm list.
+                const inSidebar = (n) => !!(n && n.closest && n.closest(
+                    'aside, [id*="sidebar" i], [id*="villageList" i], ' +
+                    '[id*="villagelist" i], .sidebar, .villageList, #myLinks'
+                ));
                 const nodes = [];
                 const seen = new Set();
                 for (const sel of rowsSelectors) {
                     document.querySelectorAll(sel).forEach(n => {
-                        if (!seen.has(n)) { seen.add(n); nodes.push(n); }
+                        if (seen.has(n) || inSidebar(n)) return;
+                        seen.add(n); nodes.push(n);
                     });
                 }
                 let row = null;
@@ -1406,6 +1430,33 @@ class ActionExecutor:
                     row = nodes.find(r =>
                         r.querySelectorAll('input[type="checkbox"]').length > 0
                     ) || null;
+                }
+                // Fallback layout ignoto: partiamo dalle checkbox dell'area
+                // contenuto e risaliamo al contenitore-riga piu' vicino.
+                if (!row) {
+                    const scope = document.querySelector(
+                        '#raidList, .raidList, #raidListTable, ' +
+                        'form[name*="farm" i], #content, #build'
+                    ) || document.body;
+                    const scopeBoxes = Array.from(
+                        scope.querySelectorAll('input[type="checkbox"]')
+                    ).filter(b => !inSidebar(b));
+                    if (scopeBoxes.length) {
+                        let cb = scopeBoxes[0];
+                        if (wanted) {
+                            const m = scopeBoxes.find(b => {
+                                const c = b.closest(
+                                    'tr, li, .listEntry, .slotRow, .row, div'
+                                );
+                                return c && (c.innerText || '')
+                                    .toLowerCase().includes(wanted);
+                            });
+                            if (m) cb = m;
+                        }
+                        row = cb.closest(
+                            'tr, li, .listEntry, .slotRow, .row'
+                        ) || cb.parentElement;
+                    }
                 }
                 if (!row) return { ok: false, reason: 'no_list_row' };
 
@@ -1435,16 +1486,45 @@ class ActionExecutor:
         if not picked or not picked.get("ok"):
             debug = await page.evaluate(
                 """
-                () => ({
-                    url: location.href,
-                    rows: document.querySelectorAll(
-                        '.listEntry, tr.farmList, .farmList li'
-                    ).length,
-                    checkboxes: document.querySelectorAll('input[type="checkbox"]').length,
-                    text: ((document.body && document.body.innerText) || '').slice(0, 300),
-                })
+                () => {
+                    const scope = document.querySelector(
+                        '#raidList, .raidList, #content, #build'
+                    ) || document.body;
+                    return {
+                        url: location.href,
+                        rows: document.querySelectorAll(
+                            '.listEntry, tr.farmList, .farmList li'
+                        ).length,
+                        checkboxes: document.querySelectorAll(
+                            'input[type="checkbox"]'
+                        ).length,
+                        checkboxesContent: scope.querySelectorAll(
+                            'input[type="checkbox"]'
+                        ).length,
+                        raidList: !!document.querySelector(
+                            '#raidList, .raidList, #raidListTable, ' +
+                            'form[name*="farm" i]'
+                        ),
+                        text: ((scope && scope.innerText) || '')
+                            .slice(0, 300),
+                    };
+                }
                 """
             )
+            # Feature non presente in pagina (nessun contenitore lista e
+            # nessuna checkbox nell'area contenuto): le farm list su TL sono
+            # Gold Club — messaggio distinto dal mismatch di selettori.
+            if not debug.get("raidList") and not debug.get("checkboxesContent"):
+                logger.warning(
+                    "Nessuna farm list disponibile (slot %s): richiede Gold Club "
+                    "o lista non ancora creata in-game. debug=%s",
+                    rally_slot, debug,
+                )
+                return ActionResult(
+                    False,
+                    "nessuna farm list disponibile (Gold Club richiesto o "
+                    "lista non creata in-game)",
+                )
             logger.warning(
                 "Farm list non selezionabile (slot %s): %s debug=%s",
                 rally_slot, picked, debug,

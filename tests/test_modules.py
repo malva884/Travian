@@ -188,13 +188,13 @@ def test_expansion_pick_founder(tmp_path):
         "Bivona": [Field(slot_id=26, name="Residenza", level=10, gid=GID_RESIDENCE)],
         "Hipponion": [],
     }
-    founder, res = mgr._pick_founder(s, villages, interior_map)
+    founder, res = mgr._pick_founder(s.expansion, villages, interior_map)
     assert founder is not None and founder.name == "Bivona"
     assert res is not None and res.slot_id == 26
 
     # Founder configurato esplicitamente
     s.expansion.founder_village = "Hipponion"
-    founder2, res2 = mgr._pick_founder(s, villages, interior_map)
+    founder2, res2 = mgr._pick_founder(s.expansion, villages, interior_map)
     assert founder2 is not None and founder2.name == "Hipponion"
     assert res2 is None  # nessuna residenza negli interni
 
