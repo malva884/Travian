@@ -74,6 +74,9 @@ def _acquire_agent_lock(accounts: list[Settings]) -> list | None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     for acc in accounts:
         _pid_path(acc.account_id).write_text(str(os.getpid()), encoding="utf-8")
+        # Resetta un eventuale stop-flag non consumato da una fermata
+        # precedente: senza pulizia l'agente uscirebbe al primo ciclo.
+        (PID_DIR / f"stop_{acc.account_id}.flag").unlink(missing_ok=True)
     return [_pid_path(acc.account_id) for acc in accounts]
 
 

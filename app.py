@@ -46,8 +46,9 @@ DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = STATE_DIR / "agent.log"
 PYTHON_EXE = sys.executable
 
-if "agent_process" not in st.session_state:
-    st.session_state.agent_process = None
+if "agent_processes" not in st.session_state:
+    # account_id -> subprocess.Popen degli agenti avviati da questa sessione
+    st.session_state.agent_processes = {}
 
 
 def _pid_alive(pid: int) -> bool:
@@ -87,32 +88,95 @@ def find_running_agents() -> list[tuple[str, int]]:
 
 def is_agent_running() -> bool:
     """Agente attivo se avviato da questa sessione o rilevato dai PID file."""
-    proc = st.session_state.agent_process
-    if proc is not None:
-        if proc.poll() is None:
-            return True
-        st.session_state.agent_process = None
-    return bool(find_running_agents())
+    procs: dict[str, subprocess.Popen] = st.session_state.agent_processes
+    for acc_id in [a for a, p in procs.items() if p.poll() is not None]:
+        del procs[acc_id]
+    return bool(procs) or bool(find_running_agents())
 
 
 def stop_all_agents() -> int:
-    """Termina il processo della sessione e tutti gli agenti rilevati dai PID file."""
-    stopped = 0
-    proc = st.session_state.agent_process
-    if proc is not None:
+    """Termina i processi della sessione e tutti gli agenti dai PID file.
+
+    I PID sono deduplicati: in modalita' orchestratore unico piu' file
+    `agent_*.pid` possono contenere lo stesso PID del processo padre.
+    """
+    stopped_pids: set[int] = set()
+    for proc in st.session_state.agent_processes.values():
         try:
             proc.terminate()
-            stopped += 1
+            stopped_pids.add(proc.pid)
         except Exception:  # noqa: BLE001
             pass
-        st.session_state.agent_process = None
+    st.session_state.agent_processes = {}
     for _acc_id, pid in find_running_agents():
+        if pid in stopped_pids:
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
-            stopped += 1
+            stopped_pids.add(pid)
         except Exception:  # noqa: BLE001
             pass
-    return stopped
+    return len(stopped_pids)
+
+
+def set_account_stop(account_id: str) -> None:
+    """Flag consumato dall'orchestratore: termina il loop del solo account."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"stop_{account_id}.flag").write_text(
+        str(datetime.datetime.now()), encoding="utf-8"
+    )
+
+
+def stop_account(account_id: str) -> None:
+    """Ferma il solo account indicato, senza toccare gli altri.
+
+    - Se l'account gira in un processo dedicato (PID non condiviso), il
+      processo viene terminato subito.
+    - Se il PID e' condiviso con altri account (orchestratore unico avviato
+      da CLI), scrive `stop_<id>.flag`: l'orchestratore chiude solo quel
+      task al prossimo ciclo e rimuove il suo PID file.
+    """
+    proc = st.session_state.agent_processes.pop(account_id, None)
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+
+    running = find_running_agents()
+    pid_counts: dict[int, int] = {}
+    for _a, p in running:
+        pid_counts[p] = pid_counts.get(p, 0) + 1
+    killed = False
+    for acc_id, pid in running:
+        if acc_id == account_id and pid_counts.get(pid, 0) == 1:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed = True
+            except Exception:  # noqa: BLE001
+                pass
+    if killed:
+        (STATE_DIR / f"agent_{account_id}.pid").unlink(missing_ok=True)
+    else:
+        # PID condiviso o gia' morto: uscita morbida via flag
+        set_account_stop(account_id)
+    set_account_pause(account_id, False)
+
+
+def _on_village_account_change() -> None:
+    """Cambio account nel tab Villaggi: invalida lo stato dei widget del form.
+
+    Evita che gli input renderizzati per l'account precedente restino nel
+    DOM o vengano riassociati ai villaggi dell'account appena selezionato.
+    """
+    st.session_state["village_form_nonce"] = (
+        st.session_state.get("village_form_nonce", 0) + 1
+    )
+    for key in list(st.session_state.keys()):
+        if key.startswith(
+            ("role_", "target_", "units_", "focus_", "market_slot_", "coord_x_", "coord_y_")
+        ):
+            del st.session_state[key]
 
 
 def is_account_paused(account_id: str) -> bool:
@@ -130,13 +194,17 @@ def set_account_pause(account_id: str, paused: bool) -> None:
 
 
 def get_latest_village_snapshots(account_id: str) -> dict[str, dict]:
-    """Estrae l'ultimo snapshot registrato per ciascun villaggio dal JSONL dello storico."""
-    history_file = STATE_DIR / "history" / f"history_{account_id}.jsonl"
+    """Estrae l'ultimo snapshot registrato per ciascun villaggio dal JSONL dello storico.
+
+    Filtraggio stretto per account: usa solo `safe_id`, lo stesso nome file
+    che l'orchestratore scrive in `_append_history`. Nessun fallback su nomi
+    raw: due account con id simili (es. 'server 11' vs 'server_11')
+    non devono mai leggere lo storico l'uno dell'altro.
+    """
+    safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
+    history_file = STATE_DIR / "history" / f"history_{safe_id}.jsonl"
     if not history_file.exists():
-        safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
-        history_file = STATE_DIR / "history" / f"history_{safe_id}.jsonl"
-        if not history_file.exists():
-            return {}
+        return {}
 
     snapshots: dict[str, dict] = {}
     try:
@@ -234,11 +302,24 @@ with st.sidebar:
                     st.rerun()
 
         with c_stop:
-            if st.button("⏹️ Ferma", use_container_width=True, type="secondary"):
+            if st.button("⏹️ Ferma tutti", use_container_width=True, type="secondary"):
                 n = stop_all_agents()
                 for acc in accounts:
                     set_account_pause(acc.account_id, False)
                 st.toast(f"Agente arrestato ({n} processo/i).", icon="⏹️")
+                time.sleep(0.5)
+                st.rerun()
+
+        # Fermata selettiva: un pulsante per ciascun account in esecuzione,
+        # cosi' si termina solo il server scelto senza toccare gli altri.
+        for acc_id, pid in running_agents:
+            if st.button(
+                f"⏹️ Ferma `{acc_id}` (PID {pid})",
+                key=f"stop_btn_{acc_id}",
+                use_container_width=True,
+            ):
+                stop_account(acc_id)
+                st.toast(f"Stop richiesto per '{acc_id}'.", icon="⏹️")
                 time.sleep(0.5)
                 st.rerun()
     else:
@@ -337,21 +418,38 @@ with tab_control:
     with c2:
         st.write(" ")
         st.write(" ")
-        if not is_agent_running():
-            if st.button("▶️ Avvia Agente / Orchestratore", type="primary", use_container_width=True):
-                if not accounts:
-                    st.error("Configura prima almeno un account!")
-                else:
-                    cmd = [PYTHON_EXE, "main.py", "--brain", selected_brain]
-                    if target_account:
-                        cmd += ["--account", target_account]
+        if st.button("▶️ Avvia Agente / Account", type="primary", use_container_width=True):
+            if not accounts:
+                st.error("Configura prima almeno un account!")
+            else:
+                running_ids = {a for a, _ in find_running_agents()}
+                target_accounts = (
+                    [a for a in accounts if a.account_id == target_account]
+                    if target_account
+                    else list(accounts)
+                )
+                started = 0
+                for acc in target_accounts:
+                    if acc.account_id in running_ids:
+                        continue
+                    # Un processo dedicato per account: PID file e file di
+                    # log separati, cosi' la fermata selettiva termina solo
+                    # il server scelto e gli stati non si mescolano.
+                    cmd = [
+                        PYTHON_EXE, "main.py",
+                        "--account", acc.account_id,
+                        "--brain", selected_brain,
+                    ]
                     if not headless_opt:
                         cmd.append("--headed")
                     if single_run:
                         cmd.append("--once")
 
-                    log_f = open(LOG_FILE, "a", encoding="utf-8")
-                    log_f.write(f"\n--- AVVIO ORCHESTRATORE: {datetime.datetime.now()} (Modalità: {run_mode}) ---\n")
+                    log_path = STATE_DIR / f"agent_{acc.account_id}.log"
+                    log_f = open(log_path, "a", encoding="utf-8")
+                    log_f.write(
+                        f"\n--- AVVIO AGENTE {acc.account_id}: {datetime.datetime.now()} ---\n"
+                    )
                     log_f.flush()
 
                     proc = subprocess.Popen(
@@ -361,12 +459,15 @@ with tab_control:
                         stderr=subprocess.STDOUT,
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                     )
-                    st.session_state.agent_process = proc
-                    st.success("Agente avviato con successo!")
+                    st.session_state.agent_processes[acc.account_id] = proc
+                    started += 1
+                if started:
+                    st.success(f"Avviati {started} agente/i (un processo dedicato per account).")
                     time.sleep(1)
                     st.rerun()
-        else:
-            st.warning("L'agente/orchestratore è già attivo in background.")
+                else:
+                    st.info("Gli account selezionati sono già in esecuzione.")
+        if is_agent_running():
             if st.button("⏹️ Arresta Tutti", type="secondary", use_container_width=True):
                 n = stop_all_agents()
                 st.toast(f"Arrestato ({n} processo/i).", icon="⏹️")
@@ -387,7 +488,9 @@ with tab_villages:
         with col_acc:
             acc_opts = [f"{a.account_id} ({a.server_url})" for a in accounts]
             sel_v_acc_idx = st.selectbox(
-                "Seleziona Account:", range(len(accounts)), format_func=lambda i: acc_opts[i], key="v_acc_sel"
+                "Seleziona Account:", range(len(accounts)),
+                format_func=lambda i: acc_opts[i], key="v_acc_sel",
+                on_change=_on_village_account_change,
             )
             cur_acc = accounts[sel_v_acc_idx]
 
@@ -490,7 +593,10 @@ with tab_villages:
         st.markdown("#### ⚙️ Configurazione Ruoli Villaggio (Micro-Level Brain)")
         st.write("Modifica i ruoli strategici e i target di spedizione. I cambiamenti vengono salvati su file e **letti all'istante dal bot al prossimo ciclo senza riavvio**.")
 
-        with st.form("village_roles_form"):
+        # Form key per-account + nonce: al cambio account i widget del
+        # form precedente vengono smontati, niente residui nel DOM.
+        form_nonce = st.session_state.get("village_form_nonce", 0)
+        with st.form(f"village_roles_form_{cur_acc.account_id}_{form_nonce}"):
             all_known = list(cur_acc.villages.keys())
             for sv in snapshots.keys():
                 if sv not in all_known:
@@ -568,6 +674,9 @@ with tab_villages:
 
             for idx, vname in enumerate(all_known):
                 old_cfg = cur_acc.villages.get(vname, VillageConfig(name=vname))
+                # Chiavi widget legate al villaggio (non alla posizione):
+                # lo stato segue il villaggio anche se l'ordine cambia.
+                vkey = "".join(c if c.isalnum() or c in "._-" else "_" for c in vname)
                 with st.expander(f"🏰 Configurazione per '{vname}'", expanded=True):
                     r_col1, r_col2 = st.columns([1, 1])
                     with r_col1:
@@ -577,7 +686,7 @@ with tab_villages:
                             role_choices,
                             index=role_choices.index(cur_role_val),
                             format_func=lambda r: role_labels.get(r, r),
-                            key=f"role_{cur_acc.account_id}_{idx}",
+                            key=f"role_{cur_acc.account_id}_{vkey}",
                         )
                     with r_col2:
                         cur_target = old_cfg.target_village if old_cfg.target_village in target_options else "(Nessuno)"
@@ -585,7 +694,7 @@ with tab_villages:
                             f"Villaggio Target Spedizione (per Feeder):",
                             target_options,
                             index=target_options.index(cur_target) if cur_target in target_options else 0,
-                            key=f"target_{cur_acc.account_id}_{idx}",
+                            key=f"target_{cur_acc.account_id}_{vkey}",
                         )
                         assigned_target = "" if new_target == "(Nessuno)" else new_target
 
@@ -601,7 +710,7 @@ with tab_villages:
                             "Unità Addestrabili Consentite:",
                             options=unit_options,
                             default=[u for u in old_cfg.allowed_units if u in unit_options],
-                            key=f"units_{cur_acc.account_id}_{idx}",
+                            key=f"units_{cur_acc.account_id}_{vkey}",
                             help="Ordine = priorita' di addestramento (usato dai ruoli "
                                  "hammer/defensive). Vuoto = nessun filtro.",
                         )
@@ -617,7 +726,7 @@ with tab_villages:
                             options=focus_options,
                             default=[f for f in old_cfg.building_focus if f in focus_options],
                             format_func=lambda k: building_focus_labels.get(k, k),
-                            key=f"focus_{cur_acc.account_id}_{idx}",
+                            key=f"focus_{cur_acc.account_id}_{vkey}",
                             help="Edifici a cui dare priorita' di upgrade in questo villaggio",
                         )
                     with u_col3:
@@ -627,7 +736,7 @@ with tab_villages:
                             max_value=40,
                             value=int(old_cfg.market_slot or 0),
                             step=1,
-                            key=f"market_slot_{cur_acc.account_id}_{idx}",
+                            key=f"market_slot_{cur_acc.account_id}_{vkey}",
                             help="Slot dorf2 del Mercato (19-40). "
                                  "0 = rilevamento automatico via gid=17.",
                         )
@@ -638,7 +747,7 @@ with tab_villages:
                             max_value=500,
                             value=int(old_cfg.x if old_cfg.x is not None else 0),
                             step=1,
-                            key=f"coord_x_{cur_acc.account_id}_{idx}",
+                            key=f"coord_x_{cur_acc.account_id}_{vkey}",
                             help="Coordinata X del villaggio (utilizzata per l'invio risorse al mercato).",
                         )
                     with u_col5:
@@ -648,7 +757,7 @@ with tab_villages:
                             max_value=500,
                             value=int(old_cfg.y if old_cfg.y is not None else 0),
                             step=1,
-                            key=f"coord_y_{cur_acc.account_id}_{idx}",
+                            key=f"coord_y_{cur_acc.account_id}_{vkey}",
                             help="Coordinata Y del villaggio (utilizzata per l'invio risorse al mercato).",
                         )
 
@@ -1462,21 +1571,24 @@ with tab_accounts:
 
 # 3. TAB LOG
 with tab_logs:
-    st.subheader("Log di Esecuzione (Tutti gli account)")
-    c_log1, c_log2 = st.columns([1, 4])
-    with c_log1:
-        auto_refresh = st.checkbox("Auto-aggiorna log", value=True)
-        if st.button("🗑️ Pulisci log"):
-            if LOG_FILE.exists():
-                LOG_FILE.write_text("", encoding="utf-8")
+    st.subheader("Log di Esecuzione (un file per account)")
+    # Ogni agente scrive su agent_<id>.log; agent.log resta per i log legacy.
+    log_files = sorted(STATE_DIR.glob("agent*.log"))
+    if not log_files:
+        st.info("Nessun file di log trovato. Avvia l'agente per generare i log.")
+        auto_refresh = False
+    else:
+        sel_log = st.selectbox("File di log:", log_files, format_func=lambda p: p.name)
+        c_log1, c_log2 = st.columns([1, 4])
+        with c_log1:
+            auto_refresh = st.checkbox("Auto-aggiorna log", value=True)
+            if st.button("🗑️ Pulisci log"):
+                sel_log.write_text("", encoding="utf-8")
                 st.rerun()
 
-    if LOG_FILE.exists():
-        log_content = LOG_FILE.read_text(encoding="utf-8", errors="replace")
+        log_content = sel_log.read_text(encoding="utf-8", errors="replace")
         lines = log_content.splitlines()[-120:]
         st.code("\n".join(lines) if lines else "Nessun log disponibile.", language="text")
-    else:
-        st.info("Nessun log recente.")
 
     if auto_refresh and is_agent_running():
         time.sleep(3)

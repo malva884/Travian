@@ -501,7 +501,21 @@ async def run_single_account_loop(
                 except Exception as hr_err:
                     logger.debug("%s Errore hot-reload config: %s", prefix, hr_err)
 
-                # 0.1 Controllo interruttore di pausa d'emergenza (creato dalla dashboard GUI)
+                # 0.1 Stop selettivo per-account (flag creato dalla dashboard GUI):
+                # termina solo questo task, lasciando attivi gli altri account.
+                stop_file = BASE_DIR / "state" / f"stop_{settings.account_id}.flag"
+                if stop_file.exists():
+                    stop_file.unlink(missing_ok=True)
+                    # Il PID puo' essere condiviso con altri account (orchestratore
+                    # unico): rimuovere il file e' l'unico modo per segnalare alla
+                    # dashboard che QUESTO account e' fermo.
+                    (BASE_DIR / "state" / f"agent_{settings.account_id}.pid").unlink(
+                        missing_ok=True
+                    )
+                    logger.info("%s Stop richiesto dalla dashboard. Uscita.", prefix)
+                    return
+
+                # 0.2 Controllo interruttore di pausa d'emergenza (creato dalla dashboard GUI)
                 pause_file = BASE_DIR / "state" / f"pause_{settings.account_id}.flag"
                 if pause_file.exists():
                     logger.info("%s Agente in PAUSA (trovato %s). Attesa 10s...", prefix, pause_file.name)
