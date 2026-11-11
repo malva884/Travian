@@ -1808,6 +1808,17 @@ class ActionExecutor:
         page = self.browser.page
         assert page is not None
 
+        # Modalita' rimpiazzo mirato (Smart Troop Replenishment): quantita'
+        # esplicite per unita' calcolate dal deficit target - (attuali+coda).
+        unit_quantities = params.get("unit_quantities")
+        if unit_quantities:
+            return await self._train_troops_targeted(
+                page,
+                trainer_slots=trainer_slots,
+                unit_quantities=dict(unit_quantities),
+                village_id=village_id,
+            )
+
         # Scorre gli edifici militari candidati finché trova truppe addestrabili
         for trainer_slot in trainer_slots:
             build_url = f"{selectors.PATH_BUILD}?id={trainer_slot}"
@@ -1883,6 +1894,121 @@ class ActionExecutor:
         return ActionResult(
             False,
             f"nessuna truppa addestrabile negli slot {trainer_slots}",
+        )
+
+    async def _train_troops_targeted(
+        self,
+        page,
+        *,
+        trainer_slots: list[int],
+        unit_quantities: dict[str, int],
+        village_id: int = 0,
+        res_margin: float = 0.85,
+        crop_margin: float = 0.70,
+    ) -> ActionResult:
+        """Addestra quantita' mirate per unita' (Smart Troop Replenishment).
+
+        Per ogni edificio legge costi/risorse reali, ridimensiona ogni
+        quantita' richiesta al massimo sostenibile (margini piu' prudenti
+        del batch surplus: 85% risorse, 70% grano per non compromettere la
+        stabilita' del grano), compila tutti gli input delle unita'
+        richieste e invia il form UNA sola volta per edificio.
+        """
+        wanted = {
+            str(k).lower(): int(v)
+            for k, v in unit_quantities.items()
+            if int(v or 0) > 0
+        }
+        if not wanted:
+            return ActionResult(False, "nessuna unita' da addestrare nel piano")
+
+        trained: list[str] = []
+        remaining = dict(wanted)
+
+        for trainer_slot in trainer_slots:
+            if not remaining:
+                break
+            build_url = f"{selectors.PATH_BUILD}?id={trainer_slot}"
+            if village_id > 0:
+                build_url += f"&newdid={village_id}"
+            await self.browser.goto(build_url)
+
+            training_data = await self._extract_training_data(page)
+            if not training_data:
+                continue
+
+            resources = training_data.get("resources") or {}
+            budget = {
+                "wood": int(resources.get("wood", 0) * res_margin),
+                "clay": int(resources.get("clay", 0) * res_margin),
+                "iron": int(resources.get("iron", 0) * res_margin),
+                "crop": int(resources.get("crop", 0) * crop_margin),
+            }
+
+            # Per ogni unita' disponibile nel form: quantita' = min(richiesta,
+            # budget/costo). Ogni input compilato aggiorna il budget residuo.
+            fills: list[tuple[str, int, str]] = []
+            for unit in training_data.get("units") or []:
+                input_name = (unit.get("inputName") or "").strip().lower()
+                label = (unit.get("label") or "").strip() or input_name
+                costs = unit.get("costs") or {}
+                need = remaining.get(input_name, 0)
+                if need <= 0 or not costs:
+                    continue
+                affordable = need
+                for key in ("wood", "clay", "iron", "crop"):
+                    cost = int(costs.get(key) or 0)
+                    if cost > 0:
+                        affordable = min(affordable, budget[key] // cost)
+                if affordable <= 0:
+                    continue
+                fills.append((input_name, int(affordable), label))
+                for key in ("wood", "clay", "iron", "crop"):
+                    cost = int(costs.get(key) or 0)
+                    budget[key] -= cost * int(affordable)
+
+            if not fills:
+                continue
+
+            filled_ok = False
+            for input_name, qty, label in fills:
+                try:
+                    await page.locator(
+                        f"input[name='{input_name}']"
+                    ).first.fill(str(qty), timeout=2000)
+                    remaining[input_name] = remaining.get(input_name, 0) - qty
+                    if remaining[input_name] <= 0:
+                        remaining.pop(input_name, None)
+                    trained.append(f"{qty}x {label}")
+                    filled_ok = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Fill mirato fallito su %s (slot %s): %s",
+                        input_name, trainer_slot, exc,
+                    )
+
+            if not filled_ok:
+                continue
+
+            await sleep_human(
+                self.settings.action_delay_min,
+                self.settings.action_delay_max,
+            )
+            if await self._click_first(page, selectors.TRAIN_SUBMIT, timeout_ms=2000):
+                await sleep_human(1.0, 2.0)
+                logger.info(
+                    "Replenishment: addestramento avviato nello slot %s "
+                    "(villaggio %s): %s",
+                    trainer_slot, village_id, ", ".join(trained),
+                )
+
+        if trained:
+            return ActionResult(
+                True, f"rimpiazzo avviato: {', '.join(trained)}"
+            )
+        return ActionResult(
+            False,
+            "nessuna unita' del piano addestrabile con le risorse attuali",
         )
 
     async def _extract_training_data(self, page) -> dict | None:

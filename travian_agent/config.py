@@ -56,6 +56,9 @@ class VillageConfig:
     x: int | None = None            # coordinata X del villaggio
     y: int | None = None            # coordinata Y del villaggio
     defense_enabled: bool = True    # include questo villaggio nella reazione anti-attacco
+    # Smart Troop Replenishment: obiettivo numerico per unita' (chiave 'tN'
+    # o nome unita'). deficit = target - (truppe a casa + truppe in coda).
+    troop_targets: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:
@@ -125,6 +128,30 @@ class HeroConfig:
 
 
 @dataclass
+class ReplenishmentConfig:
+    """Smart Troop Replenishment: rimpiazzo condizionato delle perdite.
+
+    Decide dopo ogni report di combattimento se riaddestrare le unita'
+    perse, fino al target per-villaggio (VillageConfig.troop_targets),
+    con filtro anti-suicidio e bilanciamento risorse/grano.
+    """
+
+    enabled: bool = False
+    # Blocco automatico del rimpiazzo (e degli attacchi) dopo fallimenti
+    # ripetuti su target difesi: disattivare per addestrare comunque.
+    auto_block: bool = True
+    # Fallimenti consecutivi sullo stesso target prima del congelamento
+    fail_streak_threshold: int = 2
+    # Ondata minima di attacchi in arrivo per considerare il villaggio
+    # 'sotto assedio' e sospendere rimpiazzo + rinforzi (Scenario 2)
+    siege_waves: int = 2
+    # Quota del granaio da preservare: sotto questa soglia non si addestra
+    crop_reserve_pct: float = 0.25
+    # True = l'addestramento cede il passo alle code di sviluppo economico
+    skip_while_building: bool = True
+
+
+@dataclass
 class DefenseConfig:
     """Modulo difesa: reazione intelligente agli attacchi in arrivo.
 
@@ -180,6 +207,7 @@ class Settings:
     scout_brain: ScoutBrainConfig = field(default_factory=ScoutBrainConfig)
     hero: HeroConfig = field(default_factory=HeroConfig)
     defense: DefenseConfig = field(default_factory=DefenseConfig)
+    replenishment: ReplenishmentConfig = field(default_factory=ReplenishmentConfig)
 
     def __post_init__(self) -> None:
         if not self.account_id:
@@ -269,6 +297,13 @@ def _parse_account_item(item: dict) -> Settings:
                                     if k in DefenseConfig.__dataclass_fields__
                                 }
                             ),
+                            replenishment=ReplenishmentConfig(
+                                **{
+                                    k: v
+                                    for k, v in dict(item.get("replenishment_settings") or {}).items()
+                                    if k in ReplenishmentConfig.__dataclass_fields__
+                                }
+                            ),
                             expansion=ExpansionConfig(
                                 auto_expand=bool(
                                     dict(item.get("expansion_settings") or {}).get("auto_expand", False)
@@ -315,6 +350,11 @@ def _parse_account_item(item: dict) -> Settings:
                                     market_slot=int(cfg.get("market_slot", 0) or 0),
                                     x=int(cfg["x"]) if cfg.get("x") is not None else None,
                                     y=int(cfg["y"]) if cfg.get("y") is not None else None,
+                                    troop_targets={
+                                        str(k): int(v)
+                                        for k, v in dict(cfg.get("troop_targets") or {}).items()
+                                        if int(v or 0) > 0
+                                    },
                                 )
                                 for key, cfg in (item.get("villages") or {}).items()
                                 if isinstance(cfg, dict)
@@ -433,6 +473,14 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                 "drain_target_village": acc.defense.drain_target_village,
                 "dodge_target": acc.defense.dodge_target,
             },
+            "replenishment_settings": {
+                "enabled": acc.replenishment.enabled,
+                "auto_block": acc.replenishment.auto_block,
+                "fail_streak_threshold": acc.replenishment.fail_streak_threshold,
+                "siege_waves": acc.replenishment.siege_waves,
+                "crop_reserve_pct": acc.replenishment.crop_reserve_pct,
+                "skip_while_building": acc.replenishment.skip_while_building,
+            },
             "expansion_settings": {
                 "auto_expand": acc.expansion.auto_expand,
                 "founder_village": acc.expansion.founder_village,
@@ -461,6 +509,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                     "market_slot": int(cfg.market_slot or 0),
                     "x": cfg.x,
                     "y": cfg.y,
+                    "troop_targets": dict(cfg.troop_targets),
                 }
                 for key, cfg in acc.villages.items()
             },

@@ -1178,6 +1178,63 @@ class TravianParser:
         except Exception:
             return {}
 
+    async def read_training_queue(
+        self, trainer_slot: int, village_id: int = 0
+    ) -> dict[str, int]:
+        """Legge le unita' attualmente in addestramento in un edificio.
+
+        Naviga a build.php?id=<trainer_slot> e raschia la tabella delle
+        unita' 'in addestramento' (icone 'unit uN' + quantita'). Serve al
+        modulo Smart Troop Replenishment per la formula del deficit
+        (target - attuali - in coda). Ritorna {'uN': qty} o {} se la
+        pagina non espone la coda.
+        """
+        if not self.page or not trainer_slot:
+            return {}
+        url = f"{selectors.PATH_BUILD}?id={trainer_slot}"
+        if village_id:
+            url += f"&newdid={village_id}"
+        try:
+            await self.page.goto(
+                urljoin(self.page.url or "", url),
+                wait_until="domcontentloaded",
+            )
+        except Exception:
+            return {}
+        try:
+            data = await self.page.evaluate("""
+                () => {
+                    const out = {};
+                    // Righe 'in addestramento' del trainer: tabella under_progress
+                    // o contenitori simili con icona unit + quantita'/durata.
+                    const scopes = document.querySelectorAll(
+                        'table.under_progress, .under_progress, #training, ' +
+                        '.training_list, .troopTraining, #build form + table'
+                    );
+                    scopes.forEach(scope => {
+                        scope.querySelectorAll(
+                            'img.unit, span.unit, i.unit, [class*="unit u"]'
+                        ).forEach(icon => {
+                            const cls = icon.getAttribute('class') || '';
+                            const m = cls.match(/u(\\d+)/);
+                            if (!m) return;
+                            const key = 'u' + m[1];
+                            const row = icon.closest('tr, li, .troop, div') || icon.parentElement;
+                            const txt = (row && row.innerText) || '';
+                            const num = txt.match(/(\\d[\\d.]*)/);
+                            const qty = num
+                                ? parseInt(num[1].replace(/[^0-9]/g, ''), 10) || 0
+                                : 1;
+                            out[key] = (out[key] || 0) + qty;
+                        });
+                    });
+                    return out;
+                }
+            """)
+            return {str(k): int(v) for k, v in (data or {}).items() if int(v) > 0}
+        except Exception:
+            return {}
+
     async def read_farm_lists(
         self, rally_slot: int, village_id: int = 0
     ) -> list[dict]:

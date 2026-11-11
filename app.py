@@ -761,6 +761,36 @@ with tab_villages:
                             help="Coordinata Y del villaggio (utilizzata per l'invio risorse al mercato).",
                         )
 
+                    # --- SMART TROOP REPLENISHMENT: target numerico per unita' ---
+                    # L'utente definisce l'obiettivo per ciascuna unita'
+                    # addestrabile; il modulo riaddestra il deficit
+                    # (target - attuali - in coda) dopo ogni report.
+                    st.markdown(
+                        "**🎯 Target Truppe (Smart Replenishment):** "
+                        "obiettivo per unita' — 0 = non riaddestrare"
+                    )
+                    target_units = list(dict.fromkeys(
+                        list(parsed_units) + list(old_cfg.troop_targets.keys())
+                    ))
+                    troop_targets: dict[str, int] = {}
+                    if target_units:
+                        t_cols = st.columns(min(4, len(target_units)))
+                        for t_idx, t_unit in enumerate(target_units):
+                            with t_cols[t_idx % len(t_cols)]:
+                                troop_targets[t_unit] = st.number_input(
+                                    f"Target {t_unit}:",
+                                    min_value=0,
+                                    max_value=100000,
+                                    value=int(
+                                        old_cfg.troop_targets.get(t_unit, 0) or 0
+                                    ),
+                                    step=10,
+                                    key=f"ttgt_{cur_acc.account_id}_{vkey}_{t_idx}",
+                                )
+                    troop_targets = {
+                        u: q for u, q in troop_targets.items() if int(q) > 0
+                    }
+
                     # Se X e Y sono entrambi 0 e l'utente non li ha impostati, preserva None se era None
                     final_x = parsed_x if (parsed_x != 0 or old_cfg.x == 0) else old_cfg.x
                     final_y = parsed_y if (parsed_y != 0 or old_cfg.y == 0) else old_cfg.y
@@ -776,6 +806,7 @@ with tab_villages:
                         market_slot=int(parsed_market_slot),
                         x=int(final_x) if final_x is not None else None,
                         y=int(final_y) if final_y is not None else None,
+                        troop_targets=troop_targets,
                     )
 
             save_submitted = st.form_submit_button("💾 Salva Ruoli & Strategia (Applicazione a Caldo)", type="primary")
@@ -1264,6 +1295,62 @@ with tab_modules:
                     key="defense_drain_target",
                 )
 
+            st.divider()
+
+            # ------------- SMART TROOP REPLENISHMENT (Rimpiazzo Perdite) -------------
+            if not hasattr(mod_acc, "replenishment"):
+                from travian_agent.config import ReplenishmentConfig
+                mod_acc.replenishment = ReplenishmentConfig()
+            st.markdown("### 🔄 Smart Troop Replenishment (Rimpiazzo Perdite)")
+            repl_enabled = st.toggle(
+                "Abilita Rimpiazzo Intelligente delle Perdite",
+                value=mod_acc.replenishment.enabled,
+                key="replenish_toggle",
+                help="Dopo ogni report di combattimento riaddestra le unita' "
+                     "perse fino ai Target Truppe configurati per villaggio "
+                     "(deficit = target - attuali - in coda).",
+            )
+            repl_autoblock = st.toggle(
+                "Soglia di Blocco Dinamico (anti-suicidio)",
+                value=mod_acc.replenishment.auto_block,
+                key="replenish_autoblock",
+                help="Blocca target e congela il rimpiazzo delle unita' "
+                     "offensive dopo fallimenti ripetuti contro difese "
+                     "pesanti (es. muri di Pretoriani).",
+            )
+            rp_col1, rp_col2, rp_col3 = st.columns(3)
+            with rp_col1:
+                repl_streak = st.number_input(
+                    "Fallimenti consecutivi prima del blocco:",
+                    min_value=1, max_value=10,
+                    value=int(mod_acc.replenishment.fail_streak_threshold),
+                    help="Dopo N raid falliti sullo stesso target: stop "
+                         "attacchi su quel villaggio e congelamento unita'.",
+                )
+                repl_siege = st.number_input(
+                    "Ondata minima per 'villaggio sotto assedio':",
+                    min_value=1, max_value=20,
+                    value=int(mod_acc.replenishment.siege_waves),
+                    help="Con >= N attacchi in arrivo il villaggio viene "
+                         "congelato: niente rimpiazzo ne' rinforzi.",
+                )
+            with rp_col2:
+                repl_crop_res = st.slider(
+                    "Riserva grano (% granaio sempre preservata)",
+                    min_value=0, max_value=80,
+                    value=int(mod_acc.replenishment.crop_reserve_pct * 100),
+                    help="Il rimpiazzo non usa grano oltre questa soglia: "
+                         "stabilita' alimentare del villaggio produttore.",
+                ) / 100.0
+            with rp_col3:
+                repl_skip_build = st.toggle(
+                    "Cedi priorita' alle costruzioni",
+                    value=mod_acc.replenishment.skip_while_building,
+                    key="replenish_skip_build",
+                    help="Se una coda di sviluppo e' attiva, il rimpiazzo "
+                         "attende il ciclo successivo.",
+                )
+
             mod_saved = st.form_submit_button(
                 "💾 Salva Configurazione Moduli", type="primary"
             )
@@ -1385,9 +1472,18 @@ with tab_modules:
             mod_acc.defense.drain_via_market = bool(defense_drain_mkt)
             mod_acc.defense.drain_target_village = defense_drain_target.strip()
 
+            # Smart Troop Replenishment
+            mod_acc.replenishment.enabled = bool(repl_enabled)
+            mod_acc.replenishment.auto_block = bool(repl_autoblock)
+            mod_acc.replenishment.fail_streak_threshold = int(repl_streak)
+            mod_acc.replenishment.siege_waves = int(repl_siege)
+            mod_acc.replenishment.crop_reserve_pct = float(repl_crop_res)
+            mod_acc.replenishment.skip_while_building = bool(repl_skip_build)
+
             save_accounts(accounts)
             st.success(
-                "Parametri di farming, espansione, AI Scout, eroe e difesa aggiornati e salvati su "
+                "Parametri di farming, espansione, AI Scout, eroe, difesa e "
+                "replenishment aggiornati e salvati su "
                 "accounts.json! L'agente li applicherà al prossimo ciclo."
             )
             time.sleep(1)

@@ -20,7 +20,18 @@ from .defense import DefenseManager
 from .expansion import ExpansionManager, feeder_surplus, find_market
 from .farming import FarmingManager, find_rally_point
 from .hero import HeroManager
-from .models import Action, ActionType, Field, GameState, Resources, Village
+from .models import (
+    Action,
+    ActionType,
+    Field,
+    GameState,
+    GID_BARRACKS,
+    GID_STABLE,
+    GID_WORKSHOP,
+    Resources,
+    Village,
+)
+from .replenishment import TroopReplenishmentManager
 from .sensors import GameObserver
 
 logger = logging.getLogger(__name__)
@@ -33,6 +44,7 @@ _expansion_managers: dict[str, ExpansionManager] = {}
 _scout_brains: dict[str, AIScoutBrain] = {}
 _hero_managers: dict[str, HeroManager] = {}
 _defense_managers: dict[str, DefenseManager] = {}
+_replenish_managers: dict[str, TroopReplenishmentManager] = {}
 
 
 def _append_history(account_id: str, state: GameState, action: Action) -> None:
@@ -89,6 +101,7 @@ async def monitor_all_villages(
     scout_brain: AIScoutBrain | None = None,
     hero_mgr: HeroManager | None = None,
     defense_mgr: DefenseManager | None = None,
+    replenish_mgr: TroopReplenishmentManager | None = None,
 ) -> None:
     """Ciclo di controllo multi-villaggio per l'account corrente.
 
@@ -323,6 +336,10 @@ async def monitor_all_villages(
                 except Exception as f_exc:
                     logger.warning("%s Errore modulo farming: %s", vprefix, f_exc)
 
+            # Report di combattimento letti dallo scout brain; valorizzati una
+            # sola volta per villaggio e riusati dal modulo replenish.
+            reports: list[dict] | None = None
+
             # 4.1.b Modulo AI Scout Brain: raid dinamico a coordinate libere basato su radar mappa e report
             if scout_brain is not None and settings.scout_brain.enabled:
                 rally = find_rally_point(state.interior_fields())
@@ -354,6 +371,99 @@ async def monitor_all_villages(
                             logger.info("%s AI Scout: %s", vprefix, scout_res.message)
                     except Exception as s_exc:
                         logger.warning("%s Errore modulo AI Scout Brain: %s", vprefix, s_exc)
+
+            # 4.1.c Smart Troop Replenishment: analisi post-battaglia e
+            # rimpiazzo condizionato delle perdite (target - attuali - coda)
+            if replenish_mgr is not None and settings.replenishment.enabled:
+                try:
+                    # Scenario 2: il villaggio sotto assedio blocca rimpiazzo
+                    # e rinforzi; se la difesa e' stabile si sblocca da solo.
+                    replenish_mgr.update_siege_state(
+                        vname,
+                        state.incoming_attacks,
+                        siege_waves=settings.replenishment.siege_waves,
+                    )
+
+                    vcfg_rep = settings.village_config_for(
+                        village.name, target_vid
+                    )
+                    if vcfg_rep is not None and vcfg_rep.troop_targets:
+                        # Scenario 1: report -> blocco target suicida e
+                        # congelamento unita' offensive coinvolte.
+                        if reports is None:
+                            reports = await observer.read_combat_reports(
+                                limit=10
+                            )
+                        if reports:
+                            raid_units: list[str] = []
+                            if vcfg_rep.farm_unit:
+                                raid_units.append(vcfg_rep.farm_unit)
+                            raid_units.extend(vcfg_rep.priority_units or [])
+                            replenish_mgr.process_combat_reports(
+                                reports,
+                                auto_block=settings.replenishment.auto_block,
+                                fail_streak_threshold=(
+                                    settings.replenishment.fail_streak_threshold
+                                ),
+                                raid_units=raid_units or None,
+                            )
+
+                        # Truppe a casa: riuso lettura scout o nuova lettura
+                        troops_now = dict(state.troops_home or {})
+                        rally_rep = find_rally_point(state.interior_fields())
+                        if not troops_now and rally_rep is not None:
+                            troops_now = await observer.read_troops_home(
+                                rally_rep.slot_id, village.village_id
+                            )
+                            state.troops_home = dict(troops_now)
+
+                        # Truppe in coda di addestramento (tutti i trainer)
+                        trainer_slots_rep = [
+                            f.slot_id
+                            for f in state.interior_fields()
+                            if f.gid in (GID_BARRACKS, GID_STABLE, GID_WORKSHOP)
+                        ]
+                        queued: dict[str, int] = {}
+                        for _slot in trainer_slots_rep:
+                            for _u, _q in (
+                                await observer.read_training_queue(
+                                    _slot, village.village_id
+                                )
+                            ).items():
+                                queued[_u] = queued.get(_u, 0) + _q
+
+                        # Formula: da_addestrare = target - (attuali + coda)
+                        deficit = replenish_mgr.compute_deficit(
+                            vcfg_rep.troop_targets, troops_now, queued
+                        )
+                        plan = replenish_mgr.plan_training(
+                            deficit, state, settings, village_name=vname
+                        )
+                        if plan and trainer_slots_rep:
+                            rep_action = Action(
+                                type=ActionType.TRAIN_TROOPS,
+                                params={
+                                    "trainer_slots": trainer_slots_rep,
+                                    "unit_quantities": plan,
+                                },
+                                reason=(
+                                    "Smart Replenishment: deficit "
+                                    f"{plan} verso target "
+                                    f"{vcfg_rep.troop_targets}"
+                                ),
+                            )
+                            rep_res = await executor.execute(
+                                rep_action, village_id=target_vid
+                            )
+                            logger.info(
+                                "%s Replenishment: %s",
+                                vprefix, rep_res.message,
+                            )
+                except Exception as rep_exc:
+                    logger.warning(
+                        "%s Errore modulo replenishment: %s",
+                        vprefix, rep_exc,
+                    )
 
             # 4.2 Modulo espansione: i villaggi non-fondatore con mercato
             # spediscono il surplus al fondatore mentre servono coloni
@@ -497,6 +607,7 @@ async def run_single_account_loop(
                             settings.scout_brain = fresh_acc.scout_brain
                             settings.hero = fresh_acc.hero
                             settings.defense = fresh_acc.defense
+                            settings.replenishment = fresh_acc.replenishment
                             break
                 except Exception as hr_err:
                     logger.debug("%s Errore hot-reload config: %s", prefix, hr_err)
@@ -573,6 +684,10 @@ async def run_single_account_loop(
                     _defense_managers[settings.account_id] = DefenseManager(
                         settings.account_id
                     )
+                if settings.account_id not in _replenish_managers:
+                    _replenish_managers[settings.account_id] = (
+                        TroopReplenishmentManager(settings.account_id)
+                    )
                 await monitor_all_villages(
                     browser=browser,
                     observer=observer,
@@ -586,6 +701,7 @@ async def run_single_account_loop(
                     scout_brain=_scout_brains[settings.account_id],
                     hero_mgr=_hero_managers[settings.account_id],
                     defense_mgr=_defense_managers[settings.account_id],
+                    replenish_mgr=_replenish_managers[settings.account_id],
                 )
 
                 # Reset del conteggio errori e ripristino al completamento con successo
