@@ -858,15 +858,15 @@ with tab_villages:
                                 key=f"fqtgt_{cur_acc.account_id}_{vkey}_{_i}",
                                 label_visibility="collapsed",
                             )
-                            if _cols[3].button(
+                            if _cols[3].form_submit_button(
                                 "↑", key=f"fqup_{cur_acc.account_id}_{vkey}_{_i}"
                             ) and _i > 0:
                                 queue[_i - 1], queue[_i] = queue[_i], queue[_i - 1]
-                            if _cols[4].button(
+                            if _cols[4].form_submit_button(
                                 "↓", key=f"fqdn_{cur_acc.account_id}_{vkey}_{_i}"
                             ) and _i < len(queue) - 1:
                                 queue[_i + 1], queue[_i] = queue[_i], queue[_i + 1]
-                            if _cols[5].button(
+                            if _cols[5].form_submit_button(
                                 "✕", key=f"fqrm_{cur_acc.account_id}_{vkey}_{_i}"
                             ):
                                 queue.pop(_i)
@@ -888,7 +888,7 @@ with tab_villages:
                             )
                         with _ac3:
                             st.markdown("&nbsp;")
-                            if st.button(
+                            if st.form_submit_button(
                                 "➕", key=f"fqbtn_{cur_acc.account_id}_{vkey}",
                                 help="Aggiungi lo step alla coda",
                             ):

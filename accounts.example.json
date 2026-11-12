@@ -58,11 +58,11 @@
           "Cavalieri"
         ],
         "building_focus": [
-          "barracks",
-          "stable",
-          "workshop",
-          "smithy",
-          "granary"
+          {"key": "barracks", "target_level": 10},
+          {"key": "stable", "target_level": 5},
+          {"key": "workshop", "target_level": 0},
+          {"key": "smithy", "target_level": 0},
+          {"key": "granary", "target_level": 0}
         ],
         "farm_enabled": true,
         "farm_unit": ""
