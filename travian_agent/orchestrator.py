@@ -480,6 +480,42 @@ async def monitor_all_villages(
                     "%s Azione non eseguita: %s", vprefix, result.message
                 )
 
+                # Emergency Unpack (spec 3.2): spesa prioritaria fallita per
+                # risorse mancanti -> il baule dell'eroe copre il delta. La
+                # coda piena non e' un deficit di risorse: niente unpack.
+                queue_ok = (
+                    action.type == ActionType.TRAIN_SETTLERS
+                    or len(state.build_queue) < max(1, settings.max_build_queue)
+                )
+                if (
+                    hero_mgr is not None
+                    and settings.hero.enabled
+                    and settings.hero.emergency_unpack
+                    and queue_ok
+                    and action.type in (
+                        ActionType.UPGRADE_FIELD,
+                        ActionType.TRAIN_SETTLERS,
+                    )
+                ):
+                    try:
+                        gained = await hero_mgr.emergency_unpack(
+                            browser, village_id=target_vid, prefix=vprefix
+                        )
+                        if gained:
+                            result = await executor.execute(
+                                action, village_id=target_vid
+                            )
+                            if not result.success:
+                                logger.warning(
+                                    "%s Azione non eseguita dopo unpack: %s",
+                                    vprefix, result.message,
+                                )
+                    except Exception as unpack_exc:
+                        logger.warning(
+                            "%s Errore emergency unpack eroe: %s",
+                            vprefix, unpack_exc,
+                        )
+
             # 4.1 Modulo farming: raid periodico dalla farm list, se scaduto
             if farming_mgr is not None:
                 rally = find_rally_point(state.interior_fields())

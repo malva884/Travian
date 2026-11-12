@@ -128,6 +128,9 @@ class HeroConfig:
     heal_threshold: int = 50            # % salute sotto cui usare gli unguenti
     min_health_to_adventure: int = 40   # % salute minima per la spedizione
     attribute_focus: str = "auto"       # auto|strength|off|def|resources
+    # Emergency Unpack: su spesa fallita per risorse mancanti consuma i
+    # pacchi del baule eroe per coprire il delta (spec 3.2)
+    emergency_unpack: bool = True
 
 
 @dataclass
@@ -470,6 +473,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                 "heal_threshold": acc.hero.heal_threshold,
                 "min_health_to_adventure": acc.hero.min_health_to_adventure,
                 "attribute_focus": acc.hero.attribute_focus,
+                "emergency_unpack": acc.hero.emergency_unpack,
             },
             "defense_settings": {
                 "enabled": acc.defense.enabled,

@@ -42,6 +42,140 @@ _TABS_INVENTORY = ("/hero/inventory", "hero.php?t=inventory", "hero.php?t=2")
 # AGGIUNTO IL PERCORSO PULITO COME PRIORITÀ ASSOLUTA
 _TABS_ADVENTURES = ("/hero/adventures", "hero.php?t=adventures", "hero.php?t=adventure", "hero.php?t=3")
 
+# Emergency Unpack (baule eroe): gli item risorsa sono consumabili che
+# trasferiscono legno/argilla/ferro/grano nel villaggio dove si trova
+# l'eroe. Limite di sicurezza sui consumi per singola emergenza.
+_UNPACK_MAX_USES = 8
+
+# Selettore union degli slot inventario (stesso ordine di querySelectorAll,
+# usato sia dal sensore JS sia dal click per indice).
+_INVENTORY_ITEM_SELECTOR = (
+    ".inventory .item, .items .item, #items .item, .heroInventory .item, "
+    ".inventoryItem, .itemSlot .item, [class*='inventory'] [class*='item']"
+)
+
+# Delta risorse leggibile sulla pagina contratto aperta (build.php /
+# residenza): costo richiesto (classi r1..r4) meno stock della barra
+# (#l1..#l4). Restituisce solo i deficit positivi.
+_JS_PAGE_DEFICIT = """
+    () => {
+        const toInt = (s) => {
+            const m = String(s || '')
+                .replace(/[\\s.'\\u00a0\\u202f]/g, '')
+                .match(/-?\\d+/);
+            return m ? parseInt(m[0], 10) : 0;
+        };
+        const costs = { wood: 0, clay: 0, iron: 0, crop: 0 };
+        const keyOf = { r1: 'wood', r2: 'clay', r3: 'iron', r4: 'crop' };
+        const scopes = document.querySelectorAll(
+            '.showCosts, #contract, .contractLink, table#build_value, ' +
+            '.costs, #build, #content'
+        );
+        scopes.forEach(scope => {
+            scope.querySelectorAll(
+                '.r1, .r2, .r3, .r4, [class*=" r1"], [class*=" r2"], ' +
+                '[class*=" r3"], [class*=" r4"], [class^="r1"], [class^="r2"], ' +
+                '[class^="r3"], [class^="r4"]'
+            ).forEach(el => {
+                const cls = (el.getAttribute('class') || '').match(/r([1-4])/);
+                if (!cls) return;
+                const holder = el.parentElement || el;
+                const n = toInt(holder.innerText || el.getAttribute('title') || '');
+                if (n > 0) {
+                    const key = keyOf['r' + cls[1]];
+                    costs[key] = Math.max(costs[key], n);
+                }
+            });
+        });
+        const stock = {
+            wood: toInt((document.querySelector('#l1 .value, #l1') || {}).innerText),
+            clay: toInt((document.querySelector('#l2 .value, #l2') || {}).innerText),
+            iron: toInt((document.querySelector('#l3 .value, #l3') || {}).innerText),
+            crop: toInt((document.querySelector('#l4 .value, #l4') || {}).innerText),
+        };
+        const deficit = {};
+        for (const r of ['wood', 'clay', 'iron', 'crop']) {
+            const d = costs[r] - stock[r];
+            if (costs[r] > 0 && d > 0) deficit[r] = d;
+        }
+        return { deficit: deficit, costs: costs, stock: stock };
+    }
+"""
+
+# Sensore inventario: per ogni slot item raccoglie testo/tooltip/alt e
+# rileva i consumabili di risorsa (pacchi/sacchi). 'res' = risorsa singola
+# oppure 'any' per pacchi che concedono tutte e quattro le risorse.
+_JS_INVENTORY_RESOURCES = (
+    """
+    () => {
+        const out = [];
+        const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+        const parseAmount = (txt) => {
+            const m = (txt || '').match(/(\\d[\\d.\\s']{1,9})/);
+            if (!m) return 0;
+            return parseInt(m[1].replace(/[^0-9]/g, ''), 10) || 0;
+        };
+        const resOf = (txt) => {
+            const t = ' ' + (txt || '').toLowerCase() + ' ';
+            const kw = {
+                wood: ['legno', 'wood', 'lumber', 'holz', 'bois', 'madera'],
+                clay: ['argilla', 'clay', 'lehm', 'argile', 'barro', 'arcilla'],
+                iron: ['ferro', 'iron', 'eisen', 'hierro'],
+                crop: ['grano', 'crop', 'wheat', 'grain', 'cereal', 'getreide',
+                       'frumento', 'trigo'],
+            };
+            for (const res of ['wood', 'clay', 'iron', 'crop']) {
+                if (kw[res].some(w => t.includes(w))) return res;
+            }
+            return /risorse|resources|ressourcen|recursos/.test(t) ? 'any' : '';
+        };
+        const packLike = (txt) =>
+            /pacco|sacco|pack|bag|sack|crate|cassa|chest|baule|paquet|paquete|kiste/i
+                .test(txt || '');
+        const items = document.querySelectorAll(
+            '"""
+    + _INVENTORY_ITEM_SELECTOR
+    + """'
+        );
+        let idx = 0;
+        items.forEach(item => {
+            const img = item.querySelector('img');
+            const blob = [
+                item.getAttribute('title') || '',
+                item.getAttribute('data-title') || '',
+                item.getAttribute('data-tooltip') || '',
+                item.getAttribute('data-item-name') || '',
+                item.getAttribute('aria-label') || '',
+                img ? ((img.getAttribute('alt') || '') + ' ' +
+                       (img.getAttribute('title') || '')) : '',
+                item.innerText || '',
+                ...Array.from(item.querySelectorAll(
+                    '[class*="tooltip" i], .description, .name'
+                )).map(e => e.innerText || ''),
+            ].join(' | ');
+            const res = resOf(blob);
+            const amount = parseAmount(blob);
+            let count = 1;
+            const cEl = item.querySelector(
+                '.count, .amount, .number, [class*="count" i]'
+            );
+            if (cEl) {
+                const n = parseAmount(cEl.innerText);
+                if (n > 0) count = n;
+            }
+            if (res && amount > 0 && packLike(blob)) {
+                out.push({
+                    idx: idx, res: res, amount: amount, count: count,
+                    label: norm(blob).slice(0, 120),
+                });
+            }
+            idx++;
+        });
+        return out;
+    }
+"""
+)
+
 # Focus attributi: etichette ITA/EN usate per trovare la riga e il suo "+".
 _ATTRIBUTE_LABELS: dict[str, tuple[str, ...]] = {
     "strength": ("forza", "strength", "power", "macht", "force"),
@@ -550,3 +684,183 @@ class HeroManager:
         except Exception as exc:  # noqa: BLE001
             logger.warning("%s Spedizione avventura fallita: %s", prefix, exc)
             return False
+
+    # ------------------------------------------------------------------
+    # Emergency Unpack: risorse dal baule dell'eroe (spec 3.2)
+    # ------------------------------------------------------------------
+    async def emergency_unpack(
+        self,
+        browser: "TravianBrowser",
+        *,
+        village_id: int = 0,
+        prefix: str = "",
+    ) -> dict[str, int]:
+        """Consuma pacchi risorsa dal baule dell'eroe per coprire il deficit.
+
+        Chiamato a valle di un'azione di spesa fallita per "risorse
+        insufficienti": la pagina contratto e' ancora aperta, quindi il
+        delta (costo - stock) si legge direttamente dal DOM
+        (``_JS_PAGE_DEFICIT``). Poi apre l'inventario eroe e consuma il
+        MINIMO di pacchi che copre il deficit, risorsa per risorsa
+        (i pacchi 'any' coprono tutte e quattro le risorse insieme).
+
+        Le risorse unpack finiscono nel villaggio dove si trova l'eroe:
+        se lo snapshot segnala l'eroe lontano/morto/in avventura il
+        consumo viene saltato per non accreditare il villaggio sbagliato.
+
+        Ritorna {wood, clay, iron, crop} delle quantita' accreditate
+        ({ } se nessun consumo o nessun deficit leggibile).
+        """
+        page = browser.page
+        if page is None:
+            return {}
+        status = str((self.snapshot or {}).get("status") or "")
+        if status and status != "home":
+            logger.debug(
+                "%s Emergency Unpack saltato: eroe '%s', i pacchi "
+                "accrediterebbero il villaggio sbagliato.",
+                prefix, status,
+            )
+            return {}
+
+        # 1. Delta risorse dal contratto aperto (build.php o residenza):
+        #    niente costo leggibile = niente unpack (evita sprechi).
+        try:
+            data = await page.evaluate(_JS_PAGE_DEFICIT)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("%s Lettura deficit contratto fallita: %s", prefix, exc)
+            return {}
+        deficit = {
+            str(k): int(v)
+            for k, v in ((data or {}).get("deficit") or {}).items()
+            if int(v or 0) > 0
+        }
+        if not deficit:
+            logger.debug(
+                "%s Emergency Unpack: nessun deficit leggibile sulla pagina "
+                "(costi %s, stock %s).",
+                prefix, (data or {}).get("costs"), (data or {}).get("stock"),
+            )
+            return {}
+        logger.info(
+            "%s Emergency Unpack: deficit %s — apro il baule dell'eroe.",
+            prefix, deficit,
+        )
+
+        # 2. Inventario eroe -> consumo minimo dei pacchi risorsa
+        try:
+            await self._goto_hero_tab(browser, _TABS_INVENTORY)
+            await sleep_human(1.0, 1.8)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("%s Apertura inventario eroe fallita: %s", prefix, exc)
+            return {}
+
+        gained: dict[str, int] = {"wood": 0, "clay": 0, "iron": 0, "crop": 0}
+        uses = 0
+        while uses < _UNPACK_MAX_USES and any(v > 0 for v in deficit.values()):
+            try:
+                items = await page.evaluate(_JS_INVENTORY_RESOURCES)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s Scansione inventario fallita: %s", prefix, exc)
+                break
+            items = [i for i in (items or []) if isinstance(i, dict)]
+            pick = _pick_resource_pack(items, deficit)
+            if pick is None:
+                logger.debug(
+                    "%s Nessun pacco utile in baule per il deficit %s "
+                    "(item rilevati: %s).",
+                    prefix, deficit,
+                    [f"{i.get('res')}x{i.get('amount')}" for i in items],
+                )
+                break
+            used = await self._use_inventory_item(page, int(pick["idx"]))
+            if not used:
+                break
+            uses += 1
+            amount = int(pick.get("amount") or 0)
+            if pick.get("res") == "any":
+                for res in ("wood", "clay", "iron", "crop"):
+                    covered = min(amount, deficit.get(res, 0))
+                    gained[res] += covered
+                    deficit[res] = max(0, deficit.get(res, 0) - amount)
+            else:
+                res = str(pick.get("res"))
+                covered = min(amount, deficit.get(res, 0))
+                gained[res] = gained.get(res, 0) + covered
+                deficit[res] = max(0, deficit.get(res, 0) - amount)
+            logger.info(
+                "%s Pacco consumato (%s, %s) — deficit residuo %s.",
+                prefix, pick.get("label") or pick.get("res"), amount, deficit,
+            )
+            await sleep_human(1.0, 1.6)
+
+        gained = {k: v for k, v in gained.items() if v > 0}
+        if gained:
+            logger.info(
+                "%s Emergency Unpack: accreditate %s nel villaggio "
+                "(newdid=%s) da %d pacchi.",
+                prefix, gained, village_id or "?", uses,
+            )
+        return gained
+
+    async def _use_inventory_item(self, page, idx: int) -> bool:
+        """Clicca l'item inventario in posizione `idx` e conferma 'Usa'."""
+        try:
+            item = page.locator(_INVENTORY_ITEM_SELECTOR).nth(idx)
+            if await item.count() == 0:
+                return False
+            await item.click()
+            await sleep_human(0.8, 1.4)
+            confirmed = await page.evaluate("""
+                () => {
+                    const btns = Array.from(document.querySelectorAll(
+                        'button, a.button, input[type="submit"], input[type="button"]'
+                    ));
+                    const use = btns.find(b =>
+                        /usa|use|apply|applica|consume|consuma/i.test(
+                            b.innerText || b.value || ''
+                        ) && !b.disabled && b.offsetParent !== null
+                    );
+                    if (use) { use.click(); return true; }
+                    // Alcuni server usano il pacco al primo click sull'item.
+                    return false;
+                }
+            """)
+            await sleep_human(0.8, 1.4)
+            logger.debug(
+                "Item inventario idx=%d consumato (conferma dialog=%s)",
+                idx, confirmed,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Uso item inventario idx=%d fallito: %s", idx, exc)
+            return False
+
+
+def _pick_resource_pack(
+    items: list[dict], deficit: dict[str, int]
+) -> dict | None:
+    """Sceglie il pacco inventario che copre piu' deficit residuo.
+
+    Per i pacchi 'any' il gain e' la somma sui quattro tipi; a parita'
+    di copertura vince il pacco piu' piccolo (meno spreco). Ritorna il
+    dict item scelto o None se nessun pacco copre qualcosa.
+    """
+    best: dict | None = None
+    best_gain = 0
+    for it in items:
+        amount = int(it.get("amount") or 0)
+        if amount <= 0 or int(it.get("count") or 0) <= 0:
+            continue
+        res = str(it.get("res") or "")
+        if res == "any":
+            gain = sum(min(amount, int(deficit.get(r, 0))) for r in deficit)
+        elif res in deficit:
+            gain = min(amount, int(deficit.get(res, 0)))
+        else:
+            gain = 0
+        if gain > best_gain or (
+            gain == best_gain > 0 and amount < int((best or {}).get("amount") or 0)
+        ):
+            best, best_gain = it, gain
+    return best if best_gain > 0 else None
