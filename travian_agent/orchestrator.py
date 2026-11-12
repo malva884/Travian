@@ -130,6 +130,7 @@ def _append_history(account_id: str, state: GameState, action: Action) -> None:
         safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
         entry = {
             "ts": state.timestamp,
+            "account_id": account_id,
             "village_id": state.village_id,
             "village_name": state.village_name,
             "resources": {

@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import streamlit as st
@@ -175,7 +176,11 @@ def _on_village_account_change() -> None:
     )
     for key in list(st.session_state.keys()):
         if key.startswith(
-            ("role_", "target_", "units_", "focus_", "market_slot_", "coord_x_", "coord_y_")
+            (
+                "role_", "target_", "units_", "focus_", "market_slot_",
+                "coord_x_", "coord_y_", "bqueue_", "fqtgt_", "fqup_",
+                "fqdn_", "fqrm_", "fqadd_", "fqlvl_", "fqbtn_",
+            )
         ):
             del st.session_state[key]
 
@@ -216,6 +221,12 @@ def get_latest_village_snapshots(account_id: str) -> dict[str, dict]:
                     continue
                 try:
                     data = json.loads(line)
+                    # Voci prive di account_id (storico legacy) restano valide;
+                    # quelle di un altro account vengono scartate anche se il
+                    # file e' condiviso (safe_id identico dopo sanitizzazione).
+                    rec_acc = data.get("account_id")
+                    if rec_acc is not None and rec_acc != account_id:
+                        continue
                     vname = data.get("village_name") or f"id_{data.get('village_id', '?')}"
                     snapshots[vname] = data
                 except Exception:
@@ -787,7 +798,13 @@ with tab_villages:
 
             for idx, vname in enumerate(all_known):
                 old_cfg = cur_acc.villages.get(vname, VillageConfig(name=vname))
-                vkey = "".join(c if c.isalnum() or c in "._-" else "_" for c in vname)
+                # Suffisso indice: due villaggi i cui nomi si sanitizzano
+                # uguali (es. "Villaggio 1" vs "Villaggio_1") non devono
+                # condividere chiavi widget e coda prioritaria.
+                vkey = (
+                    "".join(c if c.isalnum() or c in "._-" else "_" for c in vname)
+                    + f"_{idx}"
+                )
 
                 with st.expander(f"🏰 Configurazione per '{vname}'", expanded=True):
                     # --- SEZIONE 1: RUOLO STRATEGICO & TARGET FEEDER ---
@@ -840,13 +857,21 @@ with tab_villages:
                                     _k = focus_alias_map.get(str(_it), str(_it))
                                     _t = 0
                                 if _k:
-                                    seeded.append({"key": _k, "target_level": _t})
+                                    seeded.append({
+                                        "key": _k, "target_level": _t,
+                                        "_uid": uuid.uuid4().hex[:8],
+                                    })
                             st.session_state[queue_key] = seeded
                         queue: list[dict] = st.session_state[queue_key]
 
                         # Righe ordinate: numero, edificio, livello target,
-                        # controlli sposta su/giu' e rimuovi.
+                        # controlli sposta su/giu' e rimuovi. Le chiavi widget
+                        # usano _uid (stabile per step): riordino/rimozione non
+                        # sposta i valori fra gli step.
                         for _i, _step in enumerate(queue):
+                            if "_uid" not in _step:
+                                _step["_uid"] = uuid.uuid4().hex[:8]
+                            _uid = _step["_uid"]
                             _cols = st.columns([0.6, 4.0, 1.4, 0.7, 0.7, 0.7])
                             _cols[0].markdown(f"**{_i + 1}.**")
                             _cols[1].markdown(
@@ -855,19 +880,19 @@ with tab_villages:
                             _step["target_level"] = _cols[2].number_input(
                                 "Liv.", min_value=0, max_value=21,
                                 value=int(_step.get("target_level") or 0),
-                                key=f"fqtgt_{cur_acc.account_id}_{vkey}_{_i}",
+                                key=f"fqtgt_{cur_acc.account_id}_{vkey}_{_uid}",
                                 label_visibility="collapsed",
                             )
                             if _cols[3].form_submit_button(
-                                "↑", key=f"fqup_{cur_acc.account_id}_{vkey}_{_i}"
+                                "↑", key=f"fqup_{cur_acc.account_id}_{vkey}_{_uid}"
                             ) and _i > 0:
                                 queue[_i - 1], queue[_i] = queue[_i], queue[_i - 1]
                             if _cols[4].form_submit_button(
-                                "↓", key=f"fqdn_{cur_acc.account_id}_{vkey}_{_i}"
+                                "↓", key=f"fqdn_{cur_acc.account_id}_{vkey}_{_uid}"
                             ) and _i < len(queue) - 1:
                                 queue[_i + 1], queue[_i] = queue[_i], queue[_i + 1]
                             if _cols[5].form_submit_button(
-                                "✕", key=f"fqrm_{cur_acc.account_id}_{vkey}_{_i}"
+                                "✕", key=f"fqrm_{cur_acc.account_id}_{vkey}_{_uid}"
                             ):
                                 queue.pop(_i)
 
@@ -894,7 +919,8 @@ with tab_villages:
                             ):
                                 queue.append(
                                     {"key": _add_key,
-                                     "target_level": int(_add_tgt)}
+                                     "target_level": int(_add_tgt),
+                                     "_uid": uuid.uuid4().hex[:8]}
                                 )
 
                         # Persistenza: lista di step strutturati

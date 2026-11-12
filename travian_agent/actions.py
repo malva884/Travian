@@ -2516,12 +2516,15 @@ class ActionExecutor:
     ) -> int:
         """Apre il pannello task del villaggio attivo e riscuote i premi.
 
-        Flusso T4.x:
-        1. click sull'icona questmaster (#questmasterButton) se presente;
-        2. click ripetuto su ogni pulsante 'Riscuoti'/'Claim reward'
-           (i premi possono sbloccare task a catena);
-        3. fallback sulla pagina dedicata questmaster.php se il dialog
-           non si apre o non mostra premi;
+        Flusso:
+        1. click sull'icona questmaster (#questmasterButton) se presente
+           e riscossione premi nel dialog;
+        2. pagine dedicate UI moderna `/tasks?t=village` e
+           `/tasks?t=general`, poi legacy `questmaster.php`: in ognuna si
+           cliccano i pulsanti verdi 'Raccogli'/'Collect'/'Claim' finche'
+           non ne restano;
+        3. bottoni disabilitati (magazzino pieno) vengono saltati senza
+           errore: si riprova al ciclo successivo;
         4. chiusura del dialog.
 
         Ritorna il numero di premi effettivamente riscossi.
@@ -2533,38 +2536,42 @@ class ActionExecutor:
         assert page is not None
 
         claimed = 0
+        skipped = 0
 
-        # 1. Apri il widget task (icona questmaster), se il server la espone
+        # 1. Widget task (icona questmaster), se il server la espone
         opened = await self._click_first(
             page, selectors.QUEST_MASTER_BUTTON, timeout_ms=2000
         )
         if opened:
             await sleep_human(1.0, 1.8)
+            for _ in range(8):
+                n, s = await self._claim_task_buttons(page)
+                claimed += n
+                skipped = max(skipped, s)
+                if n == 0:
+                    break
+                await sleep_human(0.5, 0.9)
 
-        # 2. Riscossione: i pulsanti si rigenerano dopo ogni premio,
-        #    quindi si clicca uno alla volta finche' ce ne sono
-        for _ in range(8):
-            n = await self._claim_task_buttons(page)
-            if n == 0:
-                break
-            claimed += n
-            await sleep_human(0.5, 0.9)
-
-        # 3. Fallback: pagina dedicata questmaster.php (versioni senza overlay)
-        if claimed == 0 and not opened:
+        # 2. Pagine task dedicate (UI moderna) + legacy questmaster.php
+        for path in (
+            selectors.PATH_TASKS_VILLAGE,
+            selectors.PATH_TASKS_GENERAL,
+            selectors.PATH_QUESTMASTER,
+        ):
             try:
-                await self.browser.goto(selectors.PATH_QUESTMASTER)
+                await self.browser.goto(path)
                 await sleep_human(0.8, 1.2)
-                for _ in range(6):
-                    n = await self._claim_task_buttons(page)
-                    if n == 0:
-                        break
-                    claimed += n
-                    await sleep_human(0.5, 0.9)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:  # noqa: BLE001 — pagina assente su questo server
+                continue
+            for _ in range(8):
+                n, s = await self._claim_task_buttons(page)
+                claimed += n
+                skipped = max(skipped, s)
+                if n == 0:
+                    break
+                await sleep_human(0.5, 0.9)
 
-        # 4. Chiudi l'eventuale dialog rimasto aperto
+        # 3. Chiudi l'eventuale dialog rimasto aperto
         if opened:
             await self._click_first(
                 page, selectors.QUEST_DIALOG_CLOSE, timeout_ms=1200
@@ -2582,43 +2589,62 @@ class ActionExecutor:
                 "Task villaggio '%s': check eseguito, nessun premio da riscuotere",
                 village_name or village_id or "attivo",
             )
+        if skipped:
+            logger.info(
+                "Task villaggio '%s': %d premi non riscossi — pulsante "
+                "disabilitato (magazzino pieno): retry al prossimo ciclo",
+                village_name or village_id or "attivo",
+                skipped,
+            )
         return claimed
 
-    async def _claim_task_buttons(self, page) -> int:
-        """Clicca i pulsanti 'Riscuoti'/'Claim reward' attualmente visibili.
+    async def _claim_task_buttons(self, page) -> tuple[int, int]:
+        """Clicca un pulsante premio verde cliccabile nella finestra task.
 
-        Il DOM viene ricaricato dopo ogni riscossione, quindi il metodo
-        clicca un solo pulsante per valutazione e va richiamato in loop.
+        Cerca in #tasks/.tasks (UI moderna) e nei contenitori legacy i
+        bottoni con testo 'Raccogli'/'Collect'/'Claim' (case-insensitive)
+        e ne clicca il primo abilitato; i premi possono sbloccare task a
+        catena, quindi va richiamato in loop finche' non ne restano.
+
+        Ritorna (clicked, skipped): clicked = 1 se un pulsante e' stato
+        cliccato; skipped = n. di pulsanti premio trovati ma disabilitati
+        (tooltip magazzino pieno) — da saltare senza errore.
         """
-        clicked = 0
-        for _ in range(3):
-            hit = await page.evaluate(
-                """
-                () => {
-                    const claimRx = /^(riscuoti|claim reward|claim|collect reward|collect|récupérer|belohnung abholen)/i;
-                    const skipRx = /(chiudi|close|cancel|annulla|abbrechen)/i;
-                    const candidates = Array.from(document.querySelectorAll(
-                        '#dialogContent button, #dialogContent a, ' +
-                        '#dialogContent input[type="submit"], ' +
-                        '.quest button, .quest a, .task button, .task a, ' +
-                        '#content button, #content a, ' +
-                        'button, input[type="submit"], a'
-                    ));
-                    for (const el of candidates) {
-                        const text = (el.innerText || el.value || el.textContent || '').trim();
-                        if (!text || !claimRx.test(text) || skipRx.test(text)) continue;
-                        const cls = (el.className || '').toLowerCase();
-                        if (el.disabled || cls.includes('disabled') || cls.includes('inactive')) continue;
-                        if (el.offsetParent === null && el.offsetWidth === 0) continue;
-                        el.click();
-                        return true;
+        res = await page.evaluate(
+            """
+            () => {
+                const claimRx = /(raccogl|riscuot|collect|claim|récupér|belohnung)/i;
+                const skipRx = /(chiudi|close|cancel|annulla|abbrechen)/i;
+                const scopes = ['#tasks', '.tasks', '#dialogContent',
+                                '.quest', '.task', '#content', 'body'];
+                let els = [];
+                for (const scope of scopes) {
+                    for (const root of document.querySelectorAll(scope)) {
+                        els.push(...root.querySelectorAll(
+                            'button, a, input[type="submit"], input[type="button"]'
+                        ));
                     }
-                    return false;
                 }
-                """
-            )
-            if not hit:
-                break
-            clicked += 1
+                let disabledFound = 0;
+                for (const el of els) {
+                    const text = (el.innerText || el.value || el.textContent || '').trim();
+                    if (!text || !claimRx.test(text) || skipRx.test(text)) continue;
+                    const cls = (el.className || '').toLowerCase();
+                    const disabled = el.disabled ||
+                        el.getAttribute('aria-disabled') === 'true' ||
+                        cls.includes('disabled') || cls.includes('inactive') ||
+                        cls.includes('grey') || cls.includes('gray');
+                    if (disabled) { disabledFound++; continue; }
+                    if (el.offsetParent === null && el.offsetWidth === 0) continue;
+                    el.click();
+                    return { clicked: true, disabled: disabledFound };
+                }
+                return { clicked: false, disabled: disabledFound };
+            }
+            """
+        )
+        clicked = 1 if isinstance(res, dict) and res.get("clicked") else 0
+        skipped = int(res.get("disabled", 0)) if isinstance(res, dict) else 0
+        if clicked:
             await sleep_human(0.5, 0.9)
-        return clicked
+        return clicked, skipped

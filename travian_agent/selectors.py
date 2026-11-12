@@ -513,24 +513,38 @@ QUEST_MASTER_BUTTON: list[str] = [
     "#questmaster a",
     ".questmasterButton",
     "a[onclick*='questmaster']",
+    "a[href*='tasks?t=']",
+    "a[href*='tasks.php']",
 ]
-# Pulsanti di riscossione premio dentro il dialog/pagina task
+# Pulsanti di riscossione premio dentro il dialog/pagina task.
+# UI nuova: bottoni verdi cliccabili dentro #tasks/.tasks con testo
+# 'Raccogli' (fallback multilingua Collect/Claim).
 QUEST_CLAIM_BUTTON: list[str] = [
+    "#tasks button:has-text('Raccogli')",
+    "#tasks button:has-text('Collect')",
+    "#tasks button:has-text('Claim')",
+    ".tasks button:has-text('Raccogli')",
+    ".tasks button:has-text('Collect')",
+    ".tasks button:has-text('Claim')",
     "#dialogContent .quest button:has-text('Riscuoti')",
     "#dialogContent .quest button:has-text('Claim')",
     "#dialogContent button:has-text('Riscuoti premio')",
     "#dialogContent button:has-text('Claim reward')",
     ".quest button:has-text('Riscuoti')",
     ".quest button:has-text('Claim')",
+    "button:has-text('Raccogli')",
     "button:has-text('Riscuoti premio')",
     "button:has-text('Claim reward')",
     "button:has-text('Riscuoti')",
     "button:has-text('Claim reward')",
+    "a:has-text('Raccogli')",
     "a:has-text('Riscuoti premio')",
     "a:has-text('Claim reward')",
 ]
 # Contenitori del dialog task/questmaster
 QUEST_DIALOG: list[str] = [
+    "#tasks",
+    ".tasks",
     "#dialogContent",
     ".questmaster",
     "#questmasterDialog",
@@ -552,5 +566,9 @@ PATH_DORF2 = "dorf2.php"
 PATH_BUILD = "build.php"
 PATH_MAP = "karte.php"
 PATH_QUESTMASTER = "questmaster.php"
+# Task giornaliere UI moderna: pagine dedicate accanto al legacy
+# questmaster.php (village = task del villaggio, general = task account).
+PATH_TASKS_VILLAGE = "tasks?t=village"
+PATH_TASKS_GENERAL = "tasks?t=general"
 PATH_LOGIN = "login.php"
 PATH_INDEX = "index.php"
