@@ -1539,9 +1539,72 @@ class ActionExecutor:
             self.settings.action_delay_min, self.settings.action_delay_max
         )
 
-        if not await self._click_first(
+        clicked = await self._click_first(
             page, selectors.FARM_LIST_SEND_BUTTON, timeout_ms=2500
-        ):
+        )
+        if not clicked:
+            # Fallback DOM-level: :has-text non copre input[submit] (label in
+            # `value`) ne' controlli custom; si cerca nel contesto raid list.
+            clicked = bool(
+                await page.evaluate(
+                    """
+                    () => {
+                        const KEY = /avvia|start|invia|send|lancia|launch|begin|inizia|raid/i;
+                        const scope = document.querySelector(
+                            '#raidList, .raidList, #raidListTable, ' +
+                            'form[name*="farm" i], #content, #build'
+                        ) || document.body;
+                        const ctl = Array.from(scope.querySelectorAll(
+                            'button, input[type="submit"], input[type="button"], ' +
+                            'a[href], [role="button"], .button'
+                        )).filter(b =>
+                            !b.disabled && b.offsetParent !== null &&
+                            !/tutte le liste|all lists|markAll/i.test(
+                                (b.innerText || '') + ' ' + (b.value || '')
+                            )
+                        );
+                        const pick = ctl.find(b => KEY.test(
+                            ((b.innerText || '') + ' ' + (b.value || '') + ' ' +
+                             (b.getAttribute('title') || '')).trim()
+                        )) || ctl.find(b =>
+                            b.tagName === 'BUTTON' || b.type === 'submit'
+                        );
+                        if (!pick) return false;
+                        pick.click();
+                        return true;
+                    }
+                    """
+                )
+            )
+        if not clicked:
+            try:
+                dbg = await page.evaluate(
+                    """
+                    () => {
+                        const scope = document.querySelector(
+                            '#raidList, .raidList, #content, #build'
+                        ) || document.body;
+                        return {
+                            url: location.href,
+                            buttons: Array.from(scope.querySelectorAll(
+                                'button, input[type="submit"], [role="button"]'
+                            )).map(b => ({
+                                tag: b.tagName, type: b.type || '',
+                                text: (b.innerText || b.value || '')
+                                    .trim().slice(0, 40),
+                                disabled: !!b.disabled,
+                                cls: (b.className || '').toString().slice(0, 60),
+                            })).slice(0, 12),
+                            tail: (scope.innerText || '').slice(-200),
+                        };
+                    }
+                    """
+                )
+                logger.warning(
+                    "Raid farm list: pulsante avvio non trovato. debug=%s", dbg
+                )
+            except Exception:
+                pass
             return ActionResult(False, "pulsante avvio raid non trovato")
         await sleep_human(1.0, 2.0)
 

@@ -214,8 +214,20 @@ FARM_LIST_SELECT_ALL: list[str] = [
     "input[type='checkbox'][name*='all' i]",
     "input[type='checkbox'].checkAll",
 ]
-# Pulsante di avvio raid (in basso alla pagina o dentro la riga)
+# Pulsante di avvio raid (in basso alla pagina o dentro la riga).
+# UI corrente: il pulsante riporta il conteggio target, es. "Avvia (6)".
+# La parentesi nel testo evita di matchare "Avvia tutte le liste farm".
 FARM_LIST_SEND_BUTTON: list[str] = [
+    "button:has-text('Avvia (')",
+    "[role='button']:has-text('Avvia (')",
+    "a:has-text('Avvia (')",
+    "button:has-text('Start (')",
+    "[role='button']:has-text('Start (')",
+    "a:has-text('Start (')",
+    "input[type='submit'][value*='Avvia']",
+    "input[type='submit'][value*='Start']",
+    "input[type='submit'][value*='Invia']",
+    "input[type='submit'][value*='Send']",
     "button:has-text('Avvia raid')",
     "button:has-text('Invia raid')",
     "button:has-text('Lancia raid')",
@@ -223,8 +235,14 @@ FARM_LIST_SEND_BUTTON: list[str] = [
     "button:has-text('Send raid')",
     "button.green:has-text('raid')",
     "button.green:has-text('Raid')",
+    # Fallback: qualsiasi bottone "Avvia"/"Start" — in ultima posizione
+    # perche' puo' catturare anche "Avvia tutte le liste farm".
+    "button:has-text('Avvia')",
+    "button:has-text('Start')",
     "button[type='submit'].green",
     "button[type='submit']",
+    "input[type='submit'].green",
+    "input[type='submit']",
 ]
 
 # Mappa (karte.php): fondazione di un nuovo villaggio su tile libero.
