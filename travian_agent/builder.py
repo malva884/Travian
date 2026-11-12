@@ -273,36 +273,76 @@ def grain_safety_intents(state: GameState) -> list[Field]:
     return crop_fields + boosters
 
 
+def _focus_steps(focus_list: list) -> list[tuple[int, int]]:
+    """Normalizza building_focus in step ordinati (gid, target_level).
+
+    Ogni elemento puo' essere:
+    - una stringa chiave legacy (es. "barracks", "cropland");
+    - un dict {"key": str, "target_level": int} oppure
+      {"gid": int, "target_level": int} (Advanced Queue & Priority).
+
+    target_level 0/assente = fino al massimo consentito (comportamento
+    legacy). L'ordine della lista e' la priorita'.
+    """
+    steps: list[tuple[int, int]] = []
+    for item in focus_list or []:
+        target = 0
+        if isinstance(item, dict):
+            try:
+                target = max(0, int(item.get("target_level") or 0))
+            except (TypeError, ValueError):
+                target = 0
+            try:
+                gid = int(item.get("gid") or 0)
+            except (TypeError, ValueError):
+                gid = 0
+            gids = [gid] if gid > 0 else gids_for_focus_key(
+                str(item.get("key") or "")
+            )
+        else:
+            gids = gids_for_focus_key(str(item))
+        steps.extend((g, target) for g in gids if g > 0)
+    return steps
+
+
 def focus_intents(state: GameState, settings: Settings) -> list[Field]:
-    """Field corrispondenti alle chiavi building_focus dell'utente."""
+    """Field candidati dalla coda prioritaria building_focus (per step).
+
+    Ogni step e' (gid, target_level): il builder lo salta quando il
+    target e' raggiunto — campi risorsa: nessun campo sotto target;
+    edifici: almeno un'istanza al target. Edificio assente -> nuova
+    costruzione se i prerequisiti reggono.
+    """
     vcfg = settings.village_config_for(state.village_name, state.village_id)
     if vcfg is None or not vcfg.building_focus:
         return []
+    queued = queued_slot_ids(state)
     out: list[Field] = []
-    for key in vcfg.building_focus:
-        for gid in gids_for_focus_key(key):
-            if gid in FIELD_GID_TYPES:
-                # Chiave campo risorsa (es. cropland): match per tipo.
-                rtype = FIELD_GID_TYPES[gid]
-                out.extend(
-                    sorted(
-                        (
-                            f for f in upgradeable_fields(
-                                state, state.resource_fields()
-                            )
-                            if f.resource_type is rtype
-                        ),
-                        key=lambda f: (f.level, f.slot_id),
-                    )
-                )
-            else:
-                matches = [
-                    f for f in state.interior_fields()
-                    if f.gid == gid and f.gid > 0
-                    and f.slot_id not in queued_slot_ids(state)
-                    and f.level < field_max_level(state, f)
-                ]
-                out.extend(sorted(matches, key=lambda f: (f.level, f.slot_id)))
+    for gid, target in _focus_steps(vcfg.building_focus):
+        if gid in FIELD_GID_TYPES:
+            rtype = FIELD_GID_TYPES[gid]
+            matches = [
+                f for f in upgradeable_fields(state, state.resource_fields())
+                if f.resource_type is rtype
+                and (target <= 0 or f.level < target)
+            ]
+            out.extend(sorted(matches, key=lambda f: (f.level, f.slot_id)))
+        else:
+            interiors = [
+                f for f in state.interior_fields()
+                if f.gid == gid and f.gid > 0
+            ]
+            # Step raggiunto: un'istanza esistente e' gia' al target.
+            if target > 0 and any(f.level >= target for f in interiors):
+                continue
+            matches = [
+                f for f in interiors
+                if f.slot_id not in queued
+                and f.level < field_max_level(state, f)
+                and (target <= 0 or f.level < target)
+            ]
+            out.extend(sorted(matches, key=lambda f: (f.level, f.slot_id)))
+            if not interiors:
                 # Edificio focus assente: nuova costruzione se possibile.
                 out.extend(
                     new_building_intents(

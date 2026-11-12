@@ -820,29 +820,90 @@ with tab_villages:
                     p_col1, p_col2 = st.columns([1, 1])
 
                     with p_col1:
-                        st.markdown("##### 🏗️ Edifici Prioritari")
-                        st.caption("Override della coda: questi edifici avranno precedenza assoluta sullo sviluppo economico.")
-
-                        # Normalizza chiavi legacy per evitare doppioni
-                        current_focus_normalized: list[str] = []
-                        for _f in old_cfg.building_focus:
-                            can_f = focus_alias_map.get(_f, _f)
-                            if can_f not in current_focus_normalized:
-                                current_focus_normalized.append(can_f)
-
-                        focus_options = list(canonical_focus_keys)
-                        for _f in current_focus_normalized:
-                            if _f not in focus_options:
-                                focus_options.append(_f)
-
-                        parsed_focus = st.multiselect(
-                            "Edifici da Privilegiare:",
-                            options=focus_options,
-                            default=[f for f in current_focus_normalized if f in focus_options],
-                            format_func=lambda k: building_focus_labels.get(k, k),
-                            key=f"focus_{cur_acc.account_id}_{vkey}",
-                            help="Seleziona uno o più edifici da costruire o ampliare con priorità prima della normale rotazione dei campi.",
+                        st.markdown("##### 🏗️ Coda Prioritaria Edifici")
+                        st.caption(
+                            "Coda ordinata: il bot completa ogni step (costruzione o "
+                            "livello target) prima di passare al successivo. "
+                            "Livello 0 = fino al massimo consentito."
                         )
+
+                        # Coda per-villaggio in session_state, seedata dalla
+                        # config (step dict o chiavi legacy -> target 0).
+                        queue_key = f"bqueue_{cur_acc.account_id}_{vkey}"
+                        if queue_key not in st.session_state:
+                            seeded: list[dict] = []
+                            for _it in old_cfg.building_focus or []:
+                                if isinstance(_it, dict):
+                                    _k = str(_it.get("key") or _it.get("gid") or "")
+                                    _t = int(_it.get("target_level") or 0)
+                                else:
+                                    _k = focus_alias_map.get(str(_it), str(_it))
+                                    _t = 0
+                                if _k:
+                                    seeded.append({"key": _k, "target_level": _t})
+                            st.session_state[queue_key] = seeded
+                        queue: list[dict] = st.session_state[queue_key]
+
+                        # Righe ordinate: numero, edificio, livello target,
+                        # controlli sposta su/giu' e rimuovi.
+                        for _i, _step in enumerate(queue):
+                            _cols = st.columns([0.6, 4.0, 1.4, 0.7, 0.7, 0.7])
+                            _cols[0].markdown(f"**{_i + 1}.**")
+                            _cols[1].markdown(
+                                building_focus_labels.get(_step["key"], _step["key"])
+                            )
+                            _step["target_level"] = _cols[2].number_input(
+                                "Liv.", min_value=0, max_value=21,
+                                value=int(_step.get("target_level") or 0),
+                                key=f"fqtgt_{cur_acc.account_id}_{vkey}_{_i}",
+                                label_visibility="collapsed",
+                            )
+                            if _cols[3].button(
+                                "↑", key=f"fqup_{cur_acc.account_id}_{vkey}_{_i}"
+                            ) and _i > 0:
+                                queue[_i - 1], queue[_i] = queue[_i], queue[_i - 1]
+                            if _cols[4].button(
+                                "↓", key=f"fqdn_{cur_acc.account_id}_{vkey}_{_i}"
+                            ) and _i < len(queue) - 1:
+                                queue[_i + 1], queue[_i] = queue[_i], queue[_i + 1]
+                            if _cols[5].button(
+                                "✕", key=f"fqrm_{cur_acc.account_id}_{vkey}_{_i}"
+                            ):
+                                queue.pop(_i)
+
+                        # Aggiungi un nuovo step alla coda.
+                        _ac1, _ac2, _ac3 = st.columns([3.5, 1.2, 0.8])
+                        with _ac1:
+                            _add_key = st.selectbox(
+                                "Aggiungi edificio:",
+                                options=canonical_focus_keys,
+                                format_func=lambda k: building_focus_labels.get(k, k),
+                                key=f"fqadd_{cur_acc.account_id}_{vkey}",
+                                label_visibility="visible",
+                            )
+                        with _ac2:
+                            _add_tgt = st.number_input(
+                                "Liv. target:", min_value=0, max_value=21, value=0,
+                                key=f"fqlvl_{cur_acc.account_id}_{vkey}",
+                            )
+                        with _ac3:
+                            st.markdown("&nbsp;")
+                            if st.button(
+                                "➕", key=f"fqbtn_{cur_acc.account_id}_{vkey}",
+                                help="Aggiungi lo step alla coda",
+                            ):
+                                queue.append(
+                                    {"key": _add_key,
+                                     "target_level": int(_add_tgt)}
+                                )
+
+                        # Persistenza: lista di step strutturati
+                        # {"key": ..., "target_level": int} in ordine di coda.
+                        parsed_focus = [
+                            {"key": s["key"],
+                             "target_level": int(s["target_level"])}
+                            for s in queue
+                        ]
 
                     with p_col2:
                         st.markdown("##### ⚔️ Unità Addestrabili Consentite")

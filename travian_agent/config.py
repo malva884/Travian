@@ -49,7 +49,9 @@ class VillageConfig:
     target_village: str = ""        # chiave del villaggio che riceve il surplus (feeder)
     allowed_units: list[str] = field(default_factory=list)
     priority_units: list[str] = field(default_factory=list)
-    building_focus: list[str] = field(default_factory=list)  # priorita' edifici (Sprint 3+)
+    # Priorita' edifici (Sprint 3+): stringhe legacy oppure step
+    # {"key"|"gid": ..., "target_level": int} (Advanced Queue & Priority)
+    building_focus: list = field(default_factory=list)
     farm_enabled: bool = True       # include questo villaggio nei cicli di raid
     farm_unit: str = ""             # unita' da saccheggio (vuoto = truppe leggere auto)
     market_slot: int = 0            # slot dorf2 del Mercato (0 = auto-detect via gid=17)
