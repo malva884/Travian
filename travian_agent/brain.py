@@ -253,6 +253,46 @@ def _storage_full(state: GameState) -> bool:
     return wh_full or gr_full
 
 
+def _train_affordable(
+    state: GameState,
+    priority_units: list[str],
+    crop_margin: float = 0.90,
+) -> bool:
+    """True se il grano disponibile copre almeno 1 unita' autorizzata.
+
+    Con il granaio a secco l'addestramento fallisce a prescindere dalle
+    altre risorse (batch sizing scarta ogni unita'): in quel caso conviene
+    lasciare il passo allo smaltimento via Mercato. Se le tabelle dei
+    costi non sono disponibili si assume l'addestramento possibile.
+    """
+    try:
+        from .actions import STATIC_TROOP_COSTS, UNIT_ALIASES  # import ritardato: no cicli
+    except Exception:  # noqa: BLE001
+        return True
+    if not STATIC_TROOP_COSTS:
+        return True
+
+    priorities = [
+        p.strip().lower() for p in (priority_units or []) if p and p.strip()
+    ]
+
+    def _matches(unit_key: str) -> bool:
+        if not priorities:
+            return True
+        aliases = UNIT_ALIASES.get(unit_key.lower(), set()) | {unit_key.lower()}
+        return any(p in alias or alias in p for p in priorities for alias in aliases)
+
+    crop_costs = [
+        int(c.get("crop") or 0)
+        for key, c in STATIC_TROOP_COSTS.items()
+        if _matches(key) and c.get("crop")
+    ]
+    cheapest = min(crop_costs) if crop_costs else 0
+    if cheapest <= 0:
+        return True
+    return int(state.resources.crop * crop_margin) >= cheapest
+
+
 def _overflow_surplus(state: GameState, relief_ratio: float = 0.15) -> dict[str, int]:
     """Risorse da smaltire: per ogni tipo a tappo si spedisce il 15% della capienza.
 
@@ -366,18 +406,25 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
             if vcfg is not None
             else []
         )
-        return Action(
-            type=ActionType.TRAIN_TROOPS,
-            params={
-                "trainer_slot": trainer.slot_id,
-                "trainer_gid": trainer.gid,
-                "trainer_slots": [t.slot_id for t in trainers],
-                "priority_units": priority_units,
-            },
-            reason=(
-                f"Storage pieno: addestramento in '{trainer.name or 'slot ' + str(trainer.slot_id)}' "
-                f"(slot {trainer.slot_id}) per smaltire risorse"
-            ),
+        if _train_affordable(state, priority_units):
+            return Action(
+                type=ActionType.TRAIN_TROOPS,
+                params={
+                    "trainer_slot": trainer.slot_id,
+                    "trainer_gid": trainer.gid,
+                    "trainer_slots": [t.slot_id for t in trainers],
+                    "priority_units": priority_units,
+                },
+                reason=(
+                    f"Storage pieno: addestramento in '{trainer.name or 'slot ' + str(trainer.slot_id)}' "
+                    f"(slot {trainer.slot_id}) per smaltire risorse"
+                ),
+            )
+        logger.info(
+            "[%s] Storage pieno ma grano insufficiente per addestrare "
+            "(crop=%s): si passa allo smaltimento via Mercato.",
+            state.village_name,
+            state.resources.crop,
         )
 
     # --- 3) Mercato: invia l'eccedenza al peer con piu' spazio ---

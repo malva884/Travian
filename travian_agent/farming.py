@@ -41,6 +41,13 @@ STATE_DIR = BASE_DIR / "state"
 RETRY_MIN_SECONDS = 240.0
 RETRY_MAX_SECONDS = 420.0
 
+# Backoff lungo quando non esiste alcuna farm list (Gold Club attivo ma
+# 0/100 liste): riprovare ogni pochi minuti non serve, le liste vanno
+# create in-game. Controllo orario con jitter per limitare page load e
+# warning ripetuti.
+NO_LIST_RETRY_MIN_SECONDS = 3600.0
+NO_LIST_RETRY_MAX_SECONDS = 5400.0
+
 # Alias delle truppe "leggere da saccheggio" per verificare la presenza
 # quando non e' configurata un'unita' specifica: le chiavi del sensore
 # sono 'uN' (icona unit u1..u30 del CSS Travian).
@@ -272,5 +279,12 @@ class FarmingManager:
             "%s Farming: raid non avviato su '%s': %s. Retry programmato.",
             prefix, village.name, result.message,
         )
-        self._schedule_retry(vkey, now)
+        if "nessuna farm list" in (result.message or "").lower():
+            # Le liste non esistono: creazione manuale in-game richiesta.
+            self.next_due[vkey] = now + random.uniform(
+                NO_LIST_RETRY_MIN_SECONDS, NO_LIST_RETRY_MAX_SECONDS
+            )
+            self._save()
+        else:
+            self._schedule_retry(vkey, now)
         return False
