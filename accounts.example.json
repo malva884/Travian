@@ -57,13 +57,14 @@
           "Equites Caesaris",
           "Cavalieri"
         ],
-        "building_focus": [
-          {"key": "barracks", "target_level": 10},
-          {"key": "stable", "target_level": 5},
-          {"key": "workshop", "target_level": 0},
-          {"key": "smithy", "target_level": 0},
-          {"key": "granary", "target_level": 0}
+        "building_queue_plan": [
+          {"key": "cropland", "target_level": 5, "priority": 1},
+          {"key": "barracks", "target_level": 3, "priority": 2},
+          {"key": "cropland", "target_level": 10, "priority": 3},
+          {"key": "stable", "target_level": 5, "priority": 4},
+          {"key": "granary", "target_level": 0, "priority": 5}
         ],
+        "is_bootstrap": false,
         "farm_enabled": true,
         "farm_unit": ""
       },

@@ -2538,6 +2538,27 @@ class ActionExecutor:
         claimed = 0
         skipped = 0
 
+        # 0. Gate sul badge di notifica: se l'avatar del Questmaster non
+        # segnala task completate (indicatore assente o azzerato) si evita
+        # la navigazione sulle pagine /tasks (spec 4). Indicatore non
+        # rilevato = stato ignoto: si procede comunque con la scansione.
+        try:
+            badge = await self._tasks_pending_badge(page)
+            if badge is False:
+                logger.debug(
+                    "Task villaggio '%s': nessun badge sul Questmaster, "
+                    "scansione saltata",
+                    village_name or village_id or "attivo",
+                )
+                return 0
+        except Exception:  # noqa: BLE001
+            pass
+
+        # newdid preservato nelle URL delle pagine task: in T4.6 i premi
+        # sono localizzati per insediamento e la navigazione nuda su
+        # tasks?t=... tornerebbe al villaggio default di sessione.
+        newdid_q = f"&{selectors.PARAM_NEWDID}={village_id}" if village_id > 0 else ""
+
         # 1. Widget task (icona questmaster), se il server la espone
         opened = await self._click_first(
             page, selectors.QUEST_MASTER_BUTTON, timeout_ms=2000
@@ -2554,10 +2575,24 @@ class ActionExecutor:
 
         # 2. Pagine task dedicate (UI moderna) + legacy questmaster.php
         for path in (
-            selectors.PATH_TASKS_VILLAGE,
-            selectors.PATH_TASKS_GENERAL,
-            selectors.PATH_QUESTMASTER,
+            selectors.PATH_TASKS_VILLAGE + newdid_q,
+            selectors.PATH_TASKS_GENERAL + newdid_q,
+            selectors.PATH_QUESTMASTER + (f"?{selectors.PARAM_NEWDID}={village_id}" if village_id > 0 else ""),
         ):
+            # Task generali (spec 4): riscuote solo con almeno il 30% di
+            # spazio libero in magazzino E granaio — i premi globali non
+            # devono andare in overflow su un villaggio quasi pieno.
+            if path.startswith(selectors.PATH_TASKS_GENERAL):
+                try:
+                    if not await self._storage_has_headroom(page, 0.30):
+                        logger.info(
+                            "Task generali saltate in '%s': meno del 30%% "
+                            "di spazio libero in magazzino/granaio",
+                            village_name or village_id or "attivo",
+                        )
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 await self.browser.goto(path)
                 await sleep_human(0.8, 1.2)
@@ -2648,3 +2683,108 @@ class ActionExecutor:
         if clicked:
             await sleep_human(0.5, 0.9)
         return clicked, skipped
+
+    async def _tasks_pending_badge(self, page) -> bool | None:
+        """Indicatore di task completate sull'avatar del Questmaster.
+
+        Ritorna True (badge con pending), False (Questmaster presente ma
+        nessun badge/numero — navigazione /tasks evitabile), None quando
+        l'indicatore non e' rilevabile su questo server (stato ignoto).
+        """
+        try:
+            res = await page.evaluate(
+                """
+                (sels) => {
+                    const qm = document.querySelector(
+                        '#questmasterButton, .questmasterButton, ' +
+                        'a[href*="tasks"], #questmaster a'
+                    );
+                    if (!qm) return { found: false, pending: false };
+                    for (const s of sels) {
+                        for (const el of document.querySelectorAll(s)) {
+                            if (el.offsetParent === null && el.offsetWidth === 0)
+                                continue;
+                            const num = parseInt(
+                                (el.innerText || el.textContent || '')
+                                    .replace(/[^0-9]/g, '') || '0', 10);
+                            // Badge visibile: con numero > 0 o comunque
+                            // presente come marcatori grafico.
+                            if (num > 0) return { found: true, pending: true };
+                            return { found: true, pending: false };
+                        }
+                    }
+                    return { found: false, pending: false };
+                }
+                """,
+                selectors.QUEST_PENDING_BADGE,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(res, dict) or not res.get("found"):
+            return None
+        return bool(res.get("pending"))
+
+    async def _storage_has_headroom(
+        self, page, min_free_ratio: float = 0.30
+    ) -> bool:
+        """True se magazzino E granaio hanno >= min_free_ratio di spazio libero.
+
+        Legge la stock bar (#l1..l4 + capacita' dai tooltip warehouse/
+        granary). Dato non leggibile -> True (non si blocca la raccolta
+        su un layout sconosciuto).
+        """
+        try:
+            data = await page.evaluate(
+                """
+                () => {
+                    const toInt = (s) => {
+                        const m = String(s || '')
+                            .replace(/[\\u2212\\u2010-\\u2015]/g, '-')
+                            .match(/-?[\\d.\\s']+/);
+                        if (!m) return 0;
+                        return parseInt(m[0].replace(/[^0-9-]/g, ''), 10) || 0;
+                    };
+                    const capOf = (sels) => {
+                        for (const s of sels) {
+                            const el = document.querySelector(s);
+                            if (!el) continue;
+                            const blob = [
+                                el.getAttribute('title') || '',
+                                el.innerText || '',
+                            ].join(' ');
+                            // Tooltip tipico: "3300||8000" oppure "…/8000"
+                            const m = blob.match(/(\\d[\\d.\\s]*)[|/]{1,2}\\s*(\\d[\\d.\\s]*)/);
+                            if (m) return toInt(m[2]);
+                        }
+                        return 0;
+                    };
+                    return {
+                        wood: toInt((document.querySelector('#l1 .value, #l1') || {}).innerText),
+                        clay: toInt((document.querySelector('#l2 .value, #l2') || {}).innerText),
+                        iron: toInt((document.querySelector('#l3 .value, #l3') || {}).innerText),
+                        crop: toInt((document.querySelector('#l4 .value, #l4') || {}).innerText),
+                        wh_cap: capOf(['#stockBar .warehouse', '.stockBarButton.warehouse',
+                                       'li.warehouse', '.warehouse']),
+                        gr_cap: capOf(['#stockBar .granary', '.stockBarButton.granary',
+                                       'li.granary', '.granary']),
+                    };
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return True
+        if not isinstance(data, dict):
+            return True
+        wh_cap = int(data.get("wh_cap") or 0)
+        gr_cap = int(data.get("gr_cap") or 0)
+        if wh_cap <= 0 or gr_cap <= 0:
+            return True
+        used_wh = max(
+            int(data.get("wood") or 0),
+            int(data.get("clay") or 0),
+            int(data.get("iron") or 0),
+        )
+        used_gr = int(data.get("crop") or 0)
+        free_wh = (wh_cap - used_wh) / wh_cap
+        free_gr = (gr_cap - used_gr) / gr_cap
+        return free_wh >= min_free_ratio and free_gr >= min_free_ratio

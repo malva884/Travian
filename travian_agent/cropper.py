@@ -86,6 +86,7 @@ class CropperCandidate:
     nearest_village: str = ""
     oases: list[dict] = field(default_factory=list)
     status: str = STATUS_PENDING
+    manual: bool = False            # inserito a mano dalla dashboard
     updated_ts: float = field(default_factory=time.time)
 
     @classmethod
@@ -107,6 +108,7 @@ class CropperCandidate:
                 status=data.get("status")
                 if data.get("status") in VALID_STATUSES
                 else STATUS_PENDING,
+                manual=bool(data.get("manual")),
                 updated_ts=float(data.get("updated_ts") or time.time()),
             )
         except Exception:
@@ -228,6 +230,43 @@ class CropperStore:
 
     def reject(self, account_id: str, candidate_id: str) -> bool:
         return self.set_status(account_id, candidate_id, STATUS_REJECTED)
+
+    def add_manual_candidate(
+        self,
+        account_id: str,
+        x: int,
+        y: int,
+        crop_type: str,
+        nearest_village: str = "",
+        distance_hours: float = 0.0,
+    ) -> CropperCandidate | None:
+        """Inserimento manuale di un candidato dalla dashboard.
+
+        Ritorna None se le coordinate sono gia' catalogate (qualunque
+        stato): niente duplicati. Altrimenti il record entra in testa
+        alla lista dell'account con status 'pending' e flag manual,
+        visibile subito in cima alla watchlist della dashboard.
+        """
+        if self.status_at(account_id, x, y) is not None:
+            return None
+        try:
+            crop_fields = int(str(crop_type).rstrip("c"))
+        except (TypeError, ValueError):
+            crop_fields = 0
+        cand = CropperCandidate(
+            id=make_candidate_id(crop_fields, x, y),
+            x=x,
+            y=y,
+            type=str(crop_type),
+            distance_hours=float(distance_hours or 0.0),
+            nearest_village=str(nearest_village or ""),
+            status=STATUS_PENDING,
+            manual=True,
+        )
+        # insert(0): l'inserimento manuale va in cima alla watchlist
+        self._data.setdefault(account_id, []).insert(0, asdict(cand))
+        self._save()
+        return cand
 
 
 class MapScanner:

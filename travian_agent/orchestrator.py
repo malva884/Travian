@@ -15,7 +15,7 @@ from .actions import ActionExecutor
 from .ai_scout_brain import AIScoutBrain, assess_account_power
 from .brain import LLMBrain, RuleBasedBrain
 from .browser import TravianBrowser
-from .builder import plan_upgrades, save_build_plan
+from .builder import bootstrap_complete, plan_upgrades, save_build_plan
 from .config import (
     BASE_DIR,
     Settings,
@@ -40,6 +40,15 @@ from .models import (
 )
 from .replenishment import TroopReplenishmentManager
 from .sensors import GameObserver
+from .war import (
+    MAX_WAVES_PER_DISPATCH,
+    STATUS_RECLAIMED,
+    STATUS_RECLAIMING,
+    STATUS_STOLEN,
+    WAVE_FAILED,
+    WAVE_SENT,
+    WarStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +61,7 @@ _scout_brains: dict[str, AIScoutBrain] = {}
 _hero_managers: dict[str, HeroManager] = {}
 _defense_managers: dict[str, DefenseManager] = {}
 _replenish_managers: dict[str, TroopReplenishmentManager] = {}
+_war_stores: dict[str, WarStore] = {}
 
 
 def _persist_village_coords(
@@ -123,6 +133,336 @@ def _persist_village_coords(
         logger.debug("Persistenza coordinate villaggi fallita", exc_info=True)
 
 
+def _register_founded_villages(
+    settings: Settings,
+    expansion_mgr: ExpansionManager | None,
+    villages: list[Village],
+) -> None:
+    """Auto-discovery post-fondazione (spec 2): newdid -> VillageConfig.
+
+    Quando la sidebar espone un villaggio le cui coordinate coincidono
+    con un tile 'settled' in state/expansion_<acc>.json, genera la sua
+    VillageConfig in accounts.json: ruolo 'croplog' per 9c/15c, 'feeder'
+    altrimenti, flag is_bootstrap attivo. Aggiorna anche bootstrap_target
+    con il newdid/nome rilevato per il feeder bridge.
+    """
+    if expansion_mgr is None or not expansion_mgr.founded_tiles:
+        return
+    changed_mgr = False
+    for tile in expansion_mgr.founded_tiles:
+        if tile.get("registered"):
+            continue
+        tx, ty = tile.get("x"), tile.get("y")
+        if tx is None or ty is None:
+            continue
+        match = next(
+            (v for v in villages if v.x == tx and v.y == ty), None
+        )
+        if match is None or not match.village_id:
+            continue
+        crop_type = str(tile.get("crop_type") or "")
+        is_cropper = crop_type in ("9c", "15c")
+        role = "croplog" if is_cropper else "feeder"
+        try:
+            accounts = load_accounts()
+            acc = next(
+                (a for a in accounts if a.account_id == settings.account_id),
+                None,
+            )
+            if acc is None:
+                continue
+            key_id = str(match.village_id)
+            cfg = acc.villages.get(key_id)
+            if cfg is None and match.name:
+                cfg = acc.villages.get(match.name)
+            if cfg is None:
+                cfg = acc.villages.get(key_id) or VillageConfig(
+                    name=match.name or key_id
+                )
+                acc.villages[key_id] = cfg
+            cfg.name = cfg.name or match.name or key_id
+            cfg.is_bootstrap = True
+            # Non sovrascrivere un ruolo scelto dall'utente: si assegna
+            # solo se il villaggio e' nuovo o ancora 'standard'.
+            if cfg.role in ("", "standard"):
+                cfg.role = role
+            if match.x is not None:
+                cfg.x = match.x
+            if match.y is not None:
+                cfg.y = match.y
+            save_accounts(accounts)
+            # Riflette la registrazione anche nelle settings live: il
+            # ciclo corrente usa gia' il profilo bootstrap.
+            settings.villages[key_id] = VillageConfig(
+                name=cfg.name, role=cfg.role, is_bootstrap=True,
+                x=cfg.x, y=cfg.y,
+            )
+            tile["registered"] = True
+            tile["village_id"] = match.village_id
+            changed_mgr = True
+            bt = expansion_mgr.bootstrap_target
+            if bt and bt.get("x") == tx and bt.get("y") == ty:
+                bt["village_id"] = match.village_id
+                bt["name"] = match.name or cfg.name
+            logger.info(
+                "[%s] Bootstrap: nuovo villaggio '%s' (newdid=%d, %s) "
+                "registrato con ruolo '%s' e is_bootstrap=True.",
+                settings.account_id, cfg.name, match.village_id,
+                crop_type or "tile std", cfg.role,
+            )
+        except Exception:
+            logger.warning(
+                "[%s] Registrazione villaggio fondato fallita",
+                settings.account_id, exc_info=True,
+            )
+    if changed_mgr:
+        expansion_mgr._save()
+
+
+def _complete_bootstrap(
+    settings: Settings,
+    expansion_mgr: ExpansionManager | None,
+    village: Village,
+) -> None:
+    """Bootstrap terminato: is_bootstrap=False su accounts.json + state."""
+    try:
+        accounts = load_accounts()
+        acc = next(
+            (a for a in accounts if a.account_id == settings.account_id),
+            None,
+        )
+        if acc is not None:
+            key_id = str(village.village_id)
+            cfg = acc.villages.get(key_id) or (
+                acc.villages.get(village.name) if village.name else None
+            )
+            if cfg is not None:
+                cfg.is_bootstrap = False
+                save_accounts(accounts)
+        live = settings.village_config_for(village.name, village.village_id)
+        if live is not None:
+            live.is_bootstrap = False
+        if expansion_mgr is not None:
+            bt = expansion_mgr.bootstrap_target
+            if bt and (
+                bt.get("village_id") == village.village_id
+                or (village.x is not None and bt.get("x") == village.x
+                    and bt.get("y") == village.y)
+            ):
+                expansion_mgr.bootstrap_target = {}
+                expansion_mgr._save()
+        logger.info(
+            "[%s] Bootstrap completato per '%s': passaggio al ruolo assegnato.",
+            settings.account_id, village.name or village.village_id,
+        )
+    except Exception:
+        logger.debug(
+            "[%s] Chiusura bootstrap fallita", settings.account_id,
+            exc_info=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Reclaim & Chiefing Engine
+# ---------------------------------------------------------------------------
+
+async def _reconcile_village_losses(
+    settings: Settings,
+    observer: GameObserver,
+    villages: list[Village],
+    war_store: WarStore,
+    expansion_mgr: ExpansionManager | None,
+    prefix: str,
+) -> None:
+    """Confronto sidebar vs storico: STOLEN_VILLAGE e re-onboarding.
+
+    (a) Ritorno: un villaggio in sidebar le cui coordinate erano state
+        marcate stolen/reclaiming e' tornato sotto controllo -> status
+        'reclaimed' e re-onboarding (ruolo originario + is_bootstrap).
+    (b) Perdita: le coordinate di un VillageConfig persistito non
+        compaiono piu' tra i villaggi in sidebar -> record 'stolen' in
+        war_targets_<acc>.json con timestamp e info nemico dal tile.
+    Guardia anti-falso-positivo: se la sidebar non espone nessun
+    newdid la lettura e' fallita e non si marca nulla.
+    """
+    real_villages = [v for v in villages if v.village_id]
+    if not real_villages:
+        return
+    owned_coords = {
+        (v.x, v.y)
+        for v in real_villages
+        if v.x is not None and v.y is not None
+    }
+
+    # (a) Re-onboarding dei villaggi rientrati in sidebar
+    for v in real_villages:
+        if v.x is None or v.y is None:
+            continue
+        t = war_store.target_at(v.x, v.y)
+        if t and t.get("status") in (STATUS_STOLEN, STATUS_RECLAIMING):
+            war_store.mark_status(v.x, v.y, STATUS_RECLAIMED)
+            _onboard_reclaimed_village(settings, v, t, expansion_mgr)
+
+    # (b) Rilevamento perdite: coordinate configurate assenti in sidebar
+    seen: set[tuple[int, int]] = set()
+    for cfg in settings.villages.values():
+        if cfg.x is None or cfg.y is None:
+            continue
+        if (cfg.x, cfg.y) in owned_coords or (cfg.x, cfg.y) in seen:
+            continue
+        seen.add((cfg.x, cfg.y))
+        if war_store.target_at(cfg.x, cfg.y) is not None:
+            continue
+        # Info nemico dal tile (best-effort, un solo fetch per perdita)
+        enemy_info = ""
+        try:
+            info = await observer.read_map_tile(cfg.x, cfg.y)
+            enemy_info = str((info or {}).get("text") or "")[:200]
+            if not (info or {}).get("occupied"):
+                # Tile libero/irriconoscibile: il villaggio e' stato
+                # cancellato/abbandonato, non sottratto -> niente target.
+                continue
+        except Exception:
+            logger.debug(
+                "%s Reclaim: lettura tile (%d|%d) fallita",
+                prefix, cfg.x, cfg.y,
+            )
+        war_store.add_stolen(
+            cfg.x, cfg.y,
+            name=cfg.name,
+            old_role=cfg.role or "standard",
+            enemy_info=enemy_info,
+        )
+        logger.warning(
+            "%s STOLEN_VILLAGE: '%s' (%d|%d) non compare piu' in sidebar "
+            "— registrato in war_targets. %s",
+            prefix, cfg.name or "?", cfg.x, cfg.y,
+            enemy_info[:80] if enemy_info else "",
+        )
+
+
+def _onboard_reclaimed_village(
+    settings: Settings,
+    village: Village,
+    target: dict,
+    expansion_mgr: ExpansionManager | None,
+) -> None:
+    """Post-riconquista (spec 4): VillageConfig + bootstrap d'emergenza.
+
+    Il villaggio rientra in accounts.json con il vecchio ruolo (se la
+    config era tornata 'standard'), flag is_bootstrap attivo e, se il
+    feeder bridge non e' gia' impegnato, come bootstrap_target per le
+    spedizioni d'emergenza dei feeder.
+    """
+    old_role = str(target.get("old_role") or "")
+    key_id = str(village.village_id or "")
+    cfg = settings.village_config_for(village.name, village.village_id)
+    if cfg is None:
+        cfg = VillageConfig(name=village.name or key_id)
+        settings.villages[key_id or cfg.name or village.name] = cfg
+    cfg.name = cfg.name or village.name or key_id
+    cfg.is_bootstrap = True
+    if old_role and cfg.role in ("", "standard"):
+        cfg.role = old_role
+    if village.x is not None:
+        cfg.x = village.x
+    if village.y is not None:
+        cfg.y = village.y
+    try:
+        accounts = load_accounts()
+        acc = next(
+            (a for a in accounts if a.account_id == settings.account_id),
+            None,
+        )
+        if acc is not None:
+            acfg = acc.villages.get(key_id) or (
+                acc.villages.get(cfg.name) if cfg.name else None
+            )
+            if acfg is None:
+                acfg = VillageConfig(name=cfg.name or key_id)
+                acc.villages[key_id or cfg.name] = acfg
+            acfg.name = acfg.name or cfg.name
+            acfg.is_bootstrap = True
+            if old_role and acfg.role in ("", "standard"):
+                acfg.role = old_role
+            acfg.x, acfg.y = cfg.x, cfg.y
+            save_accounts(accounts)
+    except Exception:
+        logger.debug(
+            "[%s] Reclaim: persistenza re-onboarding fallita",
+            settings.account_id, exc_info=True,
+        )
+    if expansion_mgr is not None and not expansion_mgr.bootstrap_target:
+        expansion_mgr.bootstrap_target = {
+            "x": village.x,
+            "y": village.y,
+            "village_id": village.village_id,
+            "name": cfg.name,
+        }
+        expansion_mgr._save()
+    logger.warning(
+        "[%s] RECLAIMED: villaggio '%s' (newdid=%s) rientrato sotto "
+        "controllo — is_bootstrap attivo, ruolo '%s'.",
+        settings.account_id, cfg.name,
+        village.village_id or "?", cfg.role,
+    )
+
+
+async def _dispatch_reclaim_waves(
+    executor: ActionExecutor,
+    war_store: WarStore,
+    village: Village,
+    rally_slot: int,
+    prefix: str,
+) -> None:
+    """Spedisce le wave del treno il cui depart_ts e' scaduto.
+
+    Ogni wave va via form Punto di Raduno (tt=2) con tipo movimento
+    Attacco (c=3), come per dodge/raid custom. L'impatto sincronizzato
+    e' garantito a monte dal planner (depart_ts = impact - travel);
+    qui la granularita' e' quella del ciclo dei villaggi — una wave
+    scaduta viene spedita alla prima visita utile dell'origine.
+    """
+    vid = str(village.village_id or "")
+    if not vid:
+        return
+    now = time.time()
+    due = war_store.due_waves(vid, now)
+    for target, wave in due[:MAX_WAVES_PER_DISPATCH]:
+        action = Action(
+            type=ActionType.SEND_CUSTOM_RAID,
+            params={
+                "rally_slot": rally_slot,
+                "move_type": str(wave.get("move_type") or "3"),
+                "targets": [
+                    {
+                        "x": int(target["x"]),
+                        "y": int(target["y"]),
+                        "troops": dict(wave.get("troops") or {}),
+                    }
+                ],
+            },
+            reason=(
+                f"Reclaim: wave {wave.get('kind', '?')} "
+                f"#{wave.get('wave_id', '?')} verso "
+                f"({target['x']}|{target['y']})"
+            ),
+        )
+        res = await executor.execute(action, village_id=village.village_id)
+        wave["status"] = WAVE_SENT if res.success else WAVE_FAILED
+        wave["sent_ts"] = time.time()
+        target["updated_ts"] = time.time()
+        war_store._save()
+        logger.info(
+            "%s Reclaim wave %d (%s) %s -> (%s|%s): %s",
+            prefix,
+            int(wave.get("wave_id") or 0),
+            str(wave.get("kind") or "?"),
+            "inviata" if res.success else "FALLITA",
+            target["x"], target["y"], res.message,
+        )
+
+
 def _append_history(account_id: str, state: GameState, action: Action) -> None:
     """Salva lo storico decisionale per-villaggio in JSONL (state/history/)."""
     try:
@@ -179,6 +519,7 @@ async def monitor_all_villages(
     hero_mgr: HeroManager | None = None,
     defense_mgr: DefenseManager | None = None,
     replenish_mgr: TroopReplenishmentManager | None = None,
+    war_store: WarStore | None = None,
 ) -> None:
     """Ciclo di controllo multi-villaggio per l'account corrente.
 
@@ -271,6 +612,27 @@ async def monitor_all_villages(
                     "(mappa non leggibile o layout ignoto).",
                     prefix, len(missing),
                 )
+
+    # 1.06 New Village Bootstrap: il newdid appena comparso in sidebar
+    # sulle coordinate di un tile 'settled' ottiene la VillageConfig
+    # automatica (croplog 9c/15c, feeder standard) con is_bootstrap.
+    _register_founded_villages(settings, expansion_mgr, villages)
+
+    # 1.07 Reclaim & Chiefing: lo storico dei villaggi configurati viene
+    # confrontato con la sidebar — coordinate scomparse = STOLEN_VILLAGE
+    # (registrate in war_targets_<acc>.json), coordinate 'reclaiming'
+    # ricomparse = villaggio riconquistato -> re-onboarding + bootstrap.
+    if war_store is not None:
+        try:
+            await _reconcile_village_losses(
+                settings, observer, villages, war_store,
+                expansion_mgr, prefix,
+            )
+        except Exception as war_exc:
+            logger.warning(
+                "%s Errore modulo reclaim (non bloccante): %s",
+                prefix, war_exc,
+            )
 
     # 1.1 Controllo e attivazione automatica del bonus +15% per 8 ore su tutte le risorse (video ad)
     if settings.auto_video_bonus:
@@ -395,6 +757,18 @@ async def monitor_all_villages(
             if not state.village_id and village.village_id:
                 state.village_id = village.village_id
 
+            # Bootstrap auto-off (spec 2): requisiti minimi raggiunti ->
+            # is_bootstrap=False e passaggio al ruolo assegnato.
+            vcfg_boot = settings.village_config_for(
+                village.name, village.village_id
+            )
+            if (
+                vcfg_boot is not None
+                and vcfg_boot.is_bootstrap
+                and bootstrap_complete(state)
+            ):
+                _complete_bootstrap(settings, expansion_mgr, village)
+
             # Snapshot degli altri villaggi: serve al brain per scegliere
             # dove inviare le risorse in eccesso (emergenza storage pieno)
             if last_states is not None:
@@ -438,6 +812,27 @@ async def monitor_all_villages(
                         "%s Errore modulo difesa (non bloccante): %s",
                         vprefix, d_exc,
                     )
+
+            # 3.6 Reclaim & Chiefing: wave pianificate il cui depart_ts
+            #     e' scaduto partono dal Punto di Raduno di QUESTO
+            #     villaggio (tipo movimento Attacco).
+            if war_store is not None:
+                rally_rc = find_rally_point(state.interior_fields())
+                if rally_rc:
+                    try:
+                        await _dispatch_reclaim_waves(
+                            executor=executor,
+                            war_store=war_store,
+                            village=village,
+                            rally_slot=rally_rc.slot_id,
+                            prefix=vprefix,
+                        )
+                    except Exception as rw_exc:
+                        logger.warning(
+                            "%s Errore dispatch wave reclaim "
+                            "(non bloccante): %s",
+                            vprefix, rw_exc,
+                        )
 
             # 4. Il brain decide e l'esecutore agisce (con validazione newdid)
             if last_states is not None and state.village_name:
@@ -747,6 +1142,99 @@ async def monitor_all_villages(
                         feed_res.message,
                     )
 
+            # 4.3 Auto-Feeder Bridge (spec 2): finche' bootstrap_target
+            # e' attivo, i villaggi maturi (magazzino > 50%) inviano
+            # risorse al nuovo insediamento, cappate allo spazio libero
+            # reale del target (peer_villages) per evitare overflow.
+            bt = (
+                expansion_mgr.bootstrap_target
+                if expansion_mgr is not None else {}
+            )
+            if bt:
+                b_id = int(bt.get("village_id") or 0)
+                b_name = str(bt.get("name") or "")
+                if b_id and b_id != (village.village_id or 0):
+                    b_res = (
+                        state.peer_villages.get(b_name)
+                        or state.peer_villages.get(str(b_id))
+                    )
+                    # Villaggio maturo: spedisce solo sopra il 50% del
+                    # magazzino (keep_ratio dedicata al bridge).
+                    b_surplus = feeder_surplus(state, keep_ratio=0.50)
+                    if b_surplus:
+                        # Capping allo spazio libero del target.
+                        if b_res is not None:
+                            free_wh = max(
+                                0,
+                                (b_res.warehouse_capacity or 0)
+                                - max(b_res.wood, b_res.clay, b_res.iron),
+                            )
+                            free_gr = max(
+                                0,
+                                (b_res.granary_capacity or 0) - b_res.crop,
+                            )
+                        else:
+                            # Capacita' ignota (target mai visitato):
+                            # default conservativo dei magazzini base.
+                            free_wh = free_gr = 800
+                        solid = (
+                            b_surplus.get("wood", 0)
+                            + b_surplus.get("clay", 0)
+                            + b_surplus.get("iron", 0)
+                        )
+                        if solid > free_wh and solid > 0:
+                            scale = free_wh / solid if free_wh > 0 else 0.0
+                            for k in ("wood", "clay", "iron"):
+                                b_surplus[k] = int(
+                                    b_surplus.get(k, 0) * scale
+                                )
+                        if "crop" in b_surplus:
+                            b_surplus["crop"] = min(
+                                b_surplus["crop"], free_gr
+                            )
+                        b_surplus = {
+                            k: v for k, v in b_surplus.items() if v > 0
+                        }
+                    if b_surplus:
+                        b_market = find_market(state.interior_fields())
+                        b_mslot = (
+                            int(vcfg_feed.market_slot or 0)
+                            if (
+                                (vcfg_feed := settings.village_config_for(
+                                    village.name, target_vid
+                                )) is not None
+                                and vcfg_feed.market_slot
+                            )
+                            else (b_market.slot_id if b_market else 0)
+                        )
+                        if b_mslot:
+                            b_params: dict = {
+                                "market_slot": b_mslot,
+                                "target_village": b_name,
+                                "target": b_name,
+                                "resources": b_surplus,
+                            }
+                            if bt.get("x") is not None and bt.get("y") is not None:
+                                b_params["target_x"] = bt["x"]
+                                b_params["target_y"] = bt["y"]
+                            b_action = Action(
+                                type=ActionType.SEND_RESOURCES,
+                                params=b_params,
+                                reason=(
+                                    f"Bootstrap bridge: feeder -> "
+                                    f"'{b_name}' invia {b_surplus} "
+                                    "(cappato allo spazio libero)"
+                                ),
+                            )
+                            b_res_exec = await executor.execute(
+                                b_action, village_id=target_vid
+                            )
+                            logger.info(
+                                "%s Bootstrap feeder: %s -> '%s' (%s)",
+                                vprefix, b_surplus, b_name,
+                                b_res_exec.message,
+                            )
+
             # 5. Pausa umana tra un villaggio e l'altro
             if v_idx < len(villages) - 1:
                 await asyncio.sleep(random.uniform(2.5, 5.0))
@@ -916,6 +1404,10 @@ async def run_single_account_loop(
                     _replenish_managers[settings.account_id] = (
                         TroopReplenishmentManager(settings.account_id)
                     )
+                if settings.account_id not in _war_stores:
+                    _war_stores[settings.account_id] = WarStore(
+                        settings.account_id
+                    )
                 await monitor_all_villages(
                     browser=browser,
                     observer=observer,
@@ -930,6 +1422,7 @@ async def run_single_account_loop(
                     hero_mgr=_hero_managers[settings.account_id],
                     defense_mgr=_defense_managers[settings.account_id],
                     replenish_mgr=_replenish_managers[settings.account_id],
+                    war_store=_war_stores[settings.account_id],
                 )
 
                 # Reset del conteggio errori e ripristino al completamento con successo

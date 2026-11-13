@@ -541,6 +541,21 @@ QUEST_CLAIM_BUTTON: list[str] = [
     "a:has-text('Riscuoti premio')",
     "a:has-text('Claim reward')",
 ]
+# Badge/notifica sull'avatar del Questmaster (T4.6): indica task
+# completate da riscuotere. Usato come gate prima di navigare /tasks.
+QUEST_PENDING_BADGE: list[str] = [
+    "#questmasterButton .speechBubble",
+    "#questmasterButton .notification",
+    "#questmasterButton .badge",
+    "#questmasterButton .bubble",
+    "#questmasterButton .count",
+    "#questmaster .speechBubble",
+    ".questmasterButton .speechBubble",
+    ".questmasterButton .notification",
+    "a[href*='tasks'] .speechBubble",
+    "a[href*='tasks'] .notification",
+    ".questIndicator",
+]
 # Contenitori del dialog task/questmaster
 QUEST_DIALOG: list[str] = [
     "#tasks",

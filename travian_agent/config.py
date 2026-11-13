@@ -50,8 +50,23 @@ class VillageConfig:
     allowed_units: list[str] = field(default_factory=list)
     priority_units: list[str] = field(default_factory=list)
     # Priorita' edifici (Sprint 3+): stringhe legacy oppure step
-    # {"key"|"gid": ..., "target_level": int} (Advanced Queue & Priority)
+    # {"key"|"gid": ..., "target_level": int} (Advanced Queue & Priority).
+    # DEPRECATO: conservato per retrocompatibilita' col parsing legacy.
     building_focus: list = field(default_factory=list)
+    # Advanced Queue & Priority Builder (v2.0): piano ordinato a step
+    # {"key"|"gid": ..., "target_level": int, "priority": int} — il
+    # planner itera per priorita' crescente e passa allo step N+1 quando
+    # tutti i target dello step N sono raggiunti.
+    building_queue_plan: list = field(default_factory=list)
+    # New Village Bootstrap (v2.0): villaggio appena fondato — il builder
+    # esegue la sequenza startup (storage/main/campi/mercato/rally) prima
+    # di passare al ruolo assegnato; il flag si auto-disattiva a soglie
+    # raggiunte.
+    is_bootstrap: bool = False
+    # Reclaim & Chiefing: questo villaggio e' l'origine del treno di
+    # riconquista — il builder priorizza Accademia (ricerca nobile) e
+    # Residenza/Palazzo (slot conquista) prima di focus e ruolo.
+    is_reclaim_source: bool = False
     farm_enabled: bool = True       # include questo villaggio nei cicli di raid
     farm_unit: str = ""             # unita' da saccheggio (vuoto = truppe leggere auto)
     market_slot: int = 0            # slot dorf2 del Mercato (0 = auto-detect via gid=17)
@@ -356,6 +371,15 @@ def _parse_account_item(item: dict) -> Settings:
                                     allowed_units=list(cfg.get("allowed_units") or cfg.get("priority_units") or []),
                                     priority_units=list(cfg.get("priority_units") or cfg.get("allowed_units") or []),
                                     building_focus=list(cfg.get("building_focus", [])),
+                                    building_queue_plan=list(
+                                        cfg.get("building_queue_plan")
+                                        or cfg.get("building_focus")
+                                        or []
+                                    ),
+                                    is_bootstrap=bool(cfg.get("is_bootstrap", False)),
+                                    is_reclaim_source=bool(
+                                        cfg.get("is_reclaim_source", False)
+                                    ),
                                     farm_enabled=bool(cfg.get("farm_enabled", True)),
                                     farm_unit=str(cfg.get("farm_unit", "")),
                                     defense_enabled=bool(cfg.get("defense_enabled", True)),
@@ -518,6 +542,11 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                     "allowed_units": list(cfg.allowed_units),
                     "priority_units": list(cfg.priority_units),
                     "building_focus": list(cfg.building_focus),
+                    "building_queue_plan": list(
+                        cfg.building_queue_plan or cfg.building_focus
+                    ),
+                    "is_bootstrap": cfg.is_bootstrap,
+                    "is_reclaim_source": cfg.is_reclaim_source,
                     "farm_enabled": cfg.farm_enabled,
                     "farm_unit": cfg.farm_unit,
                     "defense_enabled": cfg.defense_enabled,

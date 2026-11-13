@@ -187,6 +187,10 @@ class ExpansionManager:
     state_path: Path | None = None
     founded_tiles: list[dict] = field(default_factory=list)
     feed_target: str = ""          # nome del villaggio che deve ricevere risorse
+    # New Village Bootstrap (v2.0): {"x","y","village_id","name"} del
+    # tile appena fondato — finche' attivo i villaggi maturi spediscono
+    # risorse cappate allo spazio libero del nuovo insediamento.
+    bootstrap_target: dict = field(default_factory=dict)
     next_found_attempt: float = 0.0  # cooldown anti-spam dopo fallimenti
     next_map_scan: float = 0.0       # cooldown tra scansioni cropper di mappa
 
@@ -205,6 +209,8 @@ class ExpansionManager:
                 data = json.loads(self.state_path.read_text(encoding="utf-8"))
                 self.founded_tiles = list(data.get("founded_tiles") or [])
                 self.feed_target = str(data.get("feed_target") or "")
+                bt = data.get("bootstrap_target")
+                self.bootstrap_target = dict(bt) if isinstance(bt, dict) else {}
                 self.next_found_attempt = float(data.get("next_found_attempt") or 0.0)
                 self.next_map_scan = float(data.get("next_map_scan") or 0.0)
         except Exception:
@@ -219,6 +225,7 @@ class ExpansionManager:
                     {
                         "founded_tiles": self.founded_tiles,
                         "feed_target": self.feed_target,
+                        "bootstrap_target": self.bootstrap_target,
                         "next_found_attempt": self.next_found_attempt,
                         "next_map_scan": self.next_map_scan,
                     },
@@ -292,14 +299,23 @@ class ExpansionManager:
         cfg: ExpansionConfig,
         prefix: str,
         store: CropperStore,
-    ) -> ExpansionTarget | None:
-        """Primo tile libero valido tra target configurati e cropper approved.
+    ) -> tuple[ExpansionTarget | None, int]:
+        """Primo tile libero valido + numero campi grano rilevati.
 
         Regola di sicurezza (spec): se le coordinate esistono nel
         candidates store, si procede SOLO con status 'approved';
         pending/rejected/settling/settled vengono saltate.
+        Ritorna (target, crop_fields): crop_fields serve a salvare il
+        crop_type del tile fondato per l'auto-config post-fondazione.
         """
         done = {(t.get("x"), t.get("y")) for t in self.founded_tiles}
+        # I candidati inseriti a mano dalla dashboard esulano dal filtro
+        # crop_min: l'utente ha gia' verificato il tile fuori banda.
+        manual_ok = {
+            (c.x, c.y)
+            for c in store.approved_targets(self.account_id)
+            if getattr(c, "manual", False)
+        }
         # I cropper approved dalla dashboard hanno priorita' sui target manuali
         ordered: list[ExpansionTarget] = [
             ExpansionTarget(
@@ -332,7 +348,10 @@ class ExpansionManager:
                 )
                 continue
             crop = int(info.get("crop_fields") or 0)
-            if crop and crop < cfg.crop_min:
+            if (
+                crop and crop < cfg.crop_min
+                and (target.x, target.y) not in manual_ok
+            ):
                 logger.info(
                     "%s Espansione: tile (%d, %d) solo %dc, richiesti >= %dc.",
                     prefix, target.x, target.y, crop, cfg.crop_min,
@@ -345,8 +364,8 @@ class ExpansionManager:
                     prefix, target.x, target.y,
                 )
                 continue
-            return target
-        return None
+            return target, crop
+        return None, 0
 
     # ------------------------------------------------------------------
     # Step principale (una volta per ciclo account)
@@ -467,7 +486,7 @@ class ExpansionManager:
             return
 
         # 3. Scansione dei tile target (approved + configurati)
-        target = await self._pick_target(observer, cfg, prefix, store)
+        target, tile_crop = await self._pick_target(observer, cfg, prefix, store)
         if target is None:
             logger.info(
                 "%s Espansione: nessun tile libero valido tra i target configurati.",
@@ -490,8 +509,19 @@ class ExpansionManager:
         store.set_status_at(self.account_id, target.x, target.y, STATUS_SETTLING)
         result = await executor.execute(action, village_id=founder.village_id)
         if result.success:
-            self.founded_tiles.append({"x": target.x, "y": target.y, "ts": now})
+            self.founded_tiles.append({
+                "x": target.x, "y": target.y, "ts": now,
+                "crop_type": f"{tile_crop}c" if tile_crop else "",
+                "settled_at": now,
+            })
             self.feed_target = ""
+            # Bootstrap target (spec 2): al ciclo successivo, quando la
+            # sidebar espone il nuovo newdid, l'orchestratore registra il
+            # villaggio e avvia la fase is_bootstrap + feeder bridge.
+            self.bootstrap_target = {
+                "x": target.x, "y": target.y,
+                "village_id": 0, "name": "",
+            }
             store.set_status_at(self.account_id, target.x, target.y, STATUS_SETTLED)
             logger.info(
                 "%s Espansione: villaggio fondato a (%d|%d)!",

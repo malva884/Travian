@@ -6,10 +6,13 @@ un'unica funzione `select_upgrade` che applica, in ordine di priorita':
 1. **Storage** — magazzino/granaio quasi pieni (overflow prevention);
 2. **Grain Safety Net** — margine netto di grano sotto soglia -> campi
    di grano, poi Mulino/Forno;
-3. **building_focus** — override manuale utente (priorita' sul ruolo);
-4. **Ruolo** — hammer/defensive/croplog/feeder: infrastrutture militari
+3. **Bootstrap / Reclaim** — sequenza startup del nuovo villaggio, e
+   Accademia + Residenza/Palazzo quando il villaggio e' l'origine di un
+   treno di riconquista (``VillageConfig.is_reclaim_source``);
+4. **building_focus** — override manuale utente (priorita' sul ruolo);
+5. **Ruolo** — hammer/defensive/croplog/feeder: infrastrutture militari
    o economiche bilanciate per livello;
-5. **Economia** — campo risorsa piu' debole della risorsa piu' scarsa.
+6. **Economia** — campo risorsa piu' debole della risorsa piu' scarsa.
 
 `plan_upgrades` materializza i prossimi N upgrade simulando gli scatti
 di livello, per la preview in dashboard (persistita su
@@ -26,9 +29,11 @@ from pathlib import Path
 
 from .building_prereqs import (
     FIELD_GID_TYPES,
+    GID_ACADEMY,
     GID_BAKERY,
     GID_GRAIN_MILL,
     GID_LABELS,
+    GID_MAIN_BUILDING,
     WALL_GIDS,
     gids_for_focus_key,
     prereqs_met,
@@ -39,6 +44,7 @@ from .models import (
     GID_GRANARY,
     GID_MARKETPLACE,
     GID_PALACE,
+    GID_RALLY_POINT,
     GID_RESIDENCE,
     GID_STABLE,
     GID_WAREHOUSE,
@@ -62,6 +68,12 @@ _STORAGE_WARN_RATIO = 0.90
 # Profondita' default della preview piano (3-5 per spec).
 PLAN_DEPTH = 4
 
+# New Village Bootstrap (v2.0, spec 2): requisiti minimi del villaggio
+# appena fondato prima di passare al ruolo assegnato.
+BOOTSTRAP_STORAGE_LEVEL = 5   # magazzino + granaio >= 5
+BOOTSTRAP_MAIN_LEVEL = 5      # Edificio Principale >= 5
+BOOTSTRAP_FIELD_LEVEL = 3     # tutti i campi risorsa >= 3
+
 # Ruolo -> gid interni sviluppati in modo bilanciato (livello minimo prima).
 _ROLE_INTERIORS: dict[str, tuple[int, ...]] = {
     "hammer": (GID_BARRACKS, GID_STABLE, GID_WORKSHOP),
@@ -75,7 +87,7 @@ _ROLE_INTERIORS: dict[str, tuple[int, ...]] = {
 class UpgradeIntent:
     """Prossimo upgrade proposto dal planner dinamico."""
 
-    kind: str            # storage|grain_safety|focus|role|economy
+    kind: str            # storage|grain_safety|bootstrap|focus|role|economy
     slot_id: int
     name: str
     gid: int             # -1 per campi risorsa
@@ -274,18 +286,31 @@ def grain_safety_intents(state: GameState) -> list[Field]:
 
 
 def _focus_steps(focus_list: list) -> list[tuple[int, int]]:
-    """Normalizza building_focus in step ordinati (gid, target_level).
+    """Normalizza building_queue_plan in step ordinati (gid, target_level).
 
     Ogni elemento puo' essere:
     - una stringa chiave legacy (es. "barracks", "cropland");
-    - un dict {"key": str, "target_level": int} oppure
+    - un dict {"key": str, "target_level": int, "priority": int} oppure
       {"gid": int, "target_level": int} (Advanced Queue & Priority).
 
+    Gli step dict vengono ordinati per 'priority' crescente (default =
+    posizione nella lista); le chiavi legacy mantengono l'ordine dato.
     target_level 0/assente = fino al massimo consentito (comportamento
-    legacy). L'ordine della lista e' la priorita'.
+    legacy).
     """
+    indexed: list[tuple[int, object]] = []
+    for pos, item in enumerate(focus_list or []):
+        prio = pos
+        if isinstance(item, dict):
+            try:
+                prio = int(item.get("priority") or (pos + 1)) - 1
+            except (TypeError, ValueError):
+                prio = pos
+        indexed.append((prio, item))
+    indexed.sort(key=lambda t: t[0])
+
     steps: list[tuple[int, int]] = []
-    for item in focus_list or []:
+    for _prio, item in indexed:
         target = 0
         if isinstance(item, dict):
             try:
@@ -306,7 +331,7 @@ def _focus_steps(focus_list: list) -> list[tuple[int, int]]:
 
 
 def focus_intents(state: GameState, settings: Settings) -> list[Field]:
-    """Field candidati dalla coda prioritaria building_focus (per step).
+    """Field candidati dalla coda prioritaria building_queue_plan.
 
     Ogni step e' (gid, target_level): il builder lo salta quando il
     target e' raggiunto — campi risorsa: nessun campo sotto target;
@@ -314,11 +339,14 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
     costruzione se i prerequisiti reggono.
     """
     vcfg = settings.village_config_for(state.village_name, state.village_id)
-    if vcfg is None or not vcfg.building_focus:
+    plan = []
+    if vcfg is not None:
+        plan = list(vcfg.building_queue_plan or vcfg.building_focus or [])
+    if not plan:
         return []
     queued = queued_slot_ids(state)
     out: list[Field] = []
-    for gid, target in _focus_steps(vcfg.building_focus):
+    for gid, target in _focus_steps(plan):
         if gid in FIELD_GID_TYPES:
             rtype = FIELD_GID_TYPES[gid]
             matches = [
@@ -395,6 +423,177 @@ def economy_intents(state: GameState, settings: Settings) -> list[Field]:
     return sorted(pool, key=lambda f: (f.level, f.slot_id))
 
 
+# ---------------------------------------------------------------------------
+# New Village Bootstrap (v2.0, spec 2)
+# ---------------------------------------------------------------------------
+
+def bootstrap_active(state: GameState, settings: Settings) -> bool:
+    """True se il villaggio e' flaggato is_bootstrap in VillageConfig."""
+    vcfg = settings.village_config_for(state.village_name, state.village_id)
+    return bool(vcfg is not None and vcfg.is_bootstrap)
+
+
+def bootstrap_complete(state: GameState) -> bool:
+    """True se i requisiti minimi di startup sono soddisfatti.
+
+    Requisiti (spec 2): magazzino e granaio >= 5, Edificio Principale
+    >= 5, tutti i campi risorsa >= 3, Mercato e Punto di Raduno esistenti.
+    """
+    interiors = state.interior_fields()
+
+    def _best(gid: int) -> int:
+        return max((f.level for f in interiors if f.gid == gid), default=0)
+
+    if _best(GID_WAREHOUSE) < BOOTSTRAP_STORAGE_LEVEL:
+        return False
+    if _best(GID_GRANARY) < BOOTSTRAP_STORAGE_LEVEL:
+        return False
+    if _best(GID_MAIN_BUILDING) < BOOTSTRAP_MAIN_LEVEL:
+        return False
+    if _best(GID_MARKETPLACE) < 1 or _best(GID_RALLY_POINT) < 1:
+        return False
+    res_fields = state.resource_fields()
+    if not res_fields:
+        return False
+    return all(f.level >= BOOTSTRAP_FIELD_LEVEL for f in res_fields)
+
+
+def bootstrap_intents(state: GameState, settings: Settings) -> list[Field]:
+    """Sequenza costruttiva di startup per il villaggio appena fondato.
+
+    Ordine (spec 2):
+    1. Magazzino/Granaio fino al liv. 5 — devono assorbire le spedizioni
+       dal mercato senza overflow (incluse le nuove costruzioni);
+    2. Edificio Principale fino al liv. 5 (velocita' costruzioni);
+    3. Mercato (gid 17) e Punto di Raduno (gid 16) — i prerequisiti del
+       Mercato (Municipio 3 + storage 1) rendono naturale l'ordine;
+    4. Campi risorsa bilanciati via scarcest() fino al liv. 3.
+    """
+    interiors = state.interior_fields()
+
+    def _best(gid: int) -> int:
+        return max((f.level for f in interiors if f.gid == gid), default=0)
+
+    out: list[Field] = []
+
+    # 1. Storage < 5 (upgrade esistenti o costruzione se assenti)
+    if _best(GID_WAREHOUSE) < BOOTSTRAP_STORAGE_LEVEL:
+        wh = [
+            f for f in _interior_intents(state, (GID_WAREHOUSE,))
+            if f.level < BOOTSTRAP_STORAGE_LEVEL
+        ]
+        if not wh and _best(GID_WAREHOUSE) == 0:
+            wh = new_building_intents(
+                state, (GID_WAREHOUSE,), {f.slot_id for f in out}
+            )
+        out.extend(wh)
+    if _best(GID_GRANARY) < BOOTSTRAP_STORAGE_LEVEL:
+        gr = [
+            f for f in _interior_intents(state, (GID_GRANARY,))
+            if f.level < BOOTSTRAP_STORAGE_LEVEL
+        ]
+        if not gr and _best(GID_GRANARY) == 0:
+            gr = new_building_intents(
+                state, (GID_GRANARY,), {f.slot_id for f in out}
+            )
+        out.extend(gr)
+    if out:
+        return out
+
+    # 2. Edificio Principale < 5 (upgrade o costruzione su area vuota)
+    if _best(GID_MAIN_BUILDING) < BOOTSTRAP_MAIN_LEVEL:
+        main = [
+            f for f in _interior_intents(state, (GID_MAIN_BUILDING,))
+            if f.level < BOOTSTRAP_MAIN_LEVEL
+        ]
+        if not main and _best(GID_MAIN_BUILDING) == 0:
+            main = new_building_intents(state, (GID_MAIN_BUILDING,))
+        if main:
+            return main
+
+    # 3. Mercato e Punto di Raduno (costruzione se assenti; upgrade se
+    #    presenti a liv. 0 non e' possibile: solo nuove costruzioni)
+    missing: list[int] = []
+    if _best(GID_MARKETPLACE) < 1:
+        missing.append(GID_MARKETPLACE)
+    if _best(GID_RALLY_POINT) < 1:
+        missing.append(GID_RALLY_POINT)
+    if missing:
+        newbie = new_building_intents(state, tuple(missing))
+        if newbie:
+            return newbie
+        # Prerequisiti non soddisfatti (es. Municipio < 3): si ricade
+        # sui campi, il check del ciclo successivo riprovera'.
+
+    # 4. Tutti i campi risorsa >= 3, bilanciati sulla risorsa scarsa
+    weak = [
+        f for f in upgradeable_fields(state, state.resource_fields())
+        if f.level < BOOTSTRAP_FIELD_LEVEL
+    ]
+    if weak:
+        scarcest = state.resources.scarcest()
+        same = [f for f in weak if f.resource_type is scarcest]
+        pool = same or weak
+        return sorted(pool, key=lambda f: (f.level, f.slot_id))
+    return []
+
+
+# Reclaim & Chiefing: livelli richiesti per produrre e ospitare i nobili
+# (Senatore/Comandante/Capotribu' si ricercano in Accademia e si
+# addestrano in Residenza/Palazzo; lo slot conquista serve al 20).
+RECLAIM_ACADEMY_LEVEL = 20
+RECLAIM_RESIDENCE_LEVEL = 20
+
+
+def reclaim_intents(state: GameState, settings: Settings) -> list[Field]:
+    """Infrastrutture del villaggio origine di un treno di riconquista.
+
+    Ordine (spec 2.1):
+    1. Accademia fino al liv. 20 — sblocca la ricerca del nobile
+       (t9/t19/t29 a seconda della tribu');
+    2. Residenza o Palazzo fino al liv. 20 — lo slot conquista piu'
+       alto e' necessario per un'ondata di chiefing; se entrambi
+       esistono si estende quello gia' piu' alto, altrimenti si
+       preferisce la Residenza (costo minore).
+    """
+    interiors = state.interior_fields()
+
+    def _best(gid: int) -> int:
+        return max((f.level for f in interiors if f.gid == gid), default=0)
+
+    out: list[Field] = []
+    # 1. Accademia < 20
+    if _best(GID_ACADEMY) < RECLAIM_ACADEMY_LEVEL:
+        ac = [
+            f for f in _interior_intents(state, (GID_ACADEMY,))
+            if f.level < RECLAIM_ACADEMY_LEVEL
+        ]
+        if not ac and _best(GID_ACADEMY) == 0:
+            ac = new_building_intents(
+                state, (GID_ACADEMY,), {f.slot_id for f in out}
+            )
+        out.extend(ac)
+    if out:
+        return out
+
+    # 2. Residenza/Palazzo < 20 (slot conquista)
+    home_gid = (
+        GID_PALACE
+        if _best(GID_PALACE) > _best(GID_RESIDENCE)
+        else GID_RESIDENCE
+    )
+    if _best(home_gid) < RECLAIM_RESIDENCE_LEVEL:
+        home = [
+            f for f in _interior_intents(state, (home_gid,))
+            if f.level < RECLAIM_RESIDENCE_LEVEL
+        ]
+        if not home and _best(home_gid) == 0:
+            home = new_building_intents(state, (home_gid,))
+        if home:
+            return home
+    return []
+
+
 def local_spend_intents(state: GameState) -> list[Field]:
     """Interni upgradabili dal livello piu' alto (costo maggiore).
 
@@ -461,7 +660,31 @@ def select_upgrade(
         if it:
             return it
 
-    # 3. building_focus: override manuale utente
+    # 3. New Village Bootstrap: sequenza startup finche' i requisiti
+    #    minimi non sono soddisfatti (storage 5 / Municipio 5 / campi 3 /
+    #    Mercato + Punto di Raduno) — precede focus e ruolo.
+    if bootstrap_active(state, settings):
+        it = _mk(
+            "bootstrap", bootstrap_intents(state, settings),
+            "Bootstrap nuovo villaggio: storage/Municipio/campi/Mercato",
+        )
+        if it:
+            return it
+
+    # 3.5 Reclaim & Chiefing: villaggio origine del treno ->
+    #     Accademia 20 (ricerca nobile) + Residenza/Palazzo 20 (slot).
+    vcfg_reclaim = settings.village_config_for(
+        state.village_name, state.village_id
+    )
+    if vcfg_reclaim is not None and vcfg_reclaim.is_reclaim_source:
+        it = _mk(
+            "reclaim", reclaim_intents(state, settings),
+            "Riconquista: Accademia/Residenza per i nobili",
+        )
+        if it:
+            return it
+
+    # 4. building_queue_plan: override manuale utente
     it = _mk(
         "focus", focus_intents(state, settings),
         "Focus edifici manuale da dashboard",
@@ -469,7 +692,7 @@ def select_upgrade(
     if it:
         return it
 
-    # 4. Ruolo (hammer/defensive/croplog/feeder + capitale)
+    # 5. Ruolo (hammer/defensive/croplog/feeder + capitale)
     role = settings.village_role_for(state.village_name, state.village_id)
     it = _mk(
         "role", role_intents(state, settings),
@@ -478,7 +701,7 @@ def select_upgrade(
     if it:
         return it
 
-    # 5. Economia: campo piu' debole della risorsa scarsa
+    # 6. Economia: campo piu' debole della risorsa scarsa
     it = _mk(
         "economy", economy_intents(state, settings),
         "Upgrade campo risorsa piu' debole",

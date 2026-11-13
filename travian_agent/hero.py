@@ -444,6 +444,20 @@ class HeroManager:
                     prefix, state["status"], state["health"],
                 )
 
+            # 5. Inventario risorse (spec 5): legge i pacchi/sacchi
+            #    accumulati da avventure/aste e ne salva i totali nello
+            #    snapshot — il planner li considera riserve immuni al
+            #    saccheggio (Emergency Unpack li consuma all'occorrenza).
+            inv = await self._sense_inventory_resources(browser, prefix)
+            if inv is not None:
+                self.snapshot["resource_items"] = inv["items"]
+                self.snapshot["resource_totals"] = inv["totals"]
+                if inv["items"]:
+                    logger.info(
+                        "%s Eroe: %d pacchi risorsa in inventario (%s)",
+                        prefix, inv["count"], inv["totals"],
+                    )
+
             self._save()
             return True
         except Exception as exc:  # noqa: BLE001
@@ -472,6 +486,52 @@ class HeroManager:
         return {
             "health": 100, "status": "home", "adventures": 0,
             "free_points": 0, "level": 0,
+        }
+
+    async def _sense_inventory_resources(
+        self, browser: "TravianBrowser", prefix: str = ""
+    ) -> dict[str, Any] | None:
+        """Legge i consumabili-risorsa nel baule dell'eroe (tab inventario).
+
+        Ritorna {"items": [...], "totals": {wood,clay,iron,crop}, "count": n}
+        o None se la pagina inventario non e' raggiungibile/leggibile.
+        """
+        page = browser.page
+        if page is None:
+            return None
+        try:
+            await self._goto_hero_tab(browser, _TABS_INVENTORY)
+            await sleep_human(0.8, 1.4)
+            items = await page.evaluate(_JS_INVENTORY_RESOURCES)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "%s Lettura inventario eroe fallita: %s", prefix, exc,
+            )
+            return None
+        if not isinstance(items, list):
+            return None
+        totals: dict[str, int] = {
+            "wood": 0, "clay": 0, "iron": 0, "crop": 0,
+        }
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                amount = int(it.get("amount") or 0) * max(
+                    1, int(it.get("count") or 1)
+                )
+            except (TypeError, ValueError):
+                continue
+            res = str(it.get("res") or "")
+            if res == "any":
+                for k in totals:
+                    totals[k] += amount
+            elif res in totals:
+                totals[res] += amount
+        return {
+            "items": items,
+            "totals": totals,
+            "count": len(items),
         }
 
     async def _goto_hero_tab(self, browser: "TravianBrowser", candidates: tuple[str, ...]) -> None:

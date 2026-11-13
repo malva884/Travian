@@ -504,6 +504,29 @@ class TroopReplenishmentManager:
             )
             return {}
 
+        # Priorita' anche agli upgrade critici in attesa (spec 3): se il
+        # planner ha un upgrade Storage / Grain Safety / Bootstrap che non
+        # e' ancora partito (tipicamente per mancanza di risorse), la
+        # caserma non deve drenare il budget che serve a sbloccarlo.
+        if cfg.skip_while_building:
+            try:
+                from .builder import select_upgrade  # no cicli a import
+
+                pending = select_upgrade(state, settings)
+            except Exception:  # noqa: BLE001
+                pending = None
+            if pending is not None and pending.kind in (
+                "storage", "grain_safety", "bootstrap",
+            ):
+                logger.debug(
+                    "[%s] Replenishment: upgrade prioritario pendente in "
+                    "'%s' (%s) — addestramento sospeso",
+                    self.account_id,
+                    village_name,
+                    pending.kind,
+                )
+                return {}
+
         # Grain Safety Net: usa il bilancio netto ufficiale letto da
         # production.php (crop_balance). None = dato non letto: si ripiega
         # sulla produzione oraria lorda come stima prudenziale.

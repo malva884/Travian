@@ -1506,9 +1506,9 @@ class TravianParser:
                         '#mapContainer a[class*="own"]'
                     );
                     if (center) {
-                        const m = (center.href || '').match(/x=(-?\\d+).*?y=(-?\\d+)/)
+                        const m = (center.href || '').match(/x=([+\\u2212\\u2010-\\u2015\\-]?\\d+).*?y=([+\\u2212\\u2010-\\u2015\\-]?\\d+)/)
                             || (center.title || '').match(
-                                /\\(\\s*(-?\\d+)\\s*[|/]\\s*(-?\\d+)\\s*\\)/
+                                /\\(\\s*([+\\u2212\\u2010-\\u2015\\-]?\\d+)\\s*[|/]\\s*([+\\u2212\\u2010-\\u2015\\-]?\\d+)\\s*\\)/
                             );
                         if (m) return {x: toInt(m[1]), y: toInt(m[2])};
                     }

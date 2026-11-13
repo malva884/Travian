@@ -878,10 +878,11 @@ with tab_villages:
                                 building_focus_labels.get(_step["key"], _step["key"])
                             )
                             _step["target_level"] = _cols[2].number_input(
-                                "Liv.", min_value=0, max_value=21,
+                                "Liv.", min_value=0, max_value=20,
                                 value=int(_step.get("target_level") or 0),
                                 key=f"fqtgt_{cur_acc.account_id}_{vkey}_{_uid}",
                                 label_visibility="collapsed",
+                                help="Livello target 1-20 (0 = fino al massimo consentito)",
                             )
                             if _cols[3].form_submit_button(
                                 "↑", key=f"fqup_{cur_acc.account_id}_{vkey}_{_uid}"
@@ -908,8 +909,9 @@ with tab_villages:
                             )
                         with _ac2:
                             _add_tgt = st.number_input(
-                                "Liv. target:", min_value=0, max_value=21, value=0,
+                                "Liv. target:", min_value=0, max_value=20, value=0,
                                 key=f"fqlvl_{cur_acc.account_id}_{vkey}",
+                                help="Livello target 1-20 (0 = fino al massimo consentito)",
                             )
                         with _ac3:
                             st.markdown("&nbsp;")
@@ -923,12 +925,14 @@ with tab_villages:
                                      "_uid": uuid.uuid4().hex[:8]}
                                 )
 
-                        # Persistenza: lista di step strutturati
-                        # {"key": ..., "target_level": int} in ordine di coda.
+                        # Persistenza: lista ordinata di step strutturati
+                        # {"key": ..., "target_level": int, "priority": N}
+                        # in ordine di coda (building_queue_plan, v2.0).
                         parsed_focus = [
                             {"key": s["key"],
-                             "target_level": int(s["target_level"])}
-                            for s in queue
+                             "target_level": int(s["target_level"]),
+                             "priority": _pi + 1}
+                            for _pi, s in enumerate(queue)
                         ]
 
                     with p_col2:
@@ -1034,6 +1038,8 @@ with tab_villages:
                         allowed_units=parsed_units,
                         priority_units=list(parsed_units),
                         building_focus=parsed_focus,
+                        building_queue_plan=parsed_focus,
+                        is_bootstrap=old_cfg.is_bootstrap,
                         farm_enabled=old_cfg.farm_enabled,
                         farm_unit=old_cfg.farm_unit,
                         defense_enabled=old_cfg.defense_enabled,
@@ -1748,7 +1754,9 @@ with tab_expansion:
         f_col1, f_col2, f_col3 = st.columns(3)
         with f_col1:
             f_type = st.selectbox(
-                "Filtro tipo:", ["Tutti", "15c", "9c"], key="cropper_f_type"
+                "Filtro tipo:", ["Tutti", "15c", "9c", "6c"],
+                format_func=lambda t: {"6c": "Standard"}.get(t, t),
+                key="cropper_f_type",
             )
         with f_col2:
             f_status = st.selectbox(
@@ -1781,7 +1789,9 @@ with tab_expansion:
                 STATUS_SETTLING: "🚀 Coloni in viaggio",
                 STATUS_SETTLED: "🏘️ Fondato",
             }
-            _type_label = {"15c": "15 Grani", "9c": "9 Grani"}
+            _type_label = {
+                "15c": "15 Grani", "9c": "9 Grani", "6c": "Standard",
+            }
             h = st.columns([1.4, 1.1, 1.2, 2.0, 1.4, 2.0])
             for col, title in zip(h, ("Coordinate", "Tipo", "Distanza", "Oasi Bonus", "Stato", "Azioni")):
                 col.markdown(f"**{title}**")
@@ -1789,7 +1799,10 @@ with tab_expansion:
             for cand in filtered:
                 r = st.columns([1.4, 1.1, 1.2, 2.0, 1.4, 2.0])
                 r[0].write(f"({cand.x} | {cand.y})")
-                r[1].write(_type_label.get(cand.type, cand.type))
+                r[1].write(
+                    _type_label.get(cand.type, cand.type)
+                    + (" \u270b" if getattr(cand, "manual", False) else "")
+                )
                 r[2].write(f"{cand.distance_hours:.1f} ore")
                 oases_txt = ", ".join(
                     f"+{o.get('bonus', 25)}% {o.get('type', 'crop')}"
@@ -1826,6 +1839,58 @@ with tab_expansion:
                                 e_acc.account_id, cand.id, STATUS_PENDING
                             )
                             st.rerun()
+
+        # --- Inserimento manuale candidato ---
+        # Tile conosciuti via passaparola/alleanza: entrano in watchlist
+        # come 'pending' (flag manual) e seguono lo stesso flusso di
+        # approvazione dei candidati rilevati dallo scanner.
+        st.divider()
+        st.markdown("**\u2795 Inserimento Manuale Candidato**")
+        st.caption(
+            "Conosci gia' un tile libero tramite passaparola o alleanza? "
+            "Inseriscilo qui: compare in cima alla watchlist come pending "
+            "e va approvato come gli altri."
+        )
+        m_c1, m_c2, m_c3, m_c4 = st.columns([1.0, 1.0, 1.3, 1.6])
+        with m_c1:
+            m_x = st.number_input(
+                "Coord. X:", min_value=-400, max_value=400, value=0,
+                step=1, key=f"mcx_{e_acc.account_id}",
+            )
+        with m_c2:
+            m_y = st.number_input(
+                "Coord. Y:", min_value=-400, max_value=400, value=0,
+                step=1, key=f"mcy_{e_acc.account_id}",
+            )
+        with m_c3:
+            m_type = st.selectbox(
+                "Tipo:", ["15c", "9c", "Standard"],
+                key=f"mct_{e_acc.account_id}",
+            )
+        with m_c4:
+            st.write(" ")
+            if st.button(
+                "Aggiungi Manualmente",
+                key=f"mcb_{e_acc.account_id}",
+            ):
+                _mtype = "6c" if m_type == "Standard" else m_type
+                _mx, _my = int(m_x), int(m_y)
+                _existing = store.status_at(e_acc.account_id, _mx, _my)
+                if _existing is not None:
+                    st.warning(
+                        f"({_mx}|{_my}) gia' presente in watchlist "
+                        f"(stato: {_existing})."
+                    )
+                else:
+                    _new_c = store.add_manual_candidate(
+                        e_acc.account_id, _mx, _my, _mtype,
+                    )
+                    if _new_c is not None:
+                        st.success(
+                            f"Candidato {_mtype} a ({_mx}|{_my}) aggiunto "
+                            "in cima alla watchlist (pending)."
+                        )
+                        st.rerun()
 
     # --- Smart Building planner: prossimi upgrade stimati per villaggio ---
     st.divider()
