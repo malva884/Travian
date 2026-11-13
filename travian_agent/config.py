@@ -140,7 +140,7 @@ class ScoutBrainConfig:
 
     enabled: bool = False
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
     scan_radius: int = 7                 # raggio di scansione mappa (in campi)
     max_travel_time_minutes: float = 20.0 # tempo massimo di marcia
     min_loot_ratio: float = 0.3          # rapporto minimo bottino / capacità per considerare il target redditizio

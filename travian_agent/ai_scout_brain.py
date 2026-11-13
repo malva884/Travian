@@ -220,7 +220,7 @@ async def gemini_evaluate_farming_targets(
     account_status: dict,
     nearby_targets: list[dict],
     api_key: str = "",
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = "gemini-3.5-flash-lite",
 ) -> list[dict]:
     """Usa Gemini per analizzare i target di saccheggio e decidere quali attaccare.
 
@@ -260,13 +260,39 @@ Compito:
 ]
 """
 
-    try:
-        import google.generativeai as genai  # type: ignore
+    # Modelli EOL (API v1beta deprecata): rimappati su un modello supportato
+    _EOL_MODELS = {
+        "gemini-1.5-flash", "gemini-1.5-flash-latest",
+        "gemini-1.5-pro", "gemini-1.5-pro-latest", "gemini-pro",
+    }
+    if model_name in _EOL_MODELS:
+        logger.info(
+            "Modello Gemini '%s' non piu' supportato: rimappato su gemini-3.5-flash-lite",
+            model_name,
+        )
+        model_name = "gemini-3.5-flash-lite"
 
-        genai.configure(api_key=effective_api_key)
-        model = genai.GenerativeModel(model_name)
-        response = await model.generate_content_async(prompt)
-        recommendations = _extract_json_from_text(response.text)
+    try:
+        response_text = ""
+        try:
+            # SDK attuale (google-genai): supporta i modelli 2.x
+            from google import genai as _genai  # type: ignore
+
+            client = _genai.Client(api_key=effective_api_key)
+            response = await client.aio.models.generate_content(
+                model=model_name, contents=prompt
+            )
+            response_text = response.text or ""
+        except ImportError:
+            # Fallback legacy (google-generativeai, deprecato)
+            import google.generativeai as _legacy  # type: ignore
+
+            _legacy.configure(api_key=effective_api_key)
+            model = _legacy.GenerativeModel(model_name)
+            response = await model.generate_content_async(prompt)
+            response_text = response.text or ""
+
+        recommendations = _extract_json_from_text(response_text)
         if isinstance(recommendations, list):
             logger.info("Gemini AI Scout ha restituito %d raccomandazioni di raid", len(recommendations))
             return recommendations

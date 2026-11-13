@@ -1550,7 +1550,7 @@ with tab_modules:
                     value=mod_acc.scout_brain.gemini_api_key,
                     type="password",
                 )
-                scout_model_opts = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash"]
+                scout_model_opts = ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"]
                 cur_scout_model = mod_acc.scout_brain.gemini_model if mod_acc.scout_brain.gemini_model in scout_model_opts else scout_model_opts[0]
                 scout_model_sel = st.selectbox(
                     "Modello Gemini:",
