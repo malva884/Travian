@@ -1058,13 +1058,23 @@ with tab_villages:
                             if _u not in unit_options:
                                 unit_options.append(_u)
 
+                        # 'default' solo se la chiave non e' gia' in
+                        # session_state (es. preset appena applicato):
+                        # altrimenti Streamlit segnala il doppio valore.
+                        _units_kwargs: dict = {}
+                        if units_widget_key not in st.session_state:
+                            _units_kwargs["default"] = [
+                                u for u in old_cfg.allowed_units
+                                if u in unit_options
+                            ]
+
                         parsed_units = st.multiselect(
                             "Unità Consentite per questo Villaggio:",
                             options=unit_options,
-                            default=[u for u in old_cfg.allowed_units if u in unit_options],
                             format_func=lambda u: unit_display_labels.get(u, u),
-                            key=f"units_{cur_acc.account_id}_{vkey}",
+                            key=units_widget_key,
                             help="Filtra rigorosamente quali unità questo villaggio può addestrare. Lascia vuoto per consentire tutte le unità.",
+                            **_units_kwargs,
                         )
 
                     # --- SOTTOSEZIONE: TARGET TRUPPE (SMART TROOP REPLENISHMENT) ---
