@@ -15,7 +15,14 @@ from .actions import ActionExecutor
 from .ai_scout_brain import AIScoutBrain, assess_account_power
 from .brain import LLMBrain, RuleBasedBrain
 from .browser import TravianBrowser
-from .builder import bootstrap_complete, plan_upgrades, save_build_plan
+from .builder import (
+    bootstrap_complete,
+    crop_threshold,
+    net_crop,
+    plan_upgrades,
+    save_build_plan,
+)
+from .building_prereqs import GID_SMITHY
 from .config import (
     BASE_DIR,
     Settings,
@@ -37,6 +44,11 @@ from .models import (
     GID_WORKSHOP,
     Resources,
     Village,
+)
+from .presets import (
+    detect_tribe_from_keys,
+    detect_tribe_from_labels,
+    resolve_troop_preset,
 )
 from .replenishment import TroopReplenishmentManager
 from .sensors import GameObserver
@@ -62,6 +74,9 @@ _hero_managers: dict[str, HeroManager] = {}
 _defense_managers: dict[str, DefenseManager] = {}
 _replenish_managers: dict[str, TroopReplenishmentManager] = {}
 _war_stores: dict[str, WarStore] = {}
+# Throttle del ciclo Fucina auto (villaggio -> ts ultimo tentativo).
+_last_smithy_try: dict[str, float] = {}
+SMITHY_RETRY_SECONDS = 1800.0  # un tentativo ogni ~30 min per villaggio
 
 
 def _persist_village_coords(
@@ -996,7 +1011,10 @@ async def monitor_all_villages(
                     vcfg_rep = settings.village_config_for(
                         village.name, target_vid
                     )
-                    if vcfg_rep is not None and vcfg_rep.troop_targets:
+                    if vcfg_rep is not None and (
+                        vcfg_rep.troop_targets
+                        or vcfg_rep.troop_replenishment_preset
+                    ):
                         # Scenario 1: report -> blocco target suicida e
                         # congelamento unita' offensive coinvolte.
                         if reports is None:
@@ -1041,9 +1059,27 @@ async def monitor_all_villages(
                             ).items():
                                 queued[_u] = queued.get(_u, 0) + _q
 
+                        # Smart Role Presets: il preset truppe del ruolo
+                        # si fonde nei target (i target manuali hanno
+                        # sempre la precedenza). 'settlers_target' resta
+                        # al modulo espansione (Residenza/Palazzo).
+                        rep_targets = dict(vcfg_rep.troop_targets)
+                        if vcfg_rep.troop_replenishment_preset:
+                            tribe = (
+                                settings.tribe
+                                or detect_tribe_from_keys(troops_now.keys())
+                                or detect_tribe_from_labels(
+                                    vcfg_rep.allowed_units
+                                )
+                            )
+                            for _tk, _tq in resolve_troop_preset(
+                                vcfg_rep.troop_replenishment_preset, tribe
+                            ).items():
+                                rep_targets.setdefault(_tk, _tq)
+
                         # Formula: da_addestrare = target - (attuali + coda)
                         deficit = replenish_mgr.compute_deficit(
-                            vcfg_rep.troop_targets, troops_now, queued
+                            rep_targets, troops_now, queued
                         )
                         # Anti-saturazione (spec 2.1): se il villaggio e'
                         # il fondatore designato o la rete feeder gli sta'
@@ -1087,6 +1123,67 @@ async def monitor_all_villages(
                         "%s Errore modulo replenishment: %s",
                         vprefix, rep_exc,
                     )
+
+            # 4.1.d Automazione Fucina (smithy_auto_upgrade): i ruoli
+            # militari accodano upgrade unita' fino al target, con
+            # throttling per-villaggio e rispetto della Grain Safety Net.
+            try:
+                vcfg_sm = settings.village_config_for(village.name, target_vid)
+                smithy_cfg = (
+                    dict(vcfg_sm.smithy_auto_upgrade)
+                    if vcfg_sm is not None
+                    else {}
+                )
+                smithy = next(
+                    (
+                        f for f in state.interior_fields()
+                        if f.gid == GID_SMITHY and f.level > 0
+                    ),
+                    None,
+                )
+                last_try = _last_smithy_try.get(vname, 0.0)
+                if (
+                    smithy_cfg.get("enabled")
+                    and smithy is not None
+                    and not emergency_locked
+                    and (time.time() - last_try) >= SMITHY_RETRY_SECONDS
+                ):
+                    _last_smithy_try[vname] = time.time()
+                    # Grain Safety Net: upgrade metallurgici solo con
+                    # margine grano sopra soglia.
+                    net = net_crop(state)
+                    thr = crop_threshold(state, settings)
+                    if thr > 0 and net < thr:
+                        logger.info(
+                            "%s Fucina: upgrade sospeso (net crop %d < %d)",
+                            vprefix, net, thr,
+                        )
+                    else:
+                        sm_res = await executor.execute(
+                            Action(
+                                type=ActionType.UPGRADE_UNITS,
+                                params={
+                                    "smithy_slot": smithy.slot_id,
+                                    "target_level": int(
+                                        smithy_cfg.get("target_level") or 20
+                                    ),
+                                    "units": list(
+                                        smithy_cfg.get("priority_units") or []
+                                    ),
+                                },
+                                reason=(
+                                    "Smithy auto-upgrade: potenziamento "
+                                    "unita' fino al liv. "
+                                    f"{smithy_cfg.get('target_level') or 20}"
+                                ),
+                            ),
+                            village_id=target_vid,
+                        )
+                        logger.info("%s Fucina: %s", vprefix, sm_res.message)
+            except Exception as sm_exc:
+                logger.warning(
+                    "%s Errore automazione Fucina: %s", vprefix, sm_exc,
+                )
 
             # 4.2 Modulo espansione: i villaggi non-fondatore con mercato
             # spediscono il surplus al fondatore mentre servono coloni

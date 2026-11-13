@@ -297,6 +297,8 @@ class ActionExecutor:
                 return await self._train_troops(action, village_id=vid_int)
             case ActionType.TRAIN_SETTLERS:
                 return await self._train_settlers(action, village_id=vid_int)
+            case ActionType.UPGRADE_UNITS:
+                return await self._upgrade_smithy_units(action, village_id=vid_int)
             case ActionType.CLAIM_VIDEO_BONUS:
                 return await self._claim_video_bonus(action)
             case ActionType.ALERT:
@@ -1916,6 +1918,138 @@ class ActionExecutor:
             )
 
         return ActionResult(False, "errore invio form addestramento coloni")
+
+    async def _upgrade_smithy_units(
+        self, action: Action, village_id: int = 0
+    ) -> ActionResult:
+        """Accoda un potenziamento unita' in Fucina (smithy_auto_upgrade).
+
+        Naviga a build.php?id=<smithy_slot>, rileva la tribu' dalle icone
+        unita' della pagina, risolve gli slot astratti del preset
+        (infantry_off, ram, ...) nei numeri unita' corretti e clicca il
+        primo upgrade sotto target_level. I link di potenziamento T4
+        portano 'a=<unit>' nell'href, quindi il click avvia il lavoro
+        nella coda ricerca (parallela alla coda costruzioni).
+        """
+        params = action.params or {}
+        smithy_slot = int(
+            params.get("smithy_slot") or params.get("slot_id") or 0
+        )
+        if smithy_slot <= 0:
+            return ActionResult(False, "slot Fucina mancante (smithy_slot)")
+        target_level = int(params.get("target_level") or 20)
+        wanted_units = list(params.get("units") or [])
+
+        page = self.browser.page
+        assert page is not None
+
+        url = f"{selectors.PATH_BUILD}?id={smithy_slot}"
+        if village_id > 0:
+            url += f"&newdid={village_id}"
+        await self.browser.goto(url)
+        await sleep_human(1.0, 1.5)
+
+        from .presets import TRIBE_UNIT_SLOTS  # import ritardato: no cicli
+
+        outcome = await page.evaluate(
+            """
+            (args) => {
+                const slots = args.slots || [];
+                const target = args.target_level || 20;
+                const slotMap = args.slot_map || {};
+                const busyWords =
+                    /max|pieno|fully|complet|in coda|queue|risorse insufficienti/i;
+
+                // 1. Tribu' dalle icone unita' della pagina
+                let tribe = '';
+                for (const el of document.querySelectorAll(
+                    '[class*="unit u"], .unit'
+                )) {
+                    const m = (el.getAttribute('class') || '')
+                        .match(/\\bu(\\d+)\\b/);
+                    if (!m) continue;
+                    const n = parseInt(m[1], 10);
+                    if (n >= 1 && n <= 10) { tribe = 'romans'; break; }
+                    if (n >= 11 && n <= 20) { tribe = 'teutons'; break; }
+                    if (n >= 21 && n <= 30) { tribe = 'gauls'; break; }
+                }
+                if (!tribe) {
+                    return {ok: false, why: 'tribu non rilevata in fucina'};
+                }
+
+                // 2. Insieme unita' richieste (slot astratti o tN/uN diretti)
+                const wanted = new Set();
+                for (const s of slots) {
+                    const k = String(s).trim().toLowerCase();
+                    const direct = k.match(/^[ut](\\d+)$/);
+                    if (direct) { wanted.add(parseInt(direct[1], 10)); continue; }
+                    const mp = slotMap[k];
+                    if (mp && mp[tribe]) {
+                        wanted.add(parseInt(String(mp[tribe]).slice(1), 10));
+                    }
+                }
+
+                // 3. Link di potenziamento unita': T4 usa 'a=<unit>' nel
+                //    contratto della Fucina. Cerca nella riga il livello
+                //    corrente e verifica che sia sotto target.
+                const candidates = [];
+                for (const a of document.querySelectorAll('a[href*="a="]')) {
+                    const href = a.getAttribute('href') || '';
+                    const am = href.match(/[?&]a=(\\d+)/);
+                    if (!am) continue;
+                    const uN = parseInt(am[1], 10);
+                    if (uN < 1 || uN > 30) continue;
+                    if (wanted.size && !wanted.has(uN)) continue;
+                    const row = a.closest(
+                        'tr, li, .buildingDetail, .details, div'
+                    ) || a.parentElement;
+                    const txt = (row && row.innerText) || '';
+                    if (busyWords.test(txt)) continue;
+                    const lm = txt.match(
+                        /(?:livello|level|liv\\.?)\\s*[:.]?\\s*(\\d+)/i
+                    );
+                    const lvl = lm ? parseInt(lm[1], 10) : null;
+                    if (lvl !== null && lvl >= target) continue;
+                    candidates.push({uN: uN, lvl: lvl, el: a});
+                }
+                if (!candidates.length) {
+                    return {
+                        ok: false,
+                        why: 'nessun upgrade fucina disponibile (max/coda/risorse)',
+                    };
+                }
+                candidates.sort((a, b) => (a.lvl ?? 999) - (b.lvl ?? 999));
+                const pick = candidates[0];
+                pick.el.click();
+                return {ok: true, unit: 'u' + pick.uN, level: pick.lvl};
+            }
+            """,
+            {
+                "slots": wanted_units,
+                "target_level": target_level,
+                "slot_map": TRIBE_UNIT_SLOTS,
+            },
+        ) or {}
+
+        if not outcome.get("ok"):
+            return ActionResult(
+                False,
+                str(outcome.get("why") or "upgrade fucina non disponibile"),
+            )
+
+        await sleep_human(
+            self.settings.action_delay_min, self.settings.action_delay_max
+        )
+        logger.info(
+            "Fucina: avviato upgrade %s (liv. %s) nello slot %s, villaggio %s",
+            outcome.get("unit"), outcome.get("level"),
+            smithy_slot, village_id,
+        )
+        return ActionResult(
+            True,
+            f"upgrade fucina avviato per {outcome.get('unit')} "
+            f"(liv. {outcome.get('level')})",
+        )
 
     async def _train_troops(self, action: Action, village_id: int = 0) -> ActionResult:
         """Addestra truppe nella caserma/scuderia per smaltire il surplus.

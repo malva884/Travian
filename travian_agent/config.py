@@ -79,6 +79,18 @@ class VillageConfig:
     # Smart Troop Replenishment: obiettivo numerico per unita' (chiave 'tN'
     # o nome unita'). deficit = target - (truppe a casa + truppe in coda).
     troop_targets: dict[str, int] = field(default_factory=dict)
+    # Smart Role-Based Presets: un template di ruolo e' stato applicato
+    # alla coda edifici/truppe di questo villaggio.
+    preset_applied: bool = False
+    # True = l'utente ha personalizzato la coda o i target dopo il preset:
+    # i cicli successivi rispettano le personalizzazioni.
+    custom_modified: bool = False
+    # Preset Smart Troop Replenishment (schema spec: chiavi
+    # '*_target' -> qty, risolte a runtime per tribu').
+    troop_replenishment_preset: dict = field(default_factory=dict)
+    # Automazione Fucina (ruoli militari): {"enabled", "target_level",
+    # "priority_units"} — priority_units come slot astratti o chiavi tN.
+    smithy_auto_upgrade: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:
@@ -220,6 +232,9 @@ class Settings:
     debug_dir: Path | None = None
     browser_locale: str = "it-IT"
     navigation_timeout_ms: int = 30_000
+    # Tribu' dell'account: 'romans'|'teutons'|'gauls' (vuoto = auto,
+    # rilevata a runtime dalle icone unita'/truppe a casa).
+    tribe: str = ""
     # Profili per-villaggio: chiave = newdid o nome -> VillageConfig
     villages: dict[str, "VillageConfig"] = field(default_factory=dict)
     # DEPRECATO: mappa nome_villaggio -> ruolo, mantenuta per back-compat.
@@ -296,6 +311,7 @@ def _parse_account_item(item: dict) -> Settings:
                             auto_video_bonus=bool(item.get("auto_video_bonus", True)),
                             min_net_crop_threshold=float(item.get("min_net_crop_threshold", 10.0)),
                             strategy_profile=str(item.get("strategy_profile", "balanced")),
+                            tribe=str(item.get("tribe", "") or "").strip().lower(),
                             farming=FarmingConfig(
                                 **{
                                     k: v
@@ -392,6 +408,18 @@ def _parse_account_item(item: dict) -> Settings:
                                         for k, v in dict(cfg.get("troop_targets") or {}).items()
                                         if int(v or 0) > 0
                                     },
+                                    preset_applied=bool(
+                                        cfg.get("preset_applied", False)
+                                    ),
+                                    custom_modified=bool(
+                                        cfg.get("custom_modified", False)
+                                    ),
+                                    troop_replenishment_preset=dict(
+                                        cfg.get("troop_replenishment_preset") or {}
+                                    ),
+                                    smithy_auto_upgrade=dict(
+                                        cfg.get("smithy_auto_upgrade") or {}
+                                    ),
                                 )
                                 for key, cfg in (item.get("villages") or {}).items()
                                 if isinstance(cfg, dict)
@@ -476,6 +504,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
             "auto_video_bonus": acc.auto_video_bonus,
             "min_net_crop_threshold": acc.min_net_crop_threshold,
             "strategy_profile": acc.strategy_profile,
+            "tribe": acc.tribe,
             "farming_settings": {
                 "enabled": acc.farming.enabled,
                 "interval_min_minutes": acc.farming.interval_min_minutes,
@@ -555,6 +584,12 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                     "x": cfg.x,
                     "y": cfg.y,
                     "troop_targets": dict(cfg.troop_targets),
+                    "preset_applied": cfg.preset_applied,
+                    "custom_modified": cfg.custom_modified,
+                    "troop_replenishment_preset": dict(
+                        cfg.troop_replenishment_preset
+                    ),
+                    "smithy_auto_upgrade": dict(cfg.smithy_auto_upgrade),
                 }
                 for key, cfg in acc.villages.items()
             },

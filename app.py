@@ -33,6 +33,14 @@ from travian_agent.cropper import (
     CropperStore,
 )
 from travian_agent.models import STATIC_TROOP_LABELS, VillageRole
+from travian_agent.presets import (
+    allowed_unit_slots_for_role,
+    detect_tribe_from_labels,
+    preset_for_role,
+    resolve_troop_labels,
+    smithy_preset_for_role,
+    troop_preset_for_role,
+)
 
 st.set_page_config(
     page_title="Travian Agent Multi-Account Dashboard",
@@ -178,8 +186,9 @@ def _on_village_account_change() -> None:
         if key.startswith(
             (
                 "role_", "target_", "units_", "focus_", "market_slot_",
-                "coord_x_", "coord_y_", "bqueue_", "fqtgt_", "fqup_",
-                "fqdn_", "fqrm_", "fqadd_", "fqlvl_", "fqbtn_",
+                "coord_x_", "coord_y_", "bqueue_", "bqpreset_", "bqtroop_",
+                "bqsmithy_", "fqtgt_", "fqup_",
+                "fqdn_", "fqrm_", "fqadd_", "fqlvl_", "fqbtn_", "fqprst_",
             )
         ):
             del st.session_state[key]
@@ -523,6 +532,27 @@ with tab_villages:
                 format_func=lambda s: strategy_labels.get(s, s),
                 help="Determina le priorità complessive dell'AccountBrain per il bilanciamento inter-villaggio",
             )
+            tribe_choices = ["auto", "romans", "teutons", "gauls"]
+            tribe_labels = {
+                "auto": "🔎 Auto — rileva la tribù dalle truppe/config",
+                "romans": "🏛️ Romani (t1-t10)",
+                "teutons": "⚔️ Teutoni (t11-t20)",
+                "gauls": "🌿 Galli (t21-t30)",
+            }
+            _tribe_idx = (
+                tribe_choices.index(cur_acc.tribe)
+                if cur_acc.tribe in tribe_choices[1:]
+                else 0
+            )
+            new_tribe = st.selectbox(
+                "Tribù Account:",
+                tribe_choices,
+                index=_tribe_idx,
+                format_func=lambda t: tribe_labels.get(t, t),
+                key=f"tribe_{cur_acc.account_id}",
+                help="Serve a risolvere i preset truppe (es. fanteria base "
+                     "= Legionario/Combattente/Falange). 'Auto' rileva a runtime.",
+            )
 
         # Snapshot in tempo reale da history
         snapshots = get_latest_village_snapshots(cur_acc.account_id)
@@ -550,6 +580,8 @@ with tab_villages:
                             "defensive": "🛡️ Defensive (Scudo)",
                             "croplog": "🌾 Croplog (Capitale)",
                             "feeder": "📦 Feeder (Economico)",
+                            "chiefing": "👑 Chiefing (Espansione/Nobili)",
+                            "early_cropper_founder": "🚀 Founder (Pioniere 15c)",
                             "standard": "⚙️ Standard",
                         }.get(vrole, f"⚙️ {vrole}")
                         target_info = f" ➡️ Target: `{vcfg.target_village}`" if vcfg.target_village else ""
@@ -617,13 +649,18 @@ with tab_villages:
             updated_villages: dict[str, VillageConfig] = {}
             target_options = ["(Nessuno)"] + [k for k in all_known]
 
-            role_choices = ["standard", "hammer", "defensive", "croplog", "feeder"]
+            role_choices = [
+                "standard", "early_cropper_founder", "hammer", "defensive",
+                "croplog", "feeder", "chiefing",
+            ]
             role_labels = {
                 "standard": "standard — Sviluppo bilanciato campi ed edifici",
+                "early_cropper_founder": "founder (Early Cropper/Pioniere 15c) — Avvio rapido, fanteria base + Residenza per i coloni",
                 "hammer": "hammer (Offensivo) — Caserma/Stalla/Fucina + Truppe d'attacco",
                 "defensive": "defensive (Scudo) — Caserma/Mura/Residenza + Truppe difesa",
                 "croplog": "croplog (Capitale) — Focus 100% Grano + Granai/Mulino/Panificio",
                 "feeder": "feeder (Economico) — Mercato/Magazzini + Spedizione surplus al Target",
+                "chiefing": "chiefing (Espansione) — Accademia/Residenza-Palazzo/Municipio per i nobili",
             }
 
             # Chiavi canoniche uniche degli edifici per il multiselect (senza alias duplicati)
@@ -651,6 +688,7 @@ with tab_villages:
                 "rally_point",
                 "residence",
                 "palace",
+                "residence_palace",
                 "town_hall",
                 "treasury",
                 "embassy",
@@ -708,6 +746,7 @@ with tab_villages:
                 "rally_point": "🚩 Punto di Raduno",
                 "residence": "🏠 Residenza (Espansione / Slot fondazione)",
                 "palace": "🏰 Palazzo (Capitale / Espansione)",
+                "residence_palace": "🏠/🏰 Residenza o Palazzo (auto: Residenza, Palazzo in capitale)",
                 "town_hall": "🎉 Municipio (Grandi Feste / Punti Cultura)",
                 "treasury": "💰 Tesoreria (Custodia Artefatti)",
                 "embassy": "🤝 Ambasciata",
@@ -847,9 +886,15 @@ with tab_villages:
                         # Coda per-villaggio in session_state, seedata dalla
                         # config (step dict o chiavi legacy -> target 0).
                         queue_key = f"bqueue_{cur_acc.account_id}_{vkey}"
-                        if queue_key not in st.session_state:
+                        preset_role_key = f"bqpreset_{cur_acc.account_id}_{vkey}"
+                        bqtroop_key = f"bqtroop_{cur_acc.account_id}_{vkey}"
+                        bqsmithy_key = f"bqsmithy_{cur_acc.account_id}_{vkey}"
+                        units_widget_key = f"units_{cur_acc.account_id}_{vkey}"
+
+                        def _queue_from(items) -> list[dict]:
+                            """Normalizza step (dict o chiave legacy) in righe coda."""
                             seeded: list[dict] = []
-                            for _it in old_cfg.building_focus or []:
+                            for _it in items or []:
                                 if isinstance(_it, dict):
                                     _k = str(_it.get("key") or _it.get("gid") or "")
                                     _t = int(_it.get("target_level") or 0)
@@ -861,8 +906,76 @@ with tab_villages:
                                         "key": _k, "target_level": _t,
                                         "_uid": uuid.uuid4().hex[:8],
                                     })
-                            st.session_state[queue_key] = seeded
+                            return seeded
+
+                        if queue_key not in st.session_state:
+                            st.session_state[queue_key] = _queue_from(
+                                old_cfg.building_focus
+                            )
+
+                        # Smart Role-Based Presets: al cambio di ruolo il
+                        # template completo (coda edifici + preset truppe +
+                        # automazione Fucina + unita' consentite) viene
+                        # caricato — UNA volta per selezione, poi le
+                        # modifiche manuali non vengono sovrascritte.
+                        # Il pulsante sotto forza il ricaricamento.
+                        def _apply_role_preset(role: str) -> bool:
+                            """Inietta il template completo del ruolo."""
+                            _steps = preset_for_role(role)
+                            if not _steps:
+                                return False
+                            st.session_state[queue_key] = _queue_from(_steps)
+                            st.session_state[bqtroop_key] = (
+                                troop_preset_for_role(role)
+                            )
+                            st.session_state[bqsmithy_key] = (
+                                smithy_preset_for_role(role)
+                            )
+                            # Sblocca le unita' del ruolo: richiede la
+                            # tribu' (da config account o rilevata dalle
+                            # unita' gia' consentite).
+                            _tribe = (
+                                cur_acc.tribe
+                                or detect_tribe_from_labels(
+                                    old_cfg.allowed_units
+                                )
+                            )
+                            _slots = allowed_unit_slots_for_role(role)
+                            if _tribe and _slots:
+                                st.session_state[units_widget_key] = (
+                                    resolve_troop_labels(_slots, _tribe)
+                                )
+                            return True
+
+                        _preset_applied = False
+                        if (
+                            new_role != (old_cfg.role or "standard")
+                            and st.session_state.get(preset_role_key) != new_role
+                        ):
+                            st.session_state[preset_role_key] = new_role
+                            _preset_applied = _apply_role_preset(new_role)
+
+                        _ph1, _ph2 = st.columns([3.4, 1.1])
+                        with _ph2:
+                            if st.form_submit_button(
+                                "🔄 Applica Preset",
+                                key=f"fqprst_{cur_acc.account_id}_{vkey}",
+                                help=(
+                                    "Sostituisce coda, preset truppe, Fucina "
+                                    "e unita' consentite col template "
+                                    "completo del ruolo selezionato"
+                                ),
+                            ):
+                                _preset_applied = _apply_role_preset(new_role)
+                                if not _preset_applied:
+                                    st.caption("Nessun preset per questo ruolo.")
                         queue: list[dict] = st.session_state[queue_key]
+                        if _preset_applied:
+                            st.caption(
+                                f"📋 Preset '{new_role}' applicato "
+                                f"({len(queue)} step + truppe/Fucina) — "
+                                "modificabile liberamente."
+                            )
 
                         # Righe ordinate: numero, edificio, livello target,
                         # controlli sposta su/giu' e rimuovi. Le chiavi widget
@@ -1031,6 +1144,21 @@ with tab_villages:
                     final_x = parsed_x if (parsed_x != 0 or old_cfg.x == 0) else old_cfg.x
                     final_y = parsed_y if (parsed_y != 0 or old_cfg.y == 0) else old_cfg.y
 
+                    # Flag preset (spec: 'template + overwrite'): la coda
+                    # corrente e' confrontata col template del ruolo; ogni
+                    # deviazione manuale marca custom_modified=true.
+                    _preset_sig = {
+                        s["key"]: int(s["target_level"])
+                        for s in preset_for_role(new_role)
+                    }
+                    _queue_sig = {
+                        s["key"]: int(s["target_level"]) for s in queue
+                    }
+                    custom_mod = (
+                        not _preset_applied
+                        and _preset_sig != _queue_sig
+                    )
+
                     updated_villages[vname] = VillageConfig(
                         name=vname,
                         role=new_role,
@@ -1048,12 +1176,39 @@ with tab_villages:
                         x=int(final_x) if final_x is not None else None,
                         y=int(final_y) if final_y is not None else None,
                         troop_targets=troop_targets,
+                        preset_applied=bool(
+                            old_cfg.preset_applied or _preset_applied
+                        ),
+                        custom_modified=custom_mod,
+                        troop_replenishment_preset=dict(
+                            st.session_state.get(
+                                bqtroop_key,
+                                old_cfg.troop_replenishment_preset,
+                            ) or {}
+                        ),
+                        smithy_auto_upgrade=dict(
+                            st.session_state.get(
+                                bqsmithy_key,
+                                old_cfg.smithy_auto_upgrade,
+                            ) or {}
+                        ),
                     )
 
             save_submitted = st.form_submit_button("💾 Salva Ruoli & Strategia (Applicazione a Caldo)", type="primary")
             if save_submitted:
                 cur_acc.strategy_profile = new_strat
+                cur_acc.tribe = (
+                    "" if new_tribe == "auto" else new_tribe
+                )
                 cur_acc.villages = updated_villages
+                # Founder: il villaggio pioniere diventa il fondatore
+                # designato dell'espansione (scansione cropper attiva).
+                for _fc in updated_villages.values():
+                    if _fc.role == "early_cropper_founder":
+                        if not cur_acc.expansion.founder_village:
+                            cur_acc.expansion.founder_village = _fc.name
+                        cur_acc.expansion.cropper_scan = True
+                        break
                 save_accounts(accounts)
                 st.success("Configurazione villaggi e strategia salvata con successo! L'agente leggerà le modifiche al prossimo ciclo.")
                 time.sleep(1)

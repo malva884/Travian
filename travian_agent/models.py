@@ -56,6 +56,8 @@ class VillageRole(str, Enum):
     DEFENSIVE = "defensive"      # scudo: caserma, residenza, mura, truppe difensive
     CROPLOG = "croplog"          # capitale croplog: focus grano, accetta surplus
     FEEDER = "feeder"            # economico: mercato, spedisce surplus ai target
+    CHIEFING = "chiefing"        # espansione/nobili: accademia, residenza/palazzo, municipio
+    EARLY_CROPPER_FOUNDER = "early_cropper_founder"  # pioniere 15c: avvio rapido + coloni
     STANDARD = "standard"        # nessun profilo: comportamento bilanciato
 
     @classmethod
@@ -65,9 +67,17 @@ class VillageRole(str, Enum):
         aliases = {
             "capital": cls.CROPLOG,
             "croplog_capital": cls.CROPLOG,
+            "cropper": cls.CROPLOG,
             "defence": cls.DEFENSIVE,
             "shield": cls.DEFENSIVE,
+            "anvil": cls.DEFENSIVE,
             "economy": cls.FEEDER,
+            "expansion": cls.CHIEFING,
+            "reclaim": cls.CHIEFING,
+            "noble": cls.CHIEFING,
+            "founder": cls.EARLY_CROPPER_FOUNDER,
+            "pioneer": cls.EARLY_CROPPER_FOUNDER,
+            "early_cropper": cls.EARLY_CROPPER_FOUNDER,
         }
         if normalized in aliases:
             return aliases[normalized]
@@ -232,6 +242,7 @@ class ActionType(str, Enum):
     CLAIM_VIDEO_BONUS = "claim_video_bonus"  # riscatto bonus +15% per 8 ore (video ad)
     SEND_RAID = "send_raid"          # invio raid da farm list (Punto di Raduno)
     SEND_CUSTOM_RAID = "send_custom_raid"  # invio raid dinamico a coordinate libere (AI Scout Brain)
+    UPGRADE_UNITS = "upgrade_units"  # potenziamento unita' in Fucina (smithy_auto_upgrade)
     FOUND_VILLAGE = "found_village"  # fondazione nuovo villaggio via mappa
     ALERT = "alert"          # es. attacco in arrivo: notifica senza agire
     LOGIN = "login"

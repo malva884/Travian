@@ -168,6 +168,9 @@ FOCUS_KEY_GIDS: dict[str, int | tuple[int, ...]] = {
     "market": GID_MARKETPLACE,
     "residence": GID_RESIDENCE,
     "palace": GID_PALACE,
+    # Gruppo alternativo: Residenza, oppure Palazzo (capitale) — usato
+    # dai preset ruolo; il builder sceglie il gid presente/costruibile.
+    "residence_palace": (GID_RESIDENCE, GID_PALACE),
     "treasury": GID_TREASURY,
     "town_hall": GID_TOWN_HALL,
     "hero_mansion": GID_HERO_MANSION,

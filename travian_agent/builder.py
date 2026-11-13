@@ -34,6 +34,7 @@ from .building_prereqs import (
     GID_GRAIN_MILL,
     GID_LABELS,
     GID_MAIN_BUILDING,
+    GID_TOWN_HALL,
     WALL_GIDS,
     gids_for_focus_key,
     prereqs_met,
@@ -80,6 +81,8 @@ _ROLE_INTERIORS: dict[str, tuple[int, ...]] = {
     "defensive": (GID_BARRACKS, GID_RESIDENCE) + WALL_GIDS,
     "croplog": (GID_GRANARY, GID_WAREHOUSE, GID_GRAIN_MILL, GID_BAKERY),
     "feeder": (GID_MARKETPLACE, GID_WAREHOUSE, GID_GRANARY),
+    "chiefing": (GID_ACADEMY, GID_RESIDENCE, GID_TOWN_HALL),
+    "early_cropper_founder": (GID_RESIDENCE, GID_BARRACKS, GID_MARKETPLACE),
 }
 
 
@@ -285,8 +288,8 @@ def grain_safety_intents(state: GameState) -> list[Field]:
     return crop_fields + boosters
 
 
-def _focus_steps(focus_list: list) -> list[tuple[int, int]]:
-    """Normalizza building_queue_plan in step ordinati (gid, target_level).
+def _focus_steps(focus_list: list) -> list[tuple[tuple[int, ...], int]]:
+    """Normalizza building_queue_plan in step ordinati (gruppo gid, target).
 
     Ogni elemento puo' essere:
     - una stringa chiave legacy (es. "barracks", "cropland");
@@ -297,6 +300,10 @@ def _focus_steps(focus_list: list) -> list[tuple[int, int]]:
     posizione nella lista); le chiavi legacy mantengono l'ordine dato.
     target_level 0/assente = fino al massimo consentito (comportamento
     legacy).
+
+    Le chiavi che mappano a piu' gid (es. "city_wall" -> le tre mura
+    tribali, "residence_palace" -> Residenza/Palazzo) producono UN
+    solo step-gruppo: i gid sono ALTERNATIVE, non requisiti multipli.
     """
     indexed: list[tuple[int, object]] = []
     for pos, item in enumerate(focus_list or []):
@@ -309,7 +316,7 @@ def _focus_steps(focus_list: list) -> list[tuple[int, int]]:
         indexed.append((prio, item))
     indexed.sort(key=lambda t: t[0])
 
-    steps: list[tuple[int, int]] = []
+    steps: list[tuple[tuple[int, ...], int]] = []
     for _prio, item in indexed:
         target = 0
         if isinstance(item, dict):
@@ -326,17 +333,73 @@ def _focus_steps(focus_list: list) -> list[tuple[int, int]]:
             )
         else:
             gids = gids_for_focus_key(str(item))
-        steps.extend((g, target) for g in gids if g > 0)
+        group = tuple(g for g in gids if g > 0)
+        if group:
+            steps.append((group, target))
     return steps
+
+
+def _detect_tribe(state: GameState) -> str:
+    """Deduce la tribu' del villaggio ('romans'|'teutons'|'gauls'|'').
+
+    Fonte: icone unita' lette dai sensori in troops_home — chiavi
+    'u1'..'u30' (o 't1'..'t30'): 1-10 Romani, 11-20 Teutoni, 21-30 Galli.
+    """
+    for key in (state.troops_home or {}):
+        k = str(key).strip().lower()
+        digits = k.lstrip("ut")
+        if not digits.isdigit() or not k or k[0] not in "ut":
+            continue
+        n = int(digits)
+        if 1 <= n <= 10:
+            return "romans"
+        if 11 <= n <= 20:
+            return "teutons"
+        if 21 <= n <= 30:
+            return "gauls"
+    return ""
+
+
+# Mura costruibili per tribu' (la chiave 'city_wall' mappa al gruppo).
+_TRIBE_WALL_GID: dict[str, int] = {
+    "romans": WALL_GIDS[0],   # mura cittadine
+    "teutons": WALL_GIDS[1],  # terrapieno
+    "gauls": WALL_GIDS[2],    # staccionata
+}
+
+
+def _pick_group_gid(state: GameState, gids: tuple[int, ...]) -> int:
+    """Sceglie il gid da costruire dentro un gruppo di alternative.
+
+    - Mura: dipende dalla tribu' rilevata; se sconosciuta si usa il gid
+      romano come default (caso piu' comune) — il contratto di
+      costruzione fallira' comunque apertamente se la tribu' non lo
+      consente, evitando però di provare tutti i gid a caso.
+    - Residenza/Palazzo: se esiste il Palazzo (capitale) lo step e' gia'
+      coperto dagli interni; qui si sceglie la Residenza per i
+      non-capitali.
+    - Default: primo gid del gruppo i cui prerequisiti reggono.
+    """
+    if len(gids) == 1:
+        return gids[0]
+    if set(gids) == set(WALL_GIDS):
+        tribe = _detect_tribe(state)
+        return _TRIBE_WALL_GID.get(tribe, WALL_GIDS[0])
+    for gid in gids:
+        ok, _why = prereqs_met(state.fields, gid, is_capital(state))
+        if ok:
+            return gid
+    return gids[0]
 
 
 def focus_intents(state: GameState, settings: Settings) -> list[Field]:
     """Field candidati dalla coda prioritaria building_queue_plan.
 
-    Ogni step e' (gid, target_level): il builder lo salta quando il
-    target e' raggiunto — campi risorsa: nessun campo sotto target;
+    Ogni step e' (gruppo gid, target_level): il builder lo salta quando
+    il target e' raggiunto — campi risorsa: nessun campo sotto target;
     edifici: almeno un'istanza al target. Edificio assente -> nuova
-    costruzione se i prerequisiti reggono.
+    costruzione se i prerequisiti reggono. I gruppi multi-gid (mura,
+    Residenza/Palazzo) sono alternative: basta UNA delle varianti.
     """
     vcfg = settings.village_config_for(state.village_name, state.village_id)
     plan = []
@@ -346,9 +409,9 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
         return []
     queued = queued_slot_ids(state)
     out: list[Field] = []
-    for gid, target in _focus_steps(plan):
-        if gid in FIELD_GID_TYPES:
-            rtype = FIELD_GID_TYPES[gid]
+    for gids, target in _focus_steps(plan):
+        if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
+            rtype = FIELD_GID_TYPES[gids[0]]
             matches = [
                 f for f in upgradeable_fields(state, state.resource_fields())
                 if f.resource_type is rtype
@@ -358,9 +421,9 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
         else:
             interiors = [
                 f for f in state.interior_fields()
-                if f.gid == gid and f.gid > 0
+                if f.gid in gids and f.gid > 0
             ]
-            # Step raggiunto: un'istanza esistente e' gia' al target.
+            # Step raggiunto: un'istanza qualsiasi del gruppo e' al target.
             if target > 0 and any(f.level >= target for f in interiors):
                 continue
             matches = [
@@ -371,7 +434,9 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
             ]
             out.extend(sorted(matches, key=lambda f: (f.level, f.slot_id)))
             if not interiors:
-                # Edificio focus assente: nuova costruzione se possibile.
+                # Nessuna variante presente: costruisci quella adatta
+                # alla tribu'/capitale (o la prima costruibile).
+                gid = _pick_group_gid(state, gids)
                 out.extend(
                     new_building_intents(
                         state, (gid,), {f.slot_id for f in out}
