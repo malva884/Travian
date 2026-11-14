@@ -85,6 +85,57 @@ def parse_timer(text: str | None) -> int:
     return int(timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds).total_seconds())
 
 
+def _italian_plurals(word: str) -> list[str]:
+    """Plurali possibili di una parola italiana (euristica semplice)."""
+    w = str(word or "").strip().lower()
+    if len(w) < 2:
+        return []
+    if w.endswith("io"):
+        return [w[:-1], w[:-1] + "i"]  # legionario->legionari(/i)
+    if w.endswith("o"):
+        return [w[:-1] + "i"]
+    if w.endswith("a"):
+        return [w[:-1] + "e"]
+    if w.endswith("e"):
+        return [w[:-1] + "i"]
+    if w.endswith("ca") or w.endswith("ga"):
+        return [w + "he"]
+    return []
+
+
+def _troop_label_map() -> dict[str, str]:
+    """{'legionario': 'u1', 'legionari': 'u1', ...} per il parser truppe.
+
+    Mappa i nomi localizzati delle unita' (singolare + plurale italiano)
+    nelle chiavi icona 'uN', usata dal fallback testuale di
+    ``_read_troops_dom`` quando il markup non espone le classi 'unit uN'
+    (spec bugfix parser truppe / Potenza Militare=0).
+    """
+    try:
+        from .models import STATIC_TROOP_LABELS  # import ritardato: no cicli
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, str] = {}
+    for tkey, name in STATIC_TROOP_LABELS.items():
+        low = str(name or "").strip().lower()
+        if not low or not tkey.startswith("t"):
+            continue
+        ukey = "u" + tkey[1:]
+        out[low] = ukey
+        # plurale italiano via _italian_plurals:
+        # (Legionario->Legionari, Paladino->Paladini,
+        #  Catapulta->Catapulte, Falange->Falangi)
+        for plural in _italian_plurals(low):
+            out[plural] = ukey
+        # nomi composti: plurale della prima parola
+        # ("catapulta da fuoco" -> "catapulte da fuoco")
+        if " " in low:
+            first, rest = low.split(" ", 1)
+            for plural in _italian_plurals(first):
+                out[plural + " " + rest] = ukey
+    return out
+
+
 def guess_resource_type(name: str) -> ResourceType | None:
     lowered = name.lower()
     for res_type, keywords in _RESOURCE_KEYWORDS.items():
@@ -1217,11 +1268,16 @@ class TravianParser:
             return (0, 0, 0)
 
     async def read_troops_home(self, rally_slot: int = 0, village_id: int = 0) -> dict[str, int]:
-        """Legge le truppe presenti nel villaggio dalla panoramica del
-        Punto di Raduno (o dal box truppe della sidebar).
+        """Legge le truppe presenti nel villaggio.
 
-        Ritorna {nome_unita_normalizzato: quantita'}; dict vuoto se la
-        pagina non espone i dati.
+        Fonte primaria: panoramica del Punto di Raduno (build.php?id=slot).
+        Fallback: box "Unita'" della panoramica villaggio (dorf1.php) —
+        richiesto dal bugfix parser truppe (Potenza Militare=0): se il
+        markup della pagina rally non espone i conteggi nel formato
+        atteso, la lettura non si arrende al primo selettore fallito.
+
+        Ritorna {'uN': quantita'}; dict vuoto solo se nessuna delle
+        pagine espone i dati.
         """
         if not self.page:
             return {}
@@ -1236,50 +1292,122 @@ class TravianParser:
                 )
             except Exception:
                 pass
-        try:
-            data = await self.page.evaluate("""
-                () => {
-                    const out = {};
-                    // Box truppe sidebar o panoramica rally point:
-                    // icone 'unit uN' affiancate dal numero di truppe.
-                    const containers = document.querySelectorAll(
-                        '#sidebarBoxTroop, #troops, .troop_details, .troopDetails, ' +
-                        'table.troop_details, #build .troop, .troopHeadline, #content'
+        units = await self._read_troops_dom()
+        if not units:
+            # Fallback panoramica: il box 'Unita' di dorf1.php mostra i
+            # contingenti del villaggio anche quando la pagina rally ha
+            # un markup diverso (spec bugfix parser truppe).
+            try:
+                await self.page.goto(
+                    urljoin(
+                        self.page.url or "",
+                        selectors.PATH_DORF1
+                        + (f"?newdid={village_id}" if village_id else ""),
+                    ),
+                    wait_until="domcontentloaded",
+                )
+                units = await self._read_troops_dom()
+            except Exception:
+                pass
+        if not units:
+            try:
+                logger.debug(
+                    "read_troops_home: nessuna truppa letta su %s "
+                    "(dorf1/rally), pagina=%s",
+                    f"newdid={village_id}",
+                    (self.page.url or "")[:120],
+                )
+            except Exception:
+                pass
+        return units
+
+    async def _read_troops_dom(self) -> dict[str, int]:
+        """Estrae {'uN': qty} dalla pagina corrente.
+
+        Parser tollerante al markup (T4.4/T4.6): la quantita' viene
+        cercata in catena — cella dell'icona, cella adiacente,
+        genitore, prima cella solo-numerica della riga. Se non ci sono
+        icone 'unit uN', fallback testuale su righe "Nome Unita' NNN"
+        con mappa nomi localizzati -> uN (spec bugfix parser truppe).
+        """
+        data = await self.page.evaluate(
+            """
+            (params) => {
+                const out = {};
+                const labelMap = params.labels || {};
+                const num = (t) => {
+                    const m = String(t || '').match(/(\\d[\\d.]*)/);
+                    return m ? parseInt(m[1].replace(/\\./g, ''), 10) : 0;
+                };
+                // 1) Icone 'unit uN': scope documento, dedup per nodo
+                //    DOM (stessa icona non conta due volte; icone
+                //    diverse della stessa uN si sommano = contingenti
+                //    multipli a casa).
+                const icons = document.querySelectorAll(
+                    'img[class*="unit"], i[class*="unit"], ' +
+                    'a[class*="unit"], span[class*="unit"], ' +
+                    '[class*=" unit u"], [class*="unit u"]'
+                );
+                const seen = new Set();
+                icons.forEach(icon => {
+                    if (seen.has(icon)) return;
+                    seen.add(icon);
+                    const cls = icon.getAttribute('class') || '';
+                    const m = cls.match(/(?:^|[\\s_\\-])u(\\d{1,2})(?=[\\s\\-]|$)/);
+                    if (!m) return;
+                    const key = 'u' + m[1];
+                    let qty = 0;
+                    const cell = icon.closest(
+                        'td, a, li, .col, .unit, .troop, div'
                     );
-                    const seen = new Set();
-                    containers.forEach(c => {
-                        c.querySelectorAll('img.unit, span.unit, i.unit, [class*="unit u"], img[class*="u"]').forEach(icon => {
-                            const cls = icon.getAttribute('class') || '';
-                            const m = cls.match(/u(\\d+)/);
-                            if (!m) return;
-                            const key = 'u' + m[1];
-                            if (seen.has(key + ':' + cls)) return;
-                            seen.add(key + ':' + cls);
-                            // Cerca il numero piu' vicino (fratello o genitore)
-                            let numText = '';
-                            let el = icon.nextElementSibling;
-                            if (el && /[0-9]/.test(el.innerText || '')) numText = el.innerText;
-                            if (!numText && icon.parentElement) {
-                                const pm = (icon.parentElement.innerText || '').match(/([0-9][0-9.]*)/);
-                                if (pm) numText = pm[1];
+                    if (cell) {
+                        qty = num(cell.innerText || '');
+                        if (!qty && cell.nextElementSibling)
+                            qty = num(cell.nextElementSibling.innerText || '');
+                        if (!qty && cell.parentElement)
+                            qty = num(cell.parentElement.innerText || '');
+                    }
+                    if (!qty) {
+                        const row = icon.closest('tr, li');
+                        if (row) {
+                            const cells = row.querySelectorAll('td, span, div');
+                            for (const c of cells) {
+                                if (c === cell || c.contains(icon)) continue;
+                                const t = (c.innerText || '').trim();
+                                if (/^\\d[\\d.]*$/.test(t)) { qty = num(t); break; }
                             }
-                            const qty = parseInt((numText || '').replace(/[^0-9]/g, ''), 10) || 0;
-                            out[key] = (out[key] || 0) + qty;
-                        });
+                        }
+                    }
+                    if (qty > 0) out[key] = (out[key] || 0) + qty;
+                });
+                // 2) Fallback testuale: righe 'Nome Unita' 826' senza icone.
+                if (!Object.keys(out).length) {
+                    const rows = document.querySelectorAll(
+                        'tr, li, .troop_details div, .troopDetails div'
+                    );
+                    rows.forEach(r => {
+                        const raw = (r.innerText || '').replace(/\\s+/g, ' ').trim();
+                        const low = raw.toLowerCase();
+                        for (const name in labelMap) {
+                            const idx = low.indexOf(name);
+                            if (idx >= 0) {
+                                const q = num(low.slice(idx + name.length));
+                                if (q > 0) {
+                                    const k = labelMap[name];
+                                    out[k] = Math.max(out[k] || 0, q);
+                                }
+                                break;
+                            }
+                        }
                     });
-                    // Etichette testuali delle truppe, se presenti
-                    const labels = {};
-                    document.querySelectorAll('.unit-name, .unitName, td.unit, .troop').forEach(el => {
-                        const t = (el.innerText || '').trim().toLowerCase();
-                        if (t && t.length < 40) labels[t] = true;
-                    });
-                    return { units: out, labels: Object.keys(labels) };
                 }
-            """)
-            units = (data or {}).get("units") or {}
-            return {str(k): safe_int(v) for k, v in units.items() if safe_int(v) > 0}
-        except Exception:
-            return {}
+                return { units: out };
+            }
+            """,
+            {"labels": _troop_label_map()},
+        )
+        units = (data or {}).get("units") or {}
+        return {str(k): safe_int(v) for k, v in units.items() if safe_int(v) > 0}
 
     async def read_training_queue(
         self, trainer_slot: int, village_id: int = 0

@@ -429,6 +429,7 @@ class FarmTargetStore:
         origin_y: int,
         nearest_village: str = "",
         skip_names: set[str] | None = None,
+        skip_coords: set[tuple[int, int]] | None = None,
     ) -> int:
         """Registra i tile razziabili trovati dalla scansione mappa.
 
@@ -438,6 +439,9 @@ class FarmTargetStore:
         Ritorna il numero di NUOVI target inseriti come pending.
         """
         skip = {n.strip().lower() for n in (skip_names or set()) if n}
+        skip_c = {
+            (int(cx), int(cy)) for cx, cy in (skip_coords or set())
+        }
         new_count = 0
         with self._lock:
             self._load()
@@ -446,6 +450,8 @@ class FarmTargetStore:
                     x, y = int(tile["x"]), int(tile["y"])
                 except (KeyError, TypeError, ValueError):
                     continue
+                if (x, y) in skip_c:
+                    continue  # villaggio proprio (filtro coordinate)
                 is_oasis = bool(tile.get("is_oasis"))
                 name = str(
                     tile.get("village_name") or tile.get("name") or ""
@@ -487,6 +493,41 @@ class FarmTargetStore:
                 self.account_id, new_count,
             )
         return new_count
+
+    def purge_coords(self, coords: set[tuple[int, int]]) -> int:
+        """Rimuove dallo store i record alle coordinate date.
+
+        Pulizia anti propri-villaggi (spec bugfix radar): qualunque
+        record — a prescindere dallo stato — che coincida con un
+        villaggio attivo dell'account viene eliminato: un villaggio
+        proprio non e' mai un bersaglio di raid lecito. Ritorna il
+        numero di record rimossi.
+        """
+        norm = {
+            (int(cx), int(cy)) for cx, cy in (coords or set())
+            if cx is not None and cy is not None
+        }
+        if not norm:
+            return 0
+        with self._lock:
+            self._load()
+            before = len(self._data)
+            self._data = [
+                raw for raw in self._data
+                if (
+                    int(raw.get("x", 0)), int(raw.get("y", 0))
+                ) not in norm
+            ]
+            removed = before - len(self._data)
+            if removed:
+                logger.info(
+                    "FarmTargetStore[%s]: rimossi %d record di villaggi "
+                    "propri (%s).",
+                    self.account_id, removed,
+                    ", ".join(f"({cx}|{cy})" for cx, cy in sorted(norm)),
+                )
+                self._save()
+        return removed
 
     # --------------------------------------------------------------
     # Esiti raid (Step 3 spec): report -> loot ratio / auto-blacklist

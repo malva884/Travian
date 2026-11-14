@@ -28,6 +28,11 @@ from travian_agent.config import (
     save_accounts,
     save_env_settings,
 )
+from travian_agent.config_engine import (
+    evaluate_config_preview,
+    generate_role_config,
+    village_state_from_snapshot,
+)
 from travian_agent.cropper import (
     STATUS_APPROVED,
     STATUS_PENDING,
@@ -1282,6 +1287,37 @@ if page == "Villaggi":
                                 old_cfg.building_focus
                             )
 
+                        def _detect_tribe() -> str:
+                            """Rileva la tribu' per il seed unita'.
+
+                            Catena di fallback (bugfix preset): config
+                            account -> snapshot storico -> allowed_units
+                            di QUESTO villaggio -> allowed_units degli
+                            altri villaggi dell'account (la tribu' e'
+                            una sola per account). Senza questa catena
+                            un villaggio appena fondato — niente tribu'
+                            in config, niente unita' gia' impostate,
+                            niente truppe lette — non seedava mai le
+                            'Unita' Addestrabili Consentite'.
+                            """
+                            _t = (cur_acc.tribe or "").strip().lower()
+                            if _t:
+                                return _t
+                            _t = village_state_from_snapshot(
+                                snapshots.get(vname, {})
+                            ).tribe
+                            if _t:
+                                return _t
+                            _labels: list[str] = list(
+                                old_cfg.allowed_units or []
+                            )
+                            for _vc in (cur_acc.villages or {}).values():
+                                _labels.extend(
+                                    getattr(_vc, "allowed_units", None)
+                                    or []
+                                )
+                            return detect_tribe_from_labels(_labels)
+
                         # Smart Role-Based Presets: al cambio di ruolo il
                         # template completo (coda edifici + preset truppe +
                         # automazione Fucina + unita' consentite) viene
@@ -1289,10 +1325,23 @@ if page == "Villaggi":
                         # modifiche manuali non vengono sovrascritte.
                         # Il pulsante sotto forza il ricaricamento.
                         def _apply_role_preset(role: str) -> bool:
-                            """Inietta il template completo del ruolo."""
+                            """Inietta il template del ruolo adattato."""
                             _steps = preset_for_role(role)
                             if not _steps:
                                 return False
+                            # Role-Aware Configurator (spec): il template
+                            # viene adattato alle capacita' strutturali
+                            # del villaggio — upgrade Magazzino/Granaio
+                            # auto-inseriti prima degli step non capienti,
+                            # target truppe scalati al Net Crop Cap (75%
+                            # della produzione lorda) e unita' filtrate
+                            # per edificio produttore.
+                            _vstate = village_state_from_snapshot(
+                                snapshots.get(vname, {})
+                            )
+                            _gen = generate_role_config(_vstate, role)
+                            if _gen.get("building_queue"):
+                                _steps = _gen["building_queue"]
                             st.session_state[queue_key] = _queue_from(_steps)
                             st.session_state[bqtroop_key] = (
                                 troop_preset_for_role(role)
@@ -1301,18 +1350,68 @@ if page == "Villaggi":
                                 smithy_preset_for_role(role)
                             )
                             # Sblocca le unita' del ruolo: richiede la
-                            # tribu' (da config account o rilevata dalle
-                            # unita' gia' consentite).
-                            _tribe = (
-                                cur_acc.tribe
-                                or detect_tribe_from_labels(
-                                    old_cfg.allowed_units
-                                )
-                            )
+                            # tribu' (catena di fallback completa —
+                            # vedi _detect_tribe).
+                            _tribe = _detect_tribe()
                             _slots = allowed_unit_slots_for_role(role)
                             if _tribe and _slots:
                                 st.session_state[units_widget_key] = (
                                     resolve_troop_labels(_slots, _tribe)
+                                )
+                            # Target truppe adattivi: seed dei widget
+                            # ttgt_* (chiave per-unita', scritta prima del
+                            # mount -> il widget la adotta al prossimo run).
+                            _tt_seed = {
+                                STATIC_TROOP_LABELS.get(u, u): int(q)
+                                for u, q in (
+                                    _gen.get("troop_targets") or {}
+                                ).items()
+                            }
+                            st.session_state[
+                                f"ttseed_{cur_acc.account_id}_{vkey}"
+                            ] = _tt_seed
+                            for _lbl, _q in _tt_seed.items():
+                                _slug = re.sub(
+                                    r"[^a-z0-9]+", "_", str(_lbl).lower()
+                                )
+                                st.session_state[
+                                    f"ttgt_{cur_acc.account_id}_{vkey}_{_slug}"
+                                ] = int(_q)
+                            # Firma del profilo auto-generato: i badge
+                            # Auto/Modificato confrontano i campi con
+                            # questa (o col preset base se assente).
+                            st.session_state[
+                                f"bqauto_{cur_acc.account_id}_{vkey}"
+                            ] = {
+                                "queue": {
+                                    s["key"]: int(s["target_level"])
+                                    for s in _steps
+                                },
+                                "units": list(
+                                    st.session_state.get(
+                                        units_widget_key
+                                    ) or []
+                                ),
+                                "targets": dict(_tt_seed),
+                            }
+                            if _gen.get("storage_auto_inserted"):
+                                st.toast(
+                                    "📦 Storage auto-inseriti: "
+                                    + ", ".join(
+                                        f"{x['key']}→{x['target_level']}"
+                                        for x in _gen[
+                                            "storage_auto_inserted"
+                                        ]
+                                    )
+                                )
+                            if _gen.get("excluded_units"):
+                                st.toast(
+                                    "⚠️ Unità escluse (edificio produttore "
+                                    "assente): "
+                                    + ", ".join(
+                                        x["unit"]
+                                        for x in _gen["excluded_units"]
+                                    )
                                 )
                             return True
 
@@ -1324,8 +1423,54 @@ if page == "Villaggi":
                             st.session_state[preset_role_key] = new_role
                             _preset_applied = _apply_role_preset(new_role)
 
-                        _ph1, _ph2 = st.columns([3.4, 1.1])
+                        _ph1, _ph2, _ph3 = st.columns([2.4, 0.9, 1.1])
+                        with _ph1:
+                            # Badge origine (spec 2.1): Auto se la coda
+                            # coincide col profilo generato/preset,
+                            # Modificato se personalizzata a mano.
+                            _auto_rec = st.session_state.get(
+                                f"bqauto_{cur_acc.account_id}_{vkey}"
+                            ) or {}
+                            _auto_q = _auto_rec.get("queue") or {
+                                s["key"]: int(s["target_level"])
+                                for s in preset_for_role(new_role)
+                            }
+                            if _auto_q:
+                                _cur_q = st.session_state.get(queue_key) or []
+                                _q_sig = {
+                                    s["key"]: int(s.get("target_level") or 0)
+                                    for s in _cur_q
+                                }
+                                _q_badge = (
+                                    "🤖 Auto"
+                                    if _q_sig == _auto_q
+                                    else "✏️ Modificato"
+                                )
+                                st.caption(f"Origine: **{_q_badge}**")
                         with _ph2:
+                            if st.form_submit_button(
+                                "↺ Coda",
+                                key=f"fqrst_{cur_acc.account_id}_{vkey}",
+                                help=(
+                                    "Ripristina SOLO la coda edifici dal "
+                                    "profilo ruolo+capacita' (spec "
+                                    "'Ripristina Default Ruolo')"
+                                ),
+                            ):
+                                _rg = generate_role_config(
+                                    village_state_from_snapshot(
+                                        snapshots.get(vname, {})
+                                    ),
+                                    new_role,
+                                )
+                                _steps = _rg.get("building_queue") or (
+                                    preset_for_role(new_role)
+                                )
+                                if _steps:
+                                    st.session_state[queue_key] = _queue_from(
+                                        _steps
+                                    )
+                        with _ph3:
                             if st.form_submit_button(
                                 "🔄 Applica Preset",
                                 key=f"fqprst_{cur_acc.account_id}_{vkey}",
@@ -1492,27 +1637,136 @@ if page == "Villaggi":
                             **_units_kwargs,
                         )
 
+                        # Badge origine + ripristina sezione (spec 2.1).
+                        _ub1, _ub2 = st.columns([2.6, 1.0])
+                        with _ub1:
+                            _auto_u = (
+                                st.session_state.get(
+                                    f"bqauto_{cur_acc.account_id}_{vkey}"
+                                ) or {}
+                            ).get("units")
+                            if _auto_u:
+                                _u_badge = (
+                                    "🤖 Auto"
+                                    if sorted(parsed_units)
+                                    == sorted(_auto_u)
+                                    else "✏️ Modificato"
+                                )
+                                st.caption(f"Origine: **{_u_badge}**")
+                        with _ub2:
+                            # on_click (non il corpo del submit): il
+                            # callback gira PRIMA che i widget vengano
+                            # istanziati -> scrivere units_widget_key e
+                            # ttgt_* e' consentito; scritture nel corpo
+                            # (dopo il mount del multiselect) causano
+                            # StreamlitWidgetAlreadyInstantiatedError.
+                            def _reset_troops_cb() -> None:
+                                _rg2 = generate_role_config(
+                                    village_state_from_snapshot(
+                                        snapshots.get(vname, {})
+                                    ),
+                                    new_role,
+                                )
+                                _tribe2 = _detect_tribe()
+                                _slots2 = allowed_unit_slots_for_role(
+                                    new_role
+                                )
+                                if _tribe2 and _slots2:
+                                    st.session_state[units_widget_key] = (
+                                        resolve_troop_labels(
+                                            _slots2, _tribe2
+                                        )
+                                    )
+                                _tt2 = {
+                                    STATIC_TROOP_LABELS.get(u, u): int(q)
+                                    for u, q in (
+                                        _rg2.get("troop_targets") or {}
+                                    ).items()
+                                }
+                                st.session_state[
+                                    f"ttseed_{cur_acc.account_id}_{vkey}"
+                                ] = _tt2
+                                for _l2, _q2 in _tt2.items():
+                                    _sl2 = re.sub(
+                                        r"[^a-z0-9]+", "_",
+                                        str(_l2).lower(),
+                                    )
+                                    st.session_state[
+                                        f"ttgt_{cur_acc.account_id}_{vkey}_{_sl2}"
+                                    ] = int(_q2)
+
+                            st.form_submit_button(
+                                "↺ Truppe",
+                                key=f"fursp_{cur_acc.account_id}_{vkey}",
+                                help=(
+                                    "Ripristina SOLO unita' e target dal "
+                                    "profilo ruolo+capacita' (spec "
+                                    "'Ripristina Default Ruolo')"
+                                ),
+                                on_click=_reset_troops_cb,
+                            )
+
                     # --- SOTTOSEZIONE: TARGET TRUPPE (SMART TROOP REPLENISHMENT) ---
                     target_units = list(dict.fromkeys(
                         list(parsed_units) + list(old_cfg.troop_targets.keys())
                     ))
                     troop_targets: dict[str, int] = {}
                     if target_units:
+                        _tt_seed = st.session_state.get(
+                            f"ttseed_{cur_acc.account_id}_{vkey}"
+                        ) or {}
                         st.markdown("###### 🎯 Obiettivi Numerici (Smart Troop Replenishment)")
                         st.caption("Target di truppe stabili (presenti + in coda): il bot colmerà automaticamente il deficit post-battaglia.")
                         t_cols = st.columns(min(4, max(1, len(target_units))))
                         for t_idx, t_unit in enumerate(target_units):
                             with t_cols[t_idx % len(t_cols)]:
                                 display_name = unit_short_names.get(t_unit, t_unit)
+                                # Chiave per-unita' (slug): il preset
+                                # adattivo la pre-compila in session_state
+                                # prima del mount del widget.
+                                _tslug = re.sub(
+                                    r"[^a-z0-9]+", "_",
+                                    str(t_unit).lower(),
+                                )
                                 troop_targets[t_unit] = st.number_input(
                                     f"Target {display_name}:",
                                     min_value=0,
                                     max_value=100000,
-                                    value=int(old_cfg.troop_targets.get(t_unit, 0) or 0),
+                                    value=int(
+                                        _tt_seed.get(
+                                            t_unit,
+                                            old_cfg.troop_targets.get(
+                                                t_unit, 0
+                                            ),
+                                        ) or 0
+                                    ),
                                     step=10,
-                                    key=f"ttgt_{cur_acc.account_id}_{vkey}_{t_idx}",
+                                    key=(
+                                        f"ttgt_{cur_acc.account_id}_"
+                                        f"{vkey}_{_tslug}"
+                                    ),
                                     help=f"Quantità minima da mantenere per {t_unit}. 0 = non riaddestrare.",
                                 )
+                        # Badge origine target (spec 2.1).
+                        _auto_t = (
+                            st.session_state.get(
+                                f"bqauto_{cur_acc.account_id}_{vkey}"
+                            ) or {}
+                        ).get("targets")
+                        if _auto_t:
+                            _t_badge = (
+                                "🤖 Auto"
+                                if {
+                                    u: int(q) for u, q in
+                                    troop_targets.items() if int(q) > 0
+                                } == {
+                                    u: int(q)
+                                    for u, q in _auto_t.items()
+                                    if int(q) > 0
+                                }
+                                else "✏️ Modificato"
+                            )
+                            st.caption(f"Origine: **{_t_badge}**")
                     troop_targets = {
                         u: q for u, q in troop_targets.items() if int(q) > 0
                     }
@@ -1583,6 +1837,88 @@ if page == "Villaggi":
                         not _preset_applied
                         and _preset_sig != _queue_sig
                     )
+
+                    # --- LIVE PREVIEW & FATTIBILITA' (spec 2.2): metriche
+                    # pure sulla bozza corrente — il DnD della coda emette
+                    # un rerun a ogni modifica, quindi le metriche si
+                    # riallineano istantaneamente; i widget del form si
+                    # aggiornano al submit (batching Streamlit).
+                    _pv_snap = snapshots.get(vname) or {}
+                    if _pv_snap:
+                        _pv = evaluate_config_preview(
+                            village_state_from_snapshot(_pv_snap),
+                            {
+                                "building_queue": queue,
+                                "troop_targets": troop_targets,
+                            },
+                        )
+                        with st.container(border=True):
+                            st.markdown("**🔎 Live Preview & Fattibilità**")
+                            _pv1, _pv2, _pv3, _pv4 = st.columns(4)
+                            _nc = int(_pv["projected_net_crop"])
+                            _nc_col = {
+                                "ok": "orange",
+                                "warning": "orange",
+                                "danger": "red",
+                            }.get(_pv["net_crop_status"], "blue")
+                            _pv1.markdown(
+                                "Net Crop a regime\n\n"
+                                f":{_nc_col}[**{_nc:+d}/h**]"
+                            )
+                            _tc = _pv["troop_cost_total"]
+                            _pv2.markdown(
+                                "Costo deficit truppe\n\n"
+                                f"**{sum(_tc.values()):,}**"
+                            )
+                            _pv2.caption(
+                                f"🪵{_tc['wood']:,} · 🧱{_tc['clay']:,} · "
+                                f"⚙️{_tc['iron']:,} · 🌾{_tc['crop']:,}"
+                            )
+                            _h = float(_pv["estimated_queue_hours"])
+                            _pv3.markdown(
+                                "Tempo stimato coda\n\n"
+                                + (
+                                    f"**{_h / 24:.1f} gg** ({_h}h)"
+                                    if _h >= 48
+                                    else f"**{_h}h**"
+                                )
+                            )
+                            _nw = len(_pv["queue_warnings"]) + len(
+                                _pv["missing_prerequisites"]
+                            )
+                            _pv4.markdown(
+                                "Check prerequisiti\n\n"
+                                + (
+                                    ":orange[**✓ ok**]"
+                                    if _nw == 0
+                                    else f":orange[**{_nw} avvisi**]"
+                                )
+                            )
+                            _alerts: list[str] = []
+                            if _pv["warehouse_overflow_risk"]:
+                                _alerts.append(
+                                    "⚠️ Costo truppe oltre Magazzino "
+                                    f"({_pv['warehouse_cap']:,})"
+                                )
+                            if _pv["granary_overflow_risk"]:
+                                _alerts.append(
+                                    "⚠️ Grano truppe oltre Granaio "
+                                    f"({_pv['granary_cap']:,})"
+                                )
+                            if _pv["first_capacity_block"]:
+                                _alerts.append(
+                                    "🧱 " + _pv["first_capacity_block"]
+                                )
+                            _alerts += [
+                                f"🏗️ {w}"
+                                for w in _pv["queue_warnings"][:3]
+                            ]
+                            _alerts += [
+                                f"⚔️ {w}"
+                                for w in _pv["missing_prerequisites"][:3]
+                            ]
+                            if _alerts:
+                                st.caption(" · ".join(_alerts))
 
                     updated_villages[vname] = VillageConfig(
                         name=vname,

@@ -674,7 +674,9 @@ async def _coordinate_inter_village_defense(
         break
 
 
-def _append_history(account_id: str, state: GameState, action: Action) -> None:
+def _append_history(
+    account_id: str, state: GameState, action: Action, tribe: str = ""
+) -> None:
     """Salva lo storico decisionale per-villaggio (DB + JSONL di backup)."""
     try:
         safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
@@ -691,6 +693,22 @@ def _append_history(account_id: str, state: GameState, action: Action) -> None:
                 "warehouse_cap": state.resources.warehouse_capacity,
                 "granary_cap": state.resources.granary_capacity,
             },
+            # Arricchimento spec "Role-Aware Configurator": produzione,
+            # netto grano, livelli edifici e truppe alimentano il
+            # Capacity-Aware Scaling e la Live Preview della dashboard.
+            "production": {
+                str(getattr(k, "value", k)): int(v)
+                for k, v in (state.resources.production_per_hour or {}).items()
+            },
+            "crop_balance": state.resources.crop_balance,
+            "buildings": {
+                str(f.gid): int(f.level)
+                for f in (state.fields or [])
+                if getattr(f, "gid", 0) > 0
+            },
+            "troops": dict(state.troops_home or {}),
+            # Tribu' account per il Role-Aware Configurator (seed unita').
+            "tribe": tribe,
             "build_queue": len(state.build_queue),
             "incoming_attacks": state.incoming_attacks,
             "action": action.type.value,
@@ -1210,8 +1228,24 @@ async def monitor_all_villages(
                         scanned = await observer.scan_map_area(
                             village.x or 0, village.y or 0, radius=settings.scout_brain.scan_radius
                         )
+                        # Bugfix radar: i villaggi propri non sono mai
+                        # bersagli — filtro a livello di coordinate su
+                        # radar e store + pulizia dei record storici
+                        # inquinati (routine eseguita a ogni scansione).
+                        own_coords = {
+                            (v.x, v.y) for v in villages
+                            if v.x is not None and v.y is not None
+                        }
+                        if own_coords:
+                            scout_brain.purge_coords(own_coords)
+                            farm_store.purge_coords(own_coords)
                         if scanned:
-                            scout_brain.update_targets_from_map(scanned, village.x or 0, village.y or 0)
+                            scout_brain.update_targets_from_map(
+                                scanned,
+                                village.x or 0,
+                                village.y or 0,
+                                own_coords=own_coords,
+                            )
                             # Custom Farm Targets: la stessa scansione
                             # alimenta lo store farm (tile -> pending).
                             farm_store.register_scanned(
@@ -1220,6 +1254,7 @@ async def monitor_all_villages(
                                 origin_y=village.y or 0,
                                 nearest_village=village.name or "",
                                 skip_names={v.name for v in villages if v.name},
+                                skip_coords=own_coords,
                             )
 
                         reports = await observer.read_combat_reports(limit=10)

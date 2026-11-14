@@ -550,8 +550,14 @@ class AIScoutBrain:
         scanned_tiles: list[dict],
         origin_x: int,
         origin_y: int,
+        own_coords: set[tuple[int, int]] | None = None,
     ) -> None:
-        """Aggiorna il database dei target con i tile rilevati dal sensore mappa."""
+        """Aggiorna il database dei target con i tile rilevati dal sensore mappa.
+
+        ``own_coords`` (spec bugfix radar): coordinate dei propri villaggi —
+        mai indicizzate come target di saccheggio, a prescindere dal nome.
+        """
+        own = set(own_coords or ())
         now = time.time()
         for tile in scanned_tiles:
             # Coordinate obbligatorie: tile senza x/y numeriche si scarta
@@ -559,6 +565,8 @@ class AIScoutBrain:
             y = safe_int_opt(tile.get("y"))
             if x is None or y is None:
                 continue
+            if (x, y) in own:
+                continue  # villaggio proprio: escluso dal radar
             k = self._target_key(x, y)
             dist = calculate_distance(origin_x, origin_y, x, y)
 
@@ -585,6 +593,28 @@ class AIScoutBrain:
                     last_scout_ts=now,
                 )
         self._save()
+
+    def purge_coords(self, coords) -> int:
+        """Rimuove dal radar le coordinate date (villaggi propri).
+
+        Routine di pulizia (spec bugfix radar): i target storici che
+        coincidono con i villaggi attivi dell'account vengono eliminati.
+        Ritorna il numero di record rimossi.
+        """
+        keys = {
+            self._target_key(int(x), int(y))
+            for x, y in (coords or ())
+            if x is not None and y is not None
+        }
+        hit = [k for k in keys if k in self.targets]
+        for k in hit:
+            del self.targets[k]
+        if hit:
+            logger.info(
+                "AI Scout: rimossi %d propri villaggi dal radar.", len(hit)
+            )
+            self._save()
+        return len(hit)
 
     def process_combat_reports(self, reports: list[dict], blacklist_hours: float = 12.0) -> None:
         """Elabora i report di combattimento: aggiorna il bottino o applica blacklist."""

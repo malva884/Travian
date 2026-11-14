@@ -30,7 +30,7 @@ _CSS = """
   --tv-text:      #e2e6ec;
   --tv-dim:       #8b93a1;
   --tv-accent:    #cc5e16;
-  --tv-green:     #4ade80;
+  --tv-green:     #fb923c;   /* ex verde — spec: tono arancione in tutta la UI */
   --tv-red:       #f87171;
   --tv-amber:     #fbbf24;
   --tv-blue:      #60a5fa;
@@ -219,7 +219,7 @@ div[data-testid="stDataFrame"] {
   border: 1px solid transparent;
   white-space: nowrap;
 }
-.pill.success { color: var(--tv-green); border-color: rgba(74,222,128,.35); background: rgba(74,222,128,.08); }
+.pill.success { color: var(--tv-green); border-color: rgba(251,146,60,.35); background: rgba(251,146,60,.08); }
 .pill.danger  { color: var(--tv-red);   border-color: rgba(248,113,113,.35); background: rgba(248,113,113,.08); }
 .pill.warning { color: var(--tv-amber); border-color: rgba(251,191,36,.35);  background: rgba(251,191,36,.08); }
 .pill.info    { color: var(--tv-blue);  border-color: rgba(96,165,250,.35);  background: rgba(96,165,250,.08); }
