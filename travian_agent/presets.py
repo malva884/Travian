@@ -33,29 +33,21 @@ ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
     # le Piccole Feste; Fase 3 - consolidamento produttivo e difesa.
     # Rally Point/Caserma restano prima dell'Accademia (prerequisiti).
     "early_cropper_founder": [
-        # Fase 1 — Base Economica & Sblocco Residenza
-        ("woodcutter", 3),
-        ("clay_pit", 3),
-        ("iron_mine", 3),
-        ("cropland", 3),
-        ("warehouse", 7),         # storage per il costo dei 3 coloni
-        ("granary", 7),
+        # Nuovo ordine (spec): Magazzino/Granaio anticipati per assorbire
+        # il flusso dei feeder senza overflow; Residenza al livello 10
+        # entro i primi 5 step per sbloccare subito i 3 coloni.
         ("main_building", 5),     # prerequisito Residenza
-        ("residence", 10),        # slot addestramento 3 coloni
-        # Fase 2 — Boost Punti Cultura passivi (costo/PC ottimo)
-        ("embassy", 8),
-        ("marketplace", 10),      # PC + ricezione risorse dai feeder
-        ("main_building", 10),    # sblocca il Municipio
-        ("rally_point", 1),       # prerequisito Caserma
-        ("barracks", 3),          # prerequisito Accademia
-        ("academy", 10),          # prerequisito Municipio
-        ("town_hall", 3),         # sblocca le Piccole Feste
-        # Fase 3 — Consolidamento Produttivo e difesa base
-        ("woodcutter", 6),
-        ("clay_pit", 6),
-        ("iron_mine", 6),
-        ("cropland", 6),
+        ("rally_point", 1),       # presidio minimo
+        ("warehouse", 10),        # buffer feeder — anti-overflow
+        ("granary", 10),
+        ("residence", 10),        # step 5 — slot addestramento 3 coloni
         ("city_wall", 5),
+        ("marketplace", 5),       # ricezione risorse dai feeder
+        ("woodcutter", 5),
+        ("clay_pit", 5),
+        ("iron_mine", 5),
+        ("cropland", 5),
+        ("academy", 10),          # prerequisito Municipio
     ],
     # Villaggio offensivo: infrastrutture militari al massimo, storage
     # capienti per l'economia di guerra, mura solide ma non prioritarie.

@@ -70,6 +70,170 @@ DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = STATE_DIR / "agent.log"
 PYTHON_EXE = sys.executable
 
+# ---------------------------------------------------------------------------
+# Componente CCv2: lista drag-and-drop per la Coda Prioritaria Edifici.
+# Dichiarato UNA volta a livello modulo (requisito CCv2). Su drop emette
+# il trigger "order" con la nuova sequenza di id step; il fallback con i
+# pulsanti freccia resta attivo se il JS non e' disponibile.
+# ---------------------------------------------------------------------------
+_DND_QUEUE_SORTER = st.components.v2.component(
+    "dnd_queue_sorter",
+    html="""
+<ul id="dq-list" class="dq-list"></ul>
+<div class="dq-addrow">
+  <select id="dq-add-key" class="dq-select"></select>
+  <input id="dq-add-lvl" class="dq-input" type="number" min="0" max="20" value="0"
+         title="Livello target (0 = massimo)" />
+  <button id="dq-add-btn" class="dq-btn" type="button" title="Aggiungi step">➕</button>
+</div>
+""",
+    css="""
+.dq-list { list-style: none; margin: 0; padding: 0; }
+.dq-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 8px; margin: 3px 0;
+  border: 1px solid var(--st-border-color, rgba(128,128,128,.35));
+  border-radius: 6px;
+  background: var(--st-secondary-background-color, rgba(128,128,128,.08));
+  color: var(--st-text-color, inherit);
+  font-size: 13px; user-select: none;
+}
+.dq-item.dragging { opacity: .45; }
+.dq-grip { opacity: .55; font-size: 12px; cursor: grab; }
+.dq-grip:active { cursor: grabbing; }
+.dq-pos { min-width: 22px; font-weight: 600; opacity: .75; }
+.dq-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dq-input, .dq-select {
+  background: var(--st-secondary-background-color, rgba(128,128,128,.08));
+  color: var(--st-text-color, inherit);
+  border: 1px solid var(--st-border-color, rgba(128,128,128,.35));
+  border-radius: 6px; font-size: 13px; padding: 2px 4px;
+}
+.dq-input { width: 46px; text-align: center; }
+.dq-select { flex: 1; min-width: 0; }
+.dq-btn {
+  background: transparent; color: var(--st-text-color, inherit);
+  border: 1px solid var(--st-border-color, rgba(128,128,128,.35));
+  border-radius: 6px; cursor: pointer; padding: 1px 7px; font-size: 12px;
+}
+.dq-btn:hover { border-color: var(--st-primary-color, #f63366); }
+.dq-addrow { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+""",
+    js="""
+export default function (component) {
+  const { data, parentElement, setTriggerValue } = component
+  const list = parentElement.querySelector("#dq-list")
+  const addKey = parentElement.querySelector("#dq-add-key")
+  const addLvl = parentElement.querySelector("#dq-add-lvl")
+  const addBtn = parentElement.querySelector("#dq-add-btn")
+  if (!list) return
+  list.innerHTML = ""
+  const items = (data && data.items) || []
+  const options = (data && data.options) || []
+  const emit = (k, v) => setTriggerValue(k, v)
+  const emitOrder = () => emit(
+    "order",
+    Array.from(list.children).map((el) => el.dataset.id)
+  )
+  const afterElement = (y) => {
+    const els = Array.from(list.querySelectorAll(".dq-item:not(.dragging)"))
+    let best = { offset: -Infinity, el: null }
+    for (const el of els) {
+      const box = el.getBoundingClientRect()
+      const off = y - box.top - box.height / 2
+      if (off < 0 && off > best.offset) best = { offset: off, el }
+    }
+    return best.el
+  }
+  items.forEach((it, idx) => {
+    const li = document.createElement("li")
+    li.className = "dq-item"
+    li.draggable = false
+    li.dataset.id = it.id
+    const grip = document.createElement("span")
+    grip.className = "dq-grip"; grip.textContent = "\\u2807"
+    const pos = document.createElement("span")
+    pos.className = "dq-pos"; pos.textContent = String(idx + 1) + "."
+    const label = document.createElement("span")
+    label.className = "dq-label"; label.textContent = it.label
+    const lvl = document.createElement("input")
+    lvl.className = "dq-input"; lvl.type = "number"
+    lvl.min = "0"; lvl.max = "20"; lvl.value = String(it.level || 0)
+    lvl.title = "Livello target 1-20 (0 = massimo)"
+    lvl.onchange = () => emit("level", {
+      id: it.id, level: parseInt(lvl.value || "0", 10) || 0,
+    })
+    const rm = document.createElement("button")
+    rm.className = "dq-btn"; rm.type = "button"; rm.textContent = "✕"
+    rm.title = "Rimuovi step"
+    rm.onclick = () => emit("remove", it.id)
+    li.append(grip, pos, label, lvl, rm)
+    // Drag SOLO dal grip: l'input livello resta editabile senza
+    // attivare il trascinamento della riga.
+    grip.onmousedown = () => { li.draggable = true }
+    grip.onmouseup = () => { li.draggable = false }
+    li.ondragstart = () => li.classList.add("dragging")
+    li.ondragend = () => {
+      li.classList.remove("dragging")
+      li.draggable = false
+      emitOrder()
+    }
+    list.appendChild(li)
+  })
+  // Property-handler (non addEventListener): il mount rifa' girare
+  // questa funzione a ogni rerun — assegnare, non accumulare.
+  list.ondragover = (e) => {
+    e.preventDefault()
+    const dragging = list.querySelector(".dragging")
+    if (!dragging) return
+    const after = afterElement(e.clientY)
+    if (after == null) list.appendChild(dragging)
+    else list.insertBefore(dragging, after)
+  }
+  // Riga "aggiungi edificio": opzioni ripopolate a ogni run.
+  if (addKey && addBtn) {
+    const prev = addKey.value
+    addKey.innerHTML = ""
+    options.forEach((o) => {
+      const opt = document.createElement("option")
+      opt.value = o.value; opt.textContent = o.label
+      addKey.appendChild(opt)
+    })
+    if (prev) addKey.value = prev
+    addBtn.onclick = () => emit("add", {
+      key: addKey.value,
+      level: parseInt((addLvl && addLvl.value) || "0", 10) || 0,
+    })
+  }
+}
+""",
+)
+
+
+def _queue_sorter(items: list[dict], options: list[dict], *, key: str, height: int):
+    """Editor completo drag-and-drop della coda prioritaria (CCv2).
+
+    `items`:   [{"id": uid_step, "label": nome edificio, "level": int}].
+    `options`: [{"value": chiave edificio, "label": nome}] per la riga
+               "aggiungi step" integrata.
+
+    Trigger emessi (leggibili in ``st.session_state[key].<nome>`` nella
+    rerun successiva — leggerli PRIMA del mount per evitare flicker):
+    - ``order``:  nuova sequenza di id dopo un drop di riordino;
+    - ``level``:  {"id": uid, "level": int} su modifica livello target;
+    - ``remove``: uid dello step da rimuovere;
+    - ``add``:    {"key": chiave edificio, "level": int} nuovo step.
+    """
+    return _DND_QUEUE_SORTER(
+        key=key,
+        data={"items": items, "options": options},
+        height=height,
+        on_order_change=lambda: None,
+        on_level_change=lambda: None,
+        on_remove_change=lambda: None,
+        on_add_change=lambda: None,
+    )
+
 # Regex per il tab Audits: formato "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 _LOG_LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:[,.]\d+)?\s+"
@@ -1182,66 +1346,112 @@ if page == "Villaggi":
                                 "modificabile liberamente."
                             )
 
-                        # Righe ordinate: numero, edificio, livello target,
-                        # controlli sposta su/giu' e rimuovi. Le chiavi widget
-                        # usano _uid (stabile per step): riordino/rimozione non
-                        # sposta i valori fra gli step.
-                        for _i, _step in enumerate(queue):
-                            if "_uid" not in _step:
-                                _step["_uid"] = uuid.uuid4().hex[:8]
-                            _uid = _step["_uid"]
-                            _cols = st.columns([0.6, 4.0, 1.4, 0.7, 0.7, 0.7])
-                            _cols[0].markdown(f"**{_i + 1}.**")
-                            _cols[1].markdown(
-                                building_focus_labels.get(_step["key"], _step["key"])
-                            )
-                            _step["target_level"] = _cols[2].number_input(
-                                "Liv.", min_value=0, max_value=20,
-                                value=int(_step.get("target_level") or 0),
-                                key=f"fqtgt_{cur_acc.account_id}_{vkey}_{_uid}",
-                                label_visibility="collapsed",
-                                help="Livello target 1-20 (0 = fino al massimo consentito)",
-                            )
-                            if _cols[3].form_submit_button(
-                                "↑", key=f"fqup_{cur_acc.account_id}_{vkey}_{_uid}"
-                            ) and _i > 0:
-                                queue[_i - 1], queue[_i] = queue[_i], queue[_i - 1]
-                            if _cols[4].form_submit_button(
-                                "↓", key=f"fqdn_{cur_acc.account_id}_{vkey}_{_uid}"
-                            ) and _i < len(queue) - 1:
-                                queue[_i + 1], queue[_i] = queue[_i], queue[_i + 1]
-                            if _cols[5].form_submit_button(
-                                "✕", key=f"fqrm_{cur_acc.account_id}_{vkey}_{_uid}"
-                            ):
-                                queue.pop(_i)
+                        # Editor coda completamente drag-and-drop (spec
+                        # ottimizzazione coda founder): grip ⡿ per il
+                        # riordino, input livello e ✕ su ogni riga, riga
+                        # "aggiungi edificio" integrata. I trigger del
+                        # componente vengono letti PRIMA del mount (niente
+                        # flicker) e ogni mutazione e' salvata subito su
+                        # accounts.json.
+                        for _s in queue:
+                            _s.setdefault("_uid", uuid.uuid4().hex[:8])
+                        _dnd_key = f"bqdnd_{cur_acc.account_id}_{vkey}"
+                        _dnd_state = st.session_state.get(_dnd_key)
 
-                        # Aggiungi un nuovo step alla coda.
-                        _ac1, _ac2, _ac3 = st.columns([3.5, 1.2, 0.8])
-                        with _ac1:
-                            _add_key = st.selectbox(
-                                "Aggiungi edificio:",
-                                options=canonical_focus_keys,
-                                format_func=lambda k: building_focus_labels.get(k, k),
-                                key=f"fqadd_{cur_acc.account_id}_{vkey}",
-                                label_visibility="visible",
+                        def _dnd_trig(name):
+                            v = getattr(_dnd_state, name, None)
+                            if v is None and isinstance(_dnd_state, dict):
+                                v = _dnd_state.get(name)
+                            return v
+
+                        _by_uid = {s["_uid"]: s for s in queue}
+                        _dnd_changed = False
+
+                        # Riordino: nuova sequenza completa di uid.
+                        _ord = _dnd_trig("order")
+                        _uids_now = [s["_uid"] for s in queue]
+                        if (
+                            isinstance(_ord, (list, tuple))
+                            and len(_ord) == len(_uids_now)
+                            and set(_ord) == set(_uids_now)
+                            and list(_ord) != _uids_now
+                        ):
+                            queue[:] = [_by_uid[u] for u in _ord]
+                            _dnd_changed = True
+                            st.toast(
+                                f"↕️ Coda di '{vname}' riordinata e salvata."
                             )
-                        with _ac2:
-                            _add_tgt = st.number_input(
-                                "Liv. target:", min_value=0, max_value=20, value=0,
-                                key=f"fqlvl_{cur_acc.account_id}_{vkey}",
-                                help="Livello target 1-20 (0 = fino al massimo consentito)",
+
+                        # Rimozione step.
+                        _rm = _dnd_trig("remove")
+                        if isinstance(_rm, str) and _rm in _by_uid:
+                            queue[:] = [s for s in queue if s["_uid"] != _rm]
+                            _dnd_changed = True
+                            st.toast(
+                                f"✕ Step rimosso dalla coda di '{vname}'."
                             )
-                        with _ac3:
-                            st.markdown("&nbsp;")
-                            if st.form_submit_button(
-                                "➕", key=f"fqbtn_{cur_acc.account_id}_{vkey}",
-                                help="Aggiungi lo step alla coda",
-                            ):
-                                queue.append(
-                                    {"key": _add_key,
-                                     "target_level": int(_add_tgt),
-                                     "_uid": uuid.uuid4().hex[:8]}
-                                )
+
+                        # Modifica livello target.
+                        _lv = _dnd_trig("level")
+                        if isinstance(_lv, dict) and _lv.get("id") in _by_uid:
+                            _by_uid[_lv["id"]]["target_level"] = max(
+                                0, min(20, int(_lv.get("level") or 0))
+                            )
+                            _dnd_changed = True
+
+                        # Aggiunta nuovo step.
+                        _ad = _dnd_trig("add")
+                        if (
+                            isinstance(_ad, dict)
+                            and str(_ad.get("key") or "") in canonical_focus_keys
+                        ):
+                            queue.append({
+                                "key": str(_ad["key"]),
+                                "target_level": max(
+                                    0, min(20, int(_ad.get("level") or 0))
+                                ),
+                                "_uid": uuid.uuid4().hex[:8],
+                            })
+                            _dnd_changed = True
+                            st.toast(
+                                f"➕ Step aggiunto alla coda di '{vname}'."
+                            )
+
+                        if _dnd_changed:
+                            _dnd_cfg = cur_acc.villages.get(vname) or (
+                                VillageConfig(name=vname)
+                            )
+                            _dnd_steps = [
+                                {"key": s["key"],
+                                 "target_level": int(s["target_level"]),
+                                 "priority": _pi + 1}
+                                for _pi, s in enumerate(queue)
+                            ]
+                            _dnd_cfg.building_focus = _dnd_steps
+                            _dnd_cfg.building_queue_plan = _dnd_steps
+                            cur_acc.villages[vname] = _dnd_cfg
+                            save_accounts(accounts)
+
+                        st.caption(
+                            "⡿ trascina per riordinare · Liv = livello target "
+                            "(0 = massimo) · ✕ rimuove · + aggiunge uno step"
+                        )
+                        _queue_sorter(
+                            [
+                                {"id": s["_uid"],
+                                 "label": building_focus_labels.get(
+                                     s["key"], s["key"]),
+                                 "level": int(s.get("target_level") or 0)}
+                                for s in queue
+                            ],
+                            [
+                                {"value": k,
+                                 "label": building_focus_labels.get(k, k)}
+                                for k in canonical_focus_keys
+                            ],
+                            key=_dnd_key,
+                            height=min(96 + 34 * max(len(queue), 1), 460),
+                        )
 
                         # Persistenza: lista ordinata di step strutturati
                         # {"key": ..., "target_level": int, "priority": N}

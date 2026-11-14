@@ -29,7 +29,7 @@ _CSS = """
   --tv-border:    #232a34;
   --tv-text:      #e2e6ec;
   --tv-dim:       #8b93a1;
-  --tv-accent:    #84cc16;
+  --tv-accent:    #cc5e16;
   --tv-green:     #4ade80;
   --tv-red:       #f87171;
   --tv-amber:     #fbbf24;
