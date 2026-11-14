@@ -61,10 +61,11 @@ AUTO_QTY_FLOOR = 3
 # quando non e' configurata un'unita' specifica: le chiavi del sensore
 # sono 'uN' (icona unit u1..u30 del CSS Travian).
 _LIGHT_RAIDERS = {
-    "u2",   # pretoriano? no -> legionario u1... dipende dalla tribu';
     "u1",   # legionario (romani)
-    "u4",   # emissario? no. Usiamo un set ampio:
-    "u5", "u6",
+    "u2",   # pretoriano
+    "u3",   # imperiano (era assente: villaggi con soli imperiani ->
+            # 'nessuna unita' da saccheggio risolta')
+    "u4", "u5", "u6",
     "u11",  # clubswinger (teutoni)
     "u12", "u13", "u15", "u16",
     "u22",  # spadaccino (galli)
@@ -256,6 +257,16 @@ class FarmingManager:
         for uk in sorted(_LIGHT_RAIDERS, key=lambda k: int(k[1:])):
             if troops.get(uk, 0) > 0:
                 return "t" + uk[1:]
+        # Letture parziali del sensore non devono azzerare l'intero
+        # pacchetto: se restano solo unita' fuori whitelist (assedio,
+        # esploratori, coloni) si usa comunque la piu' numerosa — il
+        # gioco valida l'invio, non il backend.
+        best = max(
+            ((v, k) for k, v in troops.items() if v > 0),
+            default=None,
+        )
+        if best is not None:
+            return "t" + best[1][1:]
         return ""
 
     def _schedule_scan(self, village_key: str, now: float | None = None) -> None:
@@ -334,12 +345,18 @@ class FarmingManager:
 
         unit_key = self._raider_key(troops, unit_pref)
         if not unit_key:
-            logger.info(
-                "%s FarmTargets: nessuna unita' da saccheggio risolta "
-                "per '%s'.",
-                prefix, village.name,
+            # Sensore cieco o dizionario azzerato da lettura parziale:
+            # non interrompere il ciclo a monte (contratto del modulo:
+            # l'invio vuoto fallisce lato gioco senza conseguenze).
+            # t1 = primo slot relativo troop[t1] del form tt=2 — la
+            # fanteria base del villaggio, sempre presente nel form.
+            unit_key = "t1"
+            logger.warning(
+                "%s FarmTargets: sensore truppe cieco su '%s' "
+                "(lettura=%s, unit_pref='%s'): tentativo comunque con "
+                "slot relativo %s.",
+                prefix, village.name, troops, unit_pref, unit_key,
             )
-            return False
 
         max_wave = max(1, int(settings.farming.targets_per_wave or 1))
         selected = approved[:max_wave]

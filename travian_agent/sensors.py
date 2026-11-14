@@ -1282,7 +1282,8 @@ class TravianParser:
         if not self.page:
             return {}
         if rally_slot:
-            url = f"{selectors.PATH_BUILD}?id={rally_slot}"
+            # tt=1: overview movimenti + tabella 'truppe nel villaggio'.
+            url = f"{selectors.PATH_BUILD}?id={rally_slot}&tt=1"
             if village_id:
                 url += f"&newdid={village_id}"
             try:
@@ -1290,8 +1291,10 @@ class TravianParser:
                     urljoin(self.page.url or "", url),
                     wait_until="domcontentloaded",
                 )
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "read_troops_home: navigazione rally fallita: %s", exc
+                )
         units = await self._read_troops_dom()
         if not units:
             # Fallback panoramica: il box 'Unita' di dorf1.php mostra i
@@ -1310,10 +1313,12 @@ class TravianParser:
             except Exception:
                 pass
         if not units:
+            # Non silenzioso: il farming deve poter distinguere un
+            # villaggio davvero vuoto da un sensore cieco (bug 1.1).
             try:
-                logger.debug(
+                logger.info(
                     "read_troops_home: nessuna truppa letta su %s "
-                    "(dorf1/rally), pagina=%s",
+                    "(rally tt=1 + dorf1), pagina=%s",
                     f"newdid={village_id}",
                     (self.page.url or "")[:120],
                 )
@@ -1357,8 +1362,11 @@ class TravianParser:
                     if (!m) return;
                     const key = 'u' + m[1];
                     let qty = 0;
+                    // NOTA: '.unit' escluso da closest() — matcherebbe
+                    // l'icona stessa (class 'unit uN') fermando la
+                    // ricerca della quantita' sul nodo sbagliato.
                     const cell = icon.closest(
-                        'td, a, li, .col, .unit, .troop, div'
+                        'td, a, li, .col, .troop, div'
                     );
                     if (cell) {
                         qty = num(cell.innerText || '');
