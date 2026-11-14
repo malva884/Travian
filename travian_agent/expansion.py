@@ -36,6 +36,7 @@ from .cropper import (
     STATUS_SETTLED,
     STATUS_SETTLING,
 )
+from .building_prereqs import GID_TOWN_HALL
 from .models import (
     Action,
     ActionType,
@@ -68,6 +69,10 @@ FEED_CAP_PER_RESOURCE = 2000
 FEEDER_KEEP_RATIO = 0.55
 # Cooldown tra tentativi di fondazione falliti (evita spam di navigazione)
 FOUND_RETRY_SECONDS = 900.0
+# Piccole Feste (Culture Points Booster): retry breve su click fallito,
+# cooldown lungo dopo l'avvio (la festa impiega ore a completarsi).
+CELEBRATION_RETRY_SECONDS = 900.0
+CELEBRATION_COOLDOWN_SECONDS = 6.0 * 3600.0
 # Retry breve quando la scansione mappa non legge tile (layout/pagina ko):
 # il cooldown pieno di 3h si applica solo a scansioni andate a buon fine.
 MAP_SCAN_RETRY_SECONDS = 600.0
@@ -98,6 +103,49 @@ def find_market(interior: list[Field]) -> Field | None:
         if f.gid == GID_MARKETPLACE and f.level >= 1:
             return f
     return None
+
+
+def find_town_hall(interior: list[Field]) -> Field | None:
+    """Municipio (gid 24) >= 1 negli edifici interni: serve alle feste."""
+    for f in interior or []:
+        if f.gid == GID_TOWN_HALL and f.level >= 1:
+            return f
+    return None
+
+
+def save_culture_points(
+    account_id: str, current: int, required: int, daily: int
+) -> None:
+    """Snapshot Punti Cultura dell'account (kv ``account_<id>.json``).
+
+    Merge con il contenuto esistente per non cancellare altre chiavi;
+    letto dalla dashboard per la barra di progresso PC.
+    """
+    try:
+        safe = "".join(
+            c if c.isalnum() or c in "._-" else "_" for c in account_id
+        )
+        key = f"account_{safe}.json"
+        data: dict = {}
+        raw = db.kv_read(key)
+        if raw:
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data.update(
+            {
+                "culture_points_current": int(current),
+                "culture_points_required": int(required),
+                "culture_points_daily_prod": int(daily),
+                "culture_points_ts": time.time(),
+            }
+        )
+        db.kv_write(key, json.dumps(data, indent=2))
+    except Exception:  # noqa: BLE001
+        logger.debug("save_culture_points fallito", exc_info=True)
 
 
 def feeder_surplus(state: GameState, keep_ratio: float = FEEDER_KEEP_RATIO) -> dict[str, int]:
@@ -207,6 +255,11 @@ class ExpansionManager:
     bootstrap_target: dict = field(default_factory=dict)
     next_found_attempt: float = 0.0  # cooldown anti-spam dopo fallimenti
     next_map_scan: float = 0.0       # cooldown tra scansioni cropper di mappa
+    # Culture Points Booster: ultimo snapshot PC + cooldown feste
+    cp_current: int = 0
+    cp_required: int = 0
+    cp_daily: int = 0
+    next_celebration_attempt: float = 0.0
 
     def __post_init__(self) -> None:
         self._kv_key: str | None = None
@@ -234,6 +287,12 @@ class ExpansionManager:
                 self.bootstrap_target = dict(bt) if isinstance(bt, dict) else {}
                 self.next_found_attempt = float(data.get("next_found_attempt") or 0.0)
                 self.next_map_scan = float(data.get("next_map_scan") or 0.0)
+                self.cp_current = int(data.get("cp_current") or 0)
+                self.cp_required = int(data.get("cp_required") or 0)
+                self.cp_daily = int(data.get("cp_daily") or 0)
+                self.next_celebration_attempt = float(
+                    data.get("next_celebration_attempt") or 0.0
+                )
         except Exception:
             pass
 
@@ -246,6 +305,10 @@ class ExpansionManager:
                     "bootstrap_target": self.bootstrap_target,
                     "next_found_attempt": self.next_found_attempt,
                     "next_map_scan": self.next_map_scan,
+                    "cp_current": self.cp_current,
+                    "cp_required": self.cp_required,
+                    "cp_daily": self.cp_daily,
+                    "next_celebration_attempt": self.next_celebration_attempt,
                 },
                 indent=2,
             )
@@ -389,6 +452,70 @@ class ExpansionManager:
             return target, crop
         return None, 0
 
+    async def _try_celebration(
+        self,
+        *,
+        executor: "ActionExecutor",
+        founder: "Village",
+        interior_map: dict[str, list[Field]],
+        states_by_village: dict[str, GameState],
+        prefix: str,
+        now: float,
+    ) -> None:
+        """Avvia una Piccola Festa nel Municipio del fondatore (spec 2).
+
+        Condizioni: Municipio >= 1, cooldown scaduto e risorse del
+        villaggio sopra la riserva dei 3 coloni (settler_reserve).
+        """
+        if now < self.next_celebration_attempt:
+            return
+        town_hall = find_town_hall(
+            interior_map.get(founder.name or "", [])
+        )
+        if town_hall is None:
+            return
+        fstate = states_by_village.get(founder.name or "")
+        if fstate is None:
+            return
+        try:
+            from .replenishment import settler_reserve  # no cicli
+        except Exception:  # noqa: BLE001
+            settler_reserve = None
+        if settler_reserve is not None:
+            reserve = settler_reserve()
+            res = fstate.resources
+            available = {
+                "wood": res.wood, "clay": res.clay,
+                "iron": res.iron, "crop": res.crop,
+            }
+            if any(
+                int(available.get(k, 0)) < int(reserve.get(k, 0))
+                for k in ("wood", "clay", "iron", "crop")
+            ):
+                return
+        action = Action(
+            type=ActionType.START_CELEBRATION,
+            params={"town_hall_slot": town_hall.slot_id, "kind": "small"},
+            reason=(
+                f"CP Booster: Piccola Festa in Municipio "
+                f"(slot {town_hall.slot_id}) — CP "
+                f"{self.cp_current}/{self.cp_required}"
+            ),
+        )
+        result = await executor.execute(
+            action, village_id=founder.village_id
+        )
+        self.next_celebration_attempt = now + (
+            CELEBRATION_COOLDOWN_SECONDS
+            if result.success
+            else CELEBRATION_RETRY_SECONDS
+        )
+        self._save()
+        logger.info(
+            "%s CP Booster: festa al Municipio di '%s' -> %s",
+            prefix, founder.name, result.message,
+        )
+
     # ------------------------------------------------------------------
     # Step principale (una volta per ciclo account)
     # ------------------------------------------------------------------
@@ -403,6 +530,7 @@ class ExpansionManager:
         interior_map: dict[str, list[Field]],
         prefix: str,
         now: float | None = None,
+        states_by_village: dict[str, GameState] | None = None,
     ) -> None:
         """Valuta lo stato espansione e agisce: coloni -> feed/raid -> fonda."""
         cfg = effective_expansion_config(settings.expansion, self.account_id)
@@ -468,16 +596,33 @@ class ExpansionManager:
             )
             return
 
-        # 1. Punti cultura
-        cp_have, cp_need = await observer.read_culture_points(
+        # 1. Punti cultura (spec CP Booster: snapshot persistito per
+        #    il booster del builder e la barra di progresso dashboard)
+        cp_have, cp_need, cp_daily = await observer.read_culture_points(
             residence.slot_id, founder.village_id
         )
+        if cp_have or cp_need or cp_daily:
+            self.cp_current, self.cp_required, self.cp_daily = (
+                cp_have, cp_need, cp_daily
+            )
+            save_culture_points(self.account_id, cp_have, cp_need, cp_daily)
+            self._save()
         if cp_need > 0 and cp_have < cp_need + cfg.min_culture_margin:
             logger.info(
                 "%s Espansione: CP insufficienti a '%s' (%d/%d). Attendo.",
                 prefix, founder.name, cp_have, cp_need,
             )
             self.feed_target = ""
+            # Piccola Festa automatica: Municipio presente, nessuna festa
+            # recente e risorse sopra la riserva dei 3 coloni.
+            await self._try_celebration(
+                executor=executor,
+                founder=founder,
+                interior_map=interior_map,
+                states_by_village=states_by_village or {},
+                prefix=prefix,
+                now=now,
+            )
             return
 
         # 2. Coloni disponibili?

@@ -1089,6 +1089,14 @@ async def monitor_all_villages(
             states_by_village[vname] = state
             troops_by_village[vname] = state.troops_home
 
+            # Culture Points Booster: inietta l'ultimo snapshot PC letto
+            # dal modulo espansione (pagina Residenza) — il gate della
+            # regola culture_boost vive su questi campi.
+            if expansion_mgr is not None and expansion_mgr.cp_required > 0:
+                state.culture_points = expansion_mgr.cp_current
+                state.culture_points_required = expansion_mgr.cp_required
+                state.culture_points_daily = expansion_mgr.cp_daily
+
             action = brain.decide(state)
 
             # Smart Building planner: persiste i prossimi upgrade stimati
@@ -1213,6 +1221,36 @@ async def monitor_all_villages(
                             scout_brain.process_combat_reports(reports, blacklist_hours=settings.scout_brain.blacklist_hours)
 
                         plan = await scout_brain.decide_raid_plan(village, state.troops_home, settings)
+                        # Human-in-the-loop (spec 1.2): il raid dinamico
+                        # parte SOLO sui target approved del farm store;
+                        # gli altri restano pending finche' la dashboard
+                        # non li approva.
+                        approved_coords = {
+                            (t.x, t.y)
+                            for t in farm_store.get_approved_targets()
+                        }
+                        if plan:
+                            gated, skipped = [], []
+                            for t in plan:
+                                if (t.get("x"), t.get("y")) in approved_coords:
+                                    gated.append(t)
+                                else:
+                                    skipped.append(
+                                        f"({t.get('x')}|{t.get('y')}) non approved"
+                                    )
+                                    farm_store.record_raid_attempt(
+                                        int(t.get("x") or 0),
+                                        int(t.get("y") or 0),
+                                        False,
+                                        "target non approved "
+                                        "(approva in dashboard)",
+                                    )
+                            if skipped:
+                                logger.info(
+                                    "%s AI Scout: %d target saltati: %s",
+                                    vprefix, len(skipped), "; ".join(skipped),
+                                )
+                            plan = gated
                         if plan:
                             scout_act = Action(
                                 type=ActionType.SEND_CUSTOM_RAID,
@@ -1220,7 +1258,28 @@ async def monitor_all_villages(
                                 reason=f"AI Scout Brain: invio {len(plan)} raid dinamici mirati",
                             )
                             scout_res = await executor.execute(scout_act, village_id=target_vid)
+                            for t in plan:
+                                farm_store.record_raid_attempt(
+                                    int(t.get("x") or 0),
+                                    int(t.get("y") or 0),
+                                    scout_res.success,
+                                    scout_res.message,
+                                )
                             logger.info("%s AI Scout: %s", vprefix, scout_res.message)
+                        elif not approved_coords:
+                            logger.info(
+                                "%s AI Scout: nessun target approved nello "
+                                "store farm — approva i bersagli dalla "
+                                "dashboard (Farming & Eroe).",
+                                vprefix,
+                            )
+                        else:
+                            logger.info(
+                                "%s AI Scout: nessun raid dinamico inviato: "
+                                "il piano AI non ha prodotto target "
+                                "approvati per questo villaggio.",
+                                vprefix,
+                            )
                     except Exception as s_exc:
                         logger.warning("%s Errore modulo AI Scout Brain: %s", vprefix, s_exc)
 
@@ -1410,12 +1469,20 @@ async def monitor_all_villages(
                 ):
                     _last_smithy_try[vname] = time.time()
                     # Grain Safety Net: upgrade metallurgici solo con
-                    # margine grano sopra soglia.
+                    # margine grano sopra soglia. net_crop() torna None
+                    # quando il bilancio non e' stato letto (production.php
+                    # non visitata): niente confronto -> salto pulito.
                     net = net_crop(state)
-                    thr = crop_threshold(state, settings)
-                    if thr > 0 and net < thr:
+                    thr = float(crop_threshold(state, settings) or 0.0)
+                    if net is None:
+                        logger.debug(
+                            "%s Fucina: bilancio grano non letto "
+                            "(net_crop=None) — tentativo rinviato.",
+                            vprefix,
+                        )
+                    elif thr > 0 and float(net) < thr:
                         logger.info(
-                            "%s Fucina: upgrade sospeso (net crop %d < %d)",
+                            "%s Fucina: upgrade sospeso (net crop %s < %s)",
                             vprefix, net, thr,
                         )
                     else:
@@ -1615,6 +1682,7 @@ async def monitor_all_villages(
                 villages=villages,
                 interior_map=interior_map,
                 prefix=prefix,
+                states_by_village=states_by_village,
             )
         except Exception as e_exc:
             logger.warning("%s Errore modulo espansione: %s", prefix, e_exc)

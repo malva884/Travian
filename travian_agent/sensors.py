@@ -1163,15 +1163,16 @@ class TravianParser:
 
     async def read_culture_points(
         self, residence_slot: int, village_id: int = 0
-    ) -> tuple[int, int]:
-        """Legge (CP attuali, CP richiesti) dalla pagina Residenza/Palazzo.
+    ) -> tuple[int, int, int]:
+        """Legge (CP attuali, CP richiesti, PC/giorno) da Residenza/Palazzo.
 
         Naviga a build.php?id=<slot residenza> e cerca il pattern 'X/Y'
-        accanto alle diciture 'punti cultura' / 'culture points'.
-        Ritorna (0, 0) se la pagina non e' leggibile.
+        accanto alle diciture 'punti cultura' / 'culture points', piu'
+        la produzione giornaliera se riportata nella stessa scheda.
+        Ritorna (0, 0, 0) se la pagina non e' leggibile.
         """
         if not self.page or not residence_slot:
-            return (0, 0)
+            return (0, 0, 0)
         url = f"{selectors.PATH_BUILD}?id={residence_slot}"
         if village_id:
             url += f"&newdid={village_id}"
@@ -1181,7 +1182,7 @@ class TravianParser:
                 wait_until="domcontentloaded",
             )
         except Exception:
-            return (0, 0)
+            return (0, 0, 0)
         try:
             data = await self.page.evaluate("""
                 () => {
@@ -1191,19 +1192,26 @@ class TravianParser:
                         /(?:punti cultura|culture points?|kulturpunkte|puntos? de cultura|points? de culture)[^0-9]{0,30}([0-9][0-9.,]*)[^0-9]{0,5}[/][^0-9]{0,5}([0-9][0-9.,]*)/i
                     );
                     const clean = (s) => parseInt(String(s).replace(/[^0-9]/g, ''), 10) || 0;
-                    if (m) return { have: clean(m[1]), need: clean(m[2]) };
+                    // Produzione giornaliera (stessa scheda o blocco vicino):
+                    // "produzione: 250 al giorno" / "production 250 per day".
+                    const day = text.match(
+                        /(\\d[0-9.,]*)[^0-9]{0,15}(?:al giorno|per day|pro tag|par jour|al d[ií]a)/i
+                    );
+                    const daily = day ? clean(day[1]) : 0;
+                    if (m) return { have: clean(m[1]), need: clean(m[2]), daily: daily };
                     const single = text.match(
                         /(?:punti cultura|culture points?|kulturpunkte|puntos? de cultura|points? de culture)[^0-9]{0,30}([0-9][0-9.,]*)/i
                     );
-                    return { have: single ? clean(single[1]) : 0, need: 0 };
+                    return { have: single ? clean(single[1]) : 0, need: 0, daily: daily };
                 }
             """)
             return (
                 int((data or {}).get("have", 0)),
                 int((data or {}).get("need", 0)),
+                int((data or {}).get("daily", 0)),
             )
         except Exception:
-            return (0, 0)
+            return (0, 0, 0)
 
     async def read_troops_home(self, rally_slot: int = 0, village_id: int = 0) -> dict[str, int]:
         """Legge le truppe presenti nel villaggio dalla panoramica del

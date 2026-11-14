@@ -77,9 +77,13 @@ class FarmTarget:
     last_loot_ratio: float = 1.0
     losses_recorded: int = 0
     distance: float = 0.0          # campi dal villaggio proprio piu' vicino
-    nearest_village: str = ""
+    nearest_village: str = ""      # villaggio mittente (auto o manuale)
+    target_type: str = ""          # oasis | inactive_village | farm
     status: str = STATUS_PENDING
     manual: bool = False           # inserito a mano dalla dashboard
+    last_raid_ts: float = 0.0      # ts ultimo invio raid verso il target
+    last_outcome: str = ""         # clean | losses | empty (dai report)
+    fail_reason: str = ""          # motivo ultimo mancato invio
     updated_ts: float = field(default_factory=time.time)
 
     @classmethod
@@ -99,10 +103,14 @@ class FarmTarget:
                 losses_recorded=int(data.get("losses_recorded") or 0),
                 distance=float(data.get("distance") or 0.0),
                 nearest_village=str(data.get("nearest_village") or ""),
+                target_type=str(data.get("target_type") or ""),
                 status=data.get("status")
                 if data.get("status") in VALID_STATUSES
                 else STATUS_PENDING,
                 manual=bool(data.get("manual")),
+                last_raid_ts=float(data.get("last_raid_ts") or 0.0),
+                last_outcome=str(data.get("last_outcome") or ""),
+                fail_reason=str(data.get("fail_reason") or ""),
                 updated_ts=float(data.get("updated_ts") or time.time()),
             )
         except Exception:
@@ -281,15 +289,20 @@ class FarmTargetStore:
         name: str = "",
         is_oasis: bool = False,
         population: int = 0,
+        status: str = STATUS_PENDING,
+        nearest_village: str = "",
     ) -> FarmTarget | None:
         """Inserimento manuale di un target dalla dashboard.
 
         Ritorna None se le coordinate sono gia' catalogate (qualunque
         stato): niente duplicati. Il record entra in testa alla lista
-        con status 'pending' e flag manual.
+        con flag manual; `status` default 'pending', la dashboard puo'
+        passare 'approved' per attivare subito i raid mirati.
         """
         if self.status_at(x, y) is not None:
             return None
+        if status not in VALID_STATUSES:
+            status = STATUS_PENDING
         tgt = FarmTarget(
             id=make_target_id(x, y),
             x=x,
@@ -298,12 +311,35 @@ class FarmTargetStore:
             is_oasis=bool(is_oasis),
             population=int(population or 0),
             estimated_loot=_estimate_loot(population, is_oasis),
-            status=STATUS_PENDING,
+            nearest_village=str(nearest_village or ""),
+            target_type="oasis" if is_oasis else "farm",
+            status=status,
             manual=True,
         )
         self._data.insert(0, asdict(tgt))
         self._save()
         return tgt
+
+    def record_raid_attempt(
+        self, x: int, y: int, sent: bool, reason: str = ""
+    ) -> None:
+        """Registra l'esito del tentativo di invio verso (x|y).
+
+        last_raid_ts si aggiorna solo su invio riuscito; fail_reason
+        conserva il motivo del mancato invio per la dashboard.
+        """
+        changed = False
+        for raw in self._data:
+            if int(raw.get("x", 0)) != x or int(raw.get("y", 0)) != y:
+                continue
+            raw["fail_reason"] = "" if sent else str(reason or "")
+            if sent:
+                raw["last_raid_ts"] = time.time()
+            raw["updated_ts"] = time.time()
+            changed = True
+            break
+        if changed:
+            self._save()
 
     # --------------------------------------------------------------
     # Discovery (Step 2 spec): tile scansionati -> pending
@@ -357,6 +393,7 @@ class FarmTargetStore:
                 estimated_loot=_estimate_loot(population, is_oasis),
                 distance=round(dist, 1),
                 nearest_village=nearest_village,
+                target_type="oasis" if is_oasis else "farm",
                 status=STATUS_PENDING,
             )
             before = len(self._data)
@@ -395,10 +432,17 @@ class FarmTargetStore:
                     continue
                 losses = int(r.get("losses", 0) or 0)
                 defenders = int(r.get("defenders", 0) or 0)
-                raw["last_loot_ratio"] = float(r.get("loot_ratio", 1.0))
+                loot = float(r.get("loot_ratio", 1.0))
+                raw["last_loot_ratio"] = loot
                 raw["losses_recorded"] = int(
                     raw.get("losses_recorded", 0) or 0
                 ) + losses
+                raw["last_raid_ts"] = now
+                raw["last_outcome"] = (
+                    "losses" if (losses > 0 or defenders > 0)
+                    else "clean" if loot > 0
+                    else "empty"
+                )
                 raw["updated_ts"] = now
                 updated += 1
                 if losses > 0 or defenders > 0:

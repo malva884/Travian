@@ -198,6 +198,7 @@ class GameState:
     # Modulo espansione: punti cultura e coloni del villaggio corrente
     culture_points: int = 0          # CP attuali letti in residenza/palazzo
     culture_points_required: int = 0  # CP richiesti per il prossimo villaggio
+    culture_points_daily: int = 0    # produzione PC giornaliera dell'account
     settlers_home: int = 0           # coloni pronti nel villaggio
     # Modulo farming: truppe attualmente a casa (alias normalizzato -> qta)
     troops_home: dict[str, int] = field(default_factory=dict)
@@ -244,6 +245,7 @@ class ActionType(str, Enum):
     SEND_CUSTOM_RAID = "send_custom_raid"  # invio raid dinamico a coordinate libere (AI Scout Brain)
     UPGRADE_UNITS = "upgrade_units"  # potenziamento unita' in Fucina (smithy_auto_upgrade)
     FOUND_VILLAGE = "found_village"  # fondazione nuovo villaggio via mappa
+    START_CELEBRATION = "start_celebration"  # festa al Municipio (punti cultura)
     ALERT = "alert"          # es. attacco in arrivo: notifica senza agire
     LOGIN = "login"
     NOOP = "noop"

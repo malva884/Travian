@@ -27,28 +27,34 @@ from __future__ import annotations
 # Ruolo -> lista ordinata di (chiave focus, livello target).
 # Chiavi = quelle canoniche della dashboard (FOCUS_KEY_GIDS).
 ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
-    # Apertura server / pioniere 15c: avvio rapido, fanteria base per
-    # farming e difesa post-protezione, poi Residenza 10 + 3 coloni per
-    # fondare il primo cropper. I campi compaiono due volte (3 -> 6):
-    # la coda ammette step ripetuti a livelli crescenti.
+    # Apertura server / pioniere 15c (Culture Points Booster, spec):
+    # Fase 1 - base economica e sblocco Residenza; Fase 2 - edifici ad
+    # alto rendimento PC (Ambasciata/Mercato/Municipio) e Municipio per
+    # le Piccole Feste; Fase 3 - consolidamento produttivo e difesa.
+    # Rally Point/Caserma restano prima dell'Accademia (prerequisiti).
     "early_cropper_founder": [
+        # Fase 1 — Base Economica & Sblocco Residenza
         ("woodcutter", 3),
         ("clay_pit", 3),
         ("iron_mine", 3),
         ("cropland", 3),
-        ("main_building", 5),
-        ("rally_point", 1),       # sblocca Caserma
-        ("barracks", 3),          # fanteria base per farming/difesa
-        ("warehouse", 7),
+        ("warehouse", 7),         # storage per il costo dei 3 coloni
         ("granary", 7),
+        ("main_building", 5),     # prerequisito Residenza
+        ("residence", 10),        # slot addestramento 3 coloni
+        # Fase 2 — Boost Punti Cultura passivi (costo/PC ottimo)
+        ("embassy", 8),
+        ("marketplace", 10),      # PC + ricezione risorse dai feeder
+        ("main_building", 10),    # sblocca il Municipio
+        ("rally_point", 1),       # prerequisito Caserma
+        ("barracks", 3),          # prerequisito Accademia
+        ("academy", 10),          # prerequisito Municipio
+        ("town_hall", 3),         # sblocca le Piccole Feste
+        # Fase 3 — Consolidamento Produttivo e difesa base
         ("woodcutter", 6),
         ("clay_pit", 6),
         ("iron_mine", 6),
         ("cropland", 6),
-        ("main_building", 10),
-        ("academy", 10),
-        ("residence", 10),        # slot addestramento 3 coloni
-        ("marketplace", 5),
         ("city_wall", 5),
     ],
     # Villaggio offensivo: infrastrutture militari al massimo, storage

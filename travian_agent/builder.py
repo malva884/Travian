@@ -32,6 +32,7 @@ from .building_prereqs import (
     FIELD_GID_TYPES,
     GID_ACADEMY,
     GID_BAKERY,
+    GID_EMBASSY,
     GID_GRAIN_MILL,
     GID_LABELS,
     GID_MAIN_BUILDING,
@@ -41,6 +42,7 @@ from .building_prereqs import (
     prereqs_met,
 )
 from .config import Settings
+from .presets import resolve_role
 from .models import (
     GID_BARRACKS,
     GID_GRANARY,
@@ -83,8 +85,24 @@ _ROLE_INTERIORS: dict[str, tuple[int, ...]] = {
     "croplog": (GID_GRANARY, GID_WAREHOUSE, GID_GRAIN_MILL, GID_BAKERY),
     "feeder": (GID_MARKETPLACE, GID_WAREHOUSE, GID_GRANARY),
     "chiefing": (GID_ACADEMY, GID_RESIDENCE, GID_TOWN_HALL),
-    "early_cropper_founder": (GID_RESIDENCE, GID_BARRACKS, GID_MARKETPLACE),
+    "early_cropper_founder": (
+        GID_RESIDENCE, GID_EMBASSY, GID_MARKETPLACE, GID_ACADEMY,
+        GID_TOWN_HALL, GID_BARRACKS,
+    ),
 }
+
+# Culture Points Booster (spec): edifici interni con il miglior
+# rapporto costo / PC giornalieri, nell'ordine di efficienza.
+_CP_BOOST_GIDS: tuple[int, ...] = (
+    GID_EMBASSY,
+    GID_ACADEMY,
+    GID_MARKETPLACE,
+    GID_TOWN_HALL,
+    GID_MAIN_BUILDING,
+)
+FOUNDER_ROLE = "early_cropper_founder"
+# Residenza/Palazzo >= 10 = booster attivo sul villaggio fondatore
+_CP_BOOST_RESIDENCE_LEVEL = 10
 
 
 @dataclass
@@ -658,6 +676,86 @@ def reclaim_intents(state: GameState, settings: Settings) -> list[Field]:
         if home:
             return home
     return []
+
+
+def is_founder_village(state: GameState, settings: Settings) -> bool:
+    """True se il ruolo del villaggio si risolve in 'founder'.
+
+    Gli alias della dashboard ('founder', 'pioneer', 'early_cropper')
+    convergono tutti su 'early_cropper_founder' via resolve_role.
+    """
+    role = settings.village_role_for(state.village_name, state.village_id)
+    return resolve_role(role) == FOUNDER_ROLE
+
+
+def culture_boost_active(state: GameState, settings: Settings) -> bool:
+    """True se il Culture Points Booster deve girare su questo villaggio.
+
+    Condizioni (spec 2): ruolo founder, Residenza/Palazzo >= 10 e
+    Punti Cultura ancora insufficienti per il prossimo slot. Si
+    disattiva da solo quando cp_current >= cp_required (o quando il
+    dato non e' stato ancora letto: booster spento, niente supposizioni).
+    """
+    if not is_founder_village(state, settings):
+        return False
+    if state.culture_points_required <= 0:
+        return False
+    if state.culture_points >= state.culture_points_required:
+        return False
+    interiors = state.interior_fields()
+    return any(
+        f.gid in (GID_RESIDENCE, GID_PALACE)
+        and f.level >= _CP_BOOST_RESIDENCE_LEVEL
+        for f in interiors
+    )
+
+
+def settler_surplus_ok(state: GameState) -> bool:
+    """True se tutte le risorse superano la riserva dei 3 coloni.
+
+    Il booster spende solo quando i magazzini coprono gia' il costo
+    completo dei coloni (max fra le tre tribu', per sicurezza).
+    """
+    try:
+        from .replenishment import settler_reserve  # no cicli
+    except Exception:  # noqa: BLE001
+        return False
+    reserve = settler_reserve()
+    if not reserve:
+        return False
+    res = state.resources
+    available = {
+        "wood": res.wood,
+        "clay": res.clay,
+        "iron": res.iron,
+        "crop": res.crop,
+    }
+    return all(
+        int(available.get(k, 0)) >= int(reserve.get(k, 0))
+        for k in ("wood", "clay", "iron", "crop")
+    )
+
+
+def culture_boost_intents(state: GameState) -> list[Field]:
+    """Interni ad alta resa PC upgradabili, dal livello piu' basso.
+
+    Include la nuova costruzione degli edifici mancanti se i
+    prerequisiti reggono (es. Municipio dopo Accademia 10 + Municipio
+    (Edificio Principale) 10).
+    """
+    rank = {gid: i for i, gid in enumerate(_CP_BOOST_GIDS)}
+    existing = sorted(
+        (
+            f
+            for f in upgradeable_fields(state, state.interior_fields())
+            if f.gid in _CP_BOOST_GIDS and f.gid > 0
+        ),
+        key=lambda f: (f.level, rank.get(f.gid, 99), f.slot_id),
+    )
+    newbies = new_building_intents(
+        state, _CP_BOOST_GIDS, {f.slot_id for f in existing}
+    )
+    return existing + newbies
 
 
 def local_spend_intents(state: GameState) -> list[Field]:

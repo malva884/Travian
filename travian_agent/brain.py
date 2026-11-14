@@ -531,6 +531,41 @@ def rule_building_focus(state: GameState, settings: Settings) -> Action | None:
     )
 
 
+def rule_culture_boost(state: GameState, settings: Settings) -> Action | None:
+    """Culture Points Booster: upgrade interni ad alta resa PC.
+
+    Attivo sui villaggi founder con Residenza/Palazzo >= 10 finche'
+    i Punti Cultura non bastano per il prossimo slot. Entra in gioco
+    dopo il focus manuale e spende solo quando le risorse superano la
+    riserva dei 3 coloni (i magazzini possono gia' pagarli).
+    """
+    if builder.crop_safety_needed(state, settings):
+        return None
+    if not builder.culture_boost_active(state, settings):
+        return None
+    if not builder.settler_surplus_ok(state):
+        return None
+    intents = builder.culture_boost_intents(state)
+    if not intents:
+        return None
+    head = intents[0]
+    if not _queue_free(state, settings, head.is_resource_field):
+        return None
+    return Action(
+        type=ActionType.UPGRADE_FIELD,
+        params={
+            "candidates": [f.slot_id for f in intents],
+            "construct": builder.construct_gids(state, intents),
+        },
+        reason=(
+            f"CP Booster: PC {state.culture_points}/"
+            f"{state.culture_points_required} — upgrade di "
+            f"'{head.name or 'slot ' + str(head.slot_id)}' "
+            f"(livello {head.level})"
+        ),
+    )
+
+
 def rule_role_buildings(state: GameState, settings: Settings) -> Action | None:
     """Infrastrutture di ruolo bilanciate (hammer/defensive/croplog/feeder).
 
@@ -589,6 +624,7 @@ class RuleBasedBrain:
         rule_grain_safety,
         rule_emergency_overflow,
         rule_building_focus,
+        rule_culture_boost,
         rule_role_buildings,
         rule_upgrade_weakest_field,
         rule_wait,

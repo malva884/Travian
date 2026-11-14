@@ -373,6 +373,12 @@ class FarmingManager:
             ),
         )
         result = await executor.execute(action, village_id=village.village_id)
+        # Registra per-target l'esito del tentativo (spec 1.2:
+        # fail_reason esplicito sui mancati invii, timestamp sui riusciti).
+        for t in selected:
+            farm_store.record_raid_attempt(
+                t.x, t.y, result.success, result.message
+            )
         if result.success:
             logger.info(
                 "%s FarmTargets: %s", prefix, result.message

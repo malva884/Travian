@@ -1651,7 +1651,13 @@ class ActionExecutor:
             tx = tgt.get("x")
             ty = tgt.get("y")
             troops = dict(tgt.get("troops") or {})
-            if tx is None or ty is None or not troops:
+            if tx is None or ty is None:
+                errors.append(f"target senza coordinate ({tx}|{ty})")
+                continue
+            if not troops:
+                errors.append(
+                    f"truppe non specificate per ({tx}|{ty})"
+                )
                 continue
             # Smart Hero Combat Evaluator: l'eroe parte con l'invio solo se
             # il planner (Scenario A/B/C) lo ha incluso. Il fill e' best-
@@ -1943,6 +1949,97 @@ class ActionExecutor:
             )
 
         return ActionResult(False, "errore invio form addestramento coloni")
+
+    async def _start_celebration(
+        self, action: Action, village_id: int = 0
+    ) -> ActionResult:
+        """Avvia una festa nel Municipio (Culture Points Booster).
+
+        Naviga a build.php?id=<town_hall_slot> e clicca il link della
+        festa richiesta (default: 'small' = Piccola Festa). Se una
+        festa e' gia' in corso o le risorse non bastano il link non e'
+        cliccabile: l'azione fallisce in modo pulito e il chiamante
+        riprova al prossimo ciclo.
+        """
+        params = action.params or {}
+        th_slot = int(
+            params.get("town_hall_slot") or params.get("slot_id") or 0
+        )
+        if th_slot <= 0:
+            return ActionResult(False, "slot Municipio mancante (town_hall_slot)")
+        kind = str(params.get("kind") or "small").strip().lower()
+
+        page = self.browser.page
+        assert page is not None
+
+        url = f"{selectors.PATH_BUILD}?id={th_slot}"
+        if village_id > 0:
+            url += f"&newdid={village_id}"
+        await self.browser.goto(url)
+        await sleep_human(1.0, 1.5)
+
+        info = await page.evaluate(
+            """
+            () => {
+                const text = (document.body && document.body.innerText) || '';
+                // Una festa in corso mostra il countdown nel Municipio.
+                const running = /celebration|festa|feier|fete|fiesta/i.test(text)
+                    && /(\\d+:\\d{2}:\\d{2})/.test(text);
+                const links = [];
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const href = a.getAttribute('href') || '';
+                    const label = (a.innerText || a.textContent || '')
+                        .trim().toLowerCase();
+                    if (/celebrat|festa|feier|fete|fiesta|great|small|piccola|grande|gro(ss|ß)|gran/i
+                            .test(href + ' ' + label)) {
+                        links.push({ href, label });
+                    }
+                });
+                return { running, links };
+            }
+            """
+        ) or {}
+
+        links = info.get("links") or []
+        if not links:
+            why = (
+                "festa gia' in corso o link assente"
+                if info.get("running")
+                else "nessun link festa nel Municipio "
+                     "(risorse insufficienti?)"
+            )
+            return ActionResult(False, why)
+
+        # Preferisci la festa 'small' (piccola): la grande costa di piu'
+        # e serve solo per i Punti Cultura massivi del chiefing.
+        pick = None
+        if kind == "small":
+            pick = next(
+                (
+                    l
+                    for l in links
+                    if any(
+                        w in l.get("label", "") + l.get("href", "")
+                        for w in ("small", "piccola", "kleine", "petite")
+                    )
+                ),
+                None,
+            )
+        if pick is None:
+            pick = links[0]
+        href = pick.get("href")
+        if not href:
+            return ActionResult(False, "link festa senza href")
+
+        await self.browser.goto(href)
+        await sleep_human(1.0, 2.0)
+        logger.info(
+            "Festa avviata al Municipio slot %s (villaggio %s): %s",
+            th_slot, village_id, pick.get("label") or href,
+        )
+        return ActionResult(
+            True, f"festa avviata al Municipio (slot {th_slot})"
+        )
 
     async def _upgrade_smithy_units(
         self, action: Action, village_id: int = 0

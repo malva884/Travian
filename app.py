@@ -48,6 +48,7 @@ from travian_agent.presets import (
     allowed_unit_slots_for_role,
     detect_tribe_from_labels,
     preset_for_role,
+    resolve_role,
     resolve_troop_labels,
     smithy_preset_for_role,
     troop_preset_for_role,
@@ -325,6 +326,25 @@ def get_defense_data(account_id: str) -> dict:
         return {}
     try:
         return json.loads(def_file.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+
+
+def get_account_data(account_id: str) -> dict:
+    """Snapshot account-level (kv ``account_<id>.json``): Punti Cultura
+    letti dal modulo espansione sulla pagina della Residenza."""
+    safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
+    raw = db.kv_read(f"account_{safe_id}.json")
+    if raw:
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
+    acc_file = STATE_DIR / f"account_{safe_id}.json"
+    if not acc_file.exists():
+        return {}
+    try:
+        return json.loads(acc_file.read_text(encoding="utf-8"))
     except ValueError:
         return {}
 
@@ -787,6 +807,11 @@ if page == "Villaggi":
 
         # Snapshot in tempo reale da history
         snapshots = get_latest_village_snapshots(cur_acc.account_id)
+        # Culture Points Booster: snapshot PC account-level (pagina Residenza)
+        _cp_data = get_account_data(cur_acc.account_id)
+        _cp_cur = int(_cp_data.get("culture_points_current") or 0)
+        _cp_req = int(_cp_data.get("culture_points_required") or 0)
+        _cp_day = int(_cp_data.get("culture_points_daily_prod") or 0)
 
         st.markdown("#### 📊 Stato Villaggi in Tempo Reale")
         if not snapshots and not cur_acc.villages:
@@ -2245,11 +2270,27 @@ if page == "Farming & Eroe":
                 FARM_STATUS_REJECTED: ("rejected", "neutral"),
                 FARM_STATUS_BLACKLISTED: ("blacklisted", "danger"),
             }
+            _outcome_lbl = {
+                "clean": "pulito", "losses": "perdite",
+                "empty": "vuoto",
+            }
             _ft_rows = []
             _ft_label = {}
             for _t in _ft_filtered:
                 _lbl, _tone = _farm_tone.get(_t.status, (_t.status, "neutral"))
                 _ft_label[_t.id] = f"({_t.x}|{_t.y}) {_t.name or ''}"
+                _last_raid = (
+                    datetime.datetime.fromtimestamp(_t.last_raid_ts)
+                    .strftime("%d/%m %H:%M")
+                    if _t.last_raid_ts else "—"
+                )
+                _last_info = _outcome_lbl.get(_t.last_outcome, "") or "—"
+                if _t.fail_reason:
+                    _last_info += (
+                        f"<br><span class='dim' title='"
+                        f"{ui.esc(_t.fail_reason)}'>⚠ "
+                        f"{ui.esc(_t.fail_reason[:40])}</span>"
+                    )
                 _ft_rows.append(
                     [
                         f"<span class='mono'>({_t.x}|{_t.y})</span>",
@@ -2259,15 +2300,43 @@ if page == "Farming & Eroe":
                         str(_t.population or "—"),
                         str(_t.estimated_loot or "—"),
                         f"{_t.last_loot_ratio:.0%}",
-                        str(_t.losses_recorded or "—"),
+                        _last_raid,
+                        _last_info,
                         ui.pill(_lbl, _tone),
                     ]
                 )
             ui.render_table(
                 ["Coord", "Nome", "Tipo", "Dist", "Pop", "Loot st.",
-                 "Loot%", "Perdite", "Stato"],
+                 "Loot%", "Ultimo raid", "Esito/Note", "Stato"],
                 _ft_rows,
             )
+
+            # Azioni rapide per-riga sui target pending (spec 1.3)
+            _pending_quick = [
+                t for t in _ft_filtered
+                if t.status == FARM_STATUS_PENDING
+            ][:8]
+            if _pending_quick:
+                st.caption("Azioni rapide sui target in attesa:")
+                for _qt in _pending_quick:
+                    q1, q2, q3 = st.columns([4, 1, 1])
+                    q1.markdown(
+                        f"`({_qt.x}|{_qt.y})` "
+                        f"{_qt.name or 'Oasi' if _qt.is_oasis else 'Villaggio'}"
+                        f" — loot ~{_qt.estimated_loot}"
+                    )
+                    if q2.button(
+                        "✅", key=f"fqok_{_qt.id}_{mod_acc.account_id}",
+                        help=f"Approva ({_qt.x}|{_qt.y})",
+                    ):
+                        _fstore.approve(_qt.id)
+                        st.rerun()
+                    if q3.button(
+                        "❌", key=f"fqno_{_qt.id}_{mod_acc.account_id}",
+                        help=f"Scarta ({_qt.x}|{_qt.y})",
+                    ):
+                        _fstore.blacklist(_qt.id)
+                        st.rerun()
 
             # Azioni bulk sui target selezionati (stile console)
             ba1, ba2, ba3, ba4 = st.columns([3, 1, 1, 1])
@@ -2301,13 +2370,15 @@ if page == "Farming & Eroe":
             # (azioni per-riga sostituite dalle azioni bulk sopra)
 
         # --- Inserimento manuale target ---
-        st.markdown("**➕ Inserimento Manuale Target**")
+        st.markdown("**➕ Aggiungi Coordinate Manualmente**")
         st.caption(
-            "Conosci un' oasi abbandonata o un villaggio inattivo da "
-            "saccheggiare? Inseriscilo qui: entra come pending e va approvato "
-            "come gli altri."
+            "Conosci un'oasi abbandonata o un villaggio inattivo da "
+            "saccheggiare? Inseriscilo qui: entra direttamente come "
+            "approved e l'agente inizia a razziarlo al prossimo ciclo."
         )
-        mt1, mt2, mt3, mt4, mt5 = st.columns([0.9, 0.9, 1.8, 0.9, 1.3])
+        mt1, mt2, mt3, mt4, mt5, mt6 = st.columns(
+            [0.8, 0.8, 1.6, 0.7, 1.2, 1.1]
+        )
         with mt1:
             _mt_x = st.number_input(
                 "Coord. X:", min_value=-400, max_value=400, value=0,
@@ -2327,6 +2398,14 @@ if page == "Farming & Eroe":
                 "Oasi", key=f"fmto_{mod_acc.account_id}",
             )
         with mt5:
+            _mt_opts = ["(auto: il piu' vicino)"] + list(
+                mod_acc.villages.keys()
+            )
+            _mt_sender = st.selectbox(
+                "Villaggio mittente:", _mt_opts,
+                key=f"fmts_{mod_acc.account_id}",
+            )
+        with mt6:
             st.write(" ")
             if st.button(
                 "Aggiungi Target",
@@ -2342,11 +2421,16 @@ if page == "Farming & Eroe":
                         _mx, _my,
                         name=_mt_name.strip(),
                         is_oasis=bool(_mt_oasis),
+                        status=FARM_STATUS_APPROVED,
+                        nearest_village=(
+                            "" if _mt_sender.startswith("(auto")
+                            else _mt_sender
+                        ),
                     )
                     if _new_t is not None:
                         st.success(
-                            f"Target ({_mx}|{_my}) aggiunto come pending. "
-                            "Approva per attivare i raid."
+                            f"Target ({_mx}|{_my}) aggiunto e APPROVATO: "
+                            "i raid mirati partono al prossimo ciclo."
                         )
                         st.rerun()
 
@@ -2363,6 +2447,31 @@ if page == "Espansione":
     else:
         e_acc = _selected_account()
         st.caption(f"Account attivo: **{e_acc.account_id}** — {e_acc.server_url}")
+
+        # Culture Points Booster: barra progresso PC verso il prossimo
+        # slot di espansione (snapshot letto dal modulo sulla Residenza).
+        _acc_data = get_account_data(e_acc.account_id)
+        _cp_cur = int(_acc_data.get("culture_points_current") or 0)
+        _cp_req = int(_acc_data.get("culture_points_required") or 0)
+        _cp_day = int(_acc_data.get("culture_points_daily_prod") or 0)
+        if _cp_req > 0:
+            st.markdown("#### 🎭 Punti Cultura verso il prossimo villaggio")
+            _pc1, _pc2, _pc3 = st.columns(3)
+            _pc1.metric("PC Attuali", f"{_cp_cur:,}")
+            _pc2.metric("PC Richiesti", f"{_cp_req:,}")
+            _pc3.metric("Produzione/giorno", f"{_cp_day:,}" if _cp_day else "—")
+            st.progress(min(1.0, _cp_cur / _cp_req))
+            if _cp_cur >= _cp_req:
+                st.success(
+                    "Soglia raggiunta: l'agente addestra i 3 coloni e "
+                    "prepara la fondazione."
+                )
+            elif _cp_day > 0:
+                _eta_days = (_cp_req - _cp_cur) / _cp_day
+                st.caption(
+                    f"Stima al prossimo slot: ~{_eta_days:.1f} giorni "
+                    f"(a produzione costante, feste escluse)"
+                )
         store = CropperStore()
         candidates = store.list_candidates(e_acc.account_id)
 
