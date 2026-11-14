@@ -30,7 +30,7 @@ from .config import (
     load_accounts,
     save_accounts,
 )
-from .defense import DefenseManager
+from .defense import DefenseManager, PendingReinforce
 from .expansion import ExpansionManager, feeder_surplus, find_market
 from .farm_store import farm_target_store
 from .farming import FarmingManager, find_rally_point
@@ -61,6 +61,8 @@ from .war import (
     WAVE_FAILED,
     WAVE_SENT,
     WarStore,
+    is_defensive_unit,
+    travel_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -480,6 +482,198 @@ async def _dispatch_reclaim_waves(
         )
 
 
+async def _coordinate_inter_village_defense(
+    *,
+    executor: ActionExecutor,
+    observer: GameObserver,
+    settings: Settings,
+    village: Village,
+    state: GameState,
+    villages: list[Village],
+    last_states: dict[str, Resources] | None,
+    defense_mgr: DefenseManager,
+    replenish_mgr: TroopReplenishmentManager | None,
+    rally_slot: int,
+    market_slot: int,
+    prefix: str,
+    now: float,
+) -> None:
+    """Smart Reinforce Coordinator (spec: motore di selezione donatori).
+
+    Eseguito nel contesto del villaggio corrente: se il villaggio e'
+    sicuro, consulta il registro minacce di DefenseManager e manda un
+    muro di rinforzo (move_type=2, solo unita' difensive) verso i
+    villaggi alleati sotto attacco reale, purché la marcia arrivi
+    prima dell'impatto meno ``reinforce_margin_seconds``.
+    """
+    cfg = settings.defense
+    threats = defense_mgr.active_threats(now)
+    my_id = int(village.village_id or state.village_id or 0)
+    targets = {
+        vid: t for vid, t in threats.items()
+        if str(vid).isdigit() and int(vid) != my_id
+    }
+    if not targets:
+        return
+
+    # Sicurezza del donatore: niente minacce reali su di se', niente
+    # lock d'emergenza, niente congelamento da assedio.
+    if str(my_id) in threats or int(state.incoming_attacks or 0) > 0:
+        return
+    if defense_mgr.is_emergency_locked(my_id, now):
+        return
+    if replenish_mgr is not None and replenish_mgr.is_village_frozen(
+        village.name or ""
+    ):
+        return
+    if village.x is None or village.y is None or not rally_slot:
+        return
+
+    # Pool difensive: solo unita' da muro della tribu' rilevata;
+    # il pacchetto mobilita mobilize_def_pct lasciando in sede almeno
+    # min_home_defense_pct di guarnigione.
+    troops = dict(state.troops_home or {})
+    if not troops:
+        troops = await observer.read_troops_home(rally_slot, my_id)
+        state.troops_home = dict(troops)
+    tribe = settings.tribe or detect_tribe_from_keys(troops.keys())
+    send: dict[str, int] = {}
+    for unit, qty in troops.items():
+        qty = int(qty or 0)
+        if qty <= 0 or not is_defensive_unit(unit, tribe):
+            continue
+        movable = int(qty * max(0.0, cfg.mobilize_def_pct))
+        keep = int(qty * max(0.0, cfg.min_home_defense_pct))
+        qty_send = min(movable, qty - keep)
+        if qty_send > 0:
+            send[unit] = qty_send
+    if not send:
+        return
+
+    for vid, info in sorted(
+        targets.items(), key=lambda kv: float(kv[1].get("arrival_ts") or 0.0)
+    ):
+        target_id = int(vid)
+        arrival = float(info.get("arrival_ts") or 0.0)
+        secs_left = arrival - now
+        if secs_left <= cfg.reinforce_margin_seconds:
+            continue
+        tname = str(info.get("name") or "")
+        # Assedio insostenibile: il bersaglio e' congelato (ondate >=
+        # siege_waves) e cedera' comunque — non sacrificare i muri.
+        if replenish_mgr is not None and replenish_mgr.is_village_frozen(tname):
+            continue
+        tx, ty = info.get("x"), info.get("y")
+        if tx is None or ty is None:
+            tv = next(
+                (
+                    v
+                    for v in villages
+                    if int(v.village_id or 0) == target_id
+                ),
+                None,
+            )
+            if tv is not None and tv.x is not None and tv.y is not None:
+                tx, ty = tv.x, tv.y
+        if tx is None or ty is None:
+            continue
+        # Filtro di arrivo: marcia <= tempo residuo - margine operativo
+        travel = travel_seconds(
+            send, int(village.x), int(village.y), int(tx), int(ty)
+        )
+        if travel > secs_left - cfg.reinforce_margin_seconds:
+            logger.debug(
+                "%s Rinforzo verso '%s' impossibile: marcia %ds > "
+                "finestra %ds.",
+                prefix, tname, int(travel),
+                int(secs_left - cfg.reinforce_margin_seconds),
+            )
+            continue
+        if defense_mgr.reinforce_sent(target_id, my_id, arrival):
+            continue
+
+        action = Action(
+            type=ActionType.SEND_CUSTOM_RAID,
+            params={
+                "rally_slot": rally_slot,
+                "move_type": "2",  # rinforzi
+                "targets": [
+                    {"x": int(tx), "y": int(ty), "troops": dict(send)}
+                ],
+            },
+            reason=(
+                f"Coordinatore rinforzi: {sum(send.values())} difese "
+                f"{village.name} -> '{tname}' ({tx}|{ty}), impatto "
+                f"nemico tra {int(secs_left)}s",
+            ),
+        )
+        result = await executor.execute(action, village_id=my_id)
+        if not result.success:
+            logger.warning(
+                "%s Rinforzo verso '%s' fallito: %s",
+                prefix, tname, result.message,
+            )
+            continue
+
+        defense_mgr.register_reinforce(
+            PendingReinforce(
+                donor_village_id=my_id,
+                donor_name=village.name or "",
+                target_village_id=target_id,
+                target_name=tname,
+                target_x=int(tx),
+                target_y=int(ty),
+                attack_arrival_ts=arrival,
+                troops=dict(send),
+                sent_ts=now,
+            ),
+            donor_x=village.x,
+            donor_y=village.y,
+            recall_delay_seconds=float(cfg.recall_delay_seconds),
+            auto_recall=bool(cfg.auto_recall_reinforce),
+        )
+        logger.warning(
+            "%s Muro in viaggio verso '%s': %d truppe, impatto nemico "
+            "tra %ds (rientro %s).",
+            prefix, tname, sum(send.values()), int(secs_left),
+            "automatico" if cfg.auto_recall_reinforce else "manuale",
+        )
+
+        # Crop safety: se il bersaglio e' gia' in carestia (bilancio
+        # grano netto negativo) il donatore accompagna il muro con un
+        # carico di grano dal surplus feeder.
+        t_res = (last_states or {}).get(tname)
+        if (
+            t_res is not None
+            and t_res.crop_balance is not None
+            and t_res.crop_balance < 0
+            and market_slot
+        ):
+            surplus = feeder_surplus(state)
+            crop_amt = int(surplus.get("crop", 0) or 0)
+            if crop_amt > 0:
+                await executor.execute(
+                    Action(
+                        type=ActionType.SEND_RESOURCES,
+                        params={
+                            "market_slot": market_slot,
+                            "target_village": tname,
+                            "target_x": int(tx),
+                            "target_y": int(ty),
+                            "resources": {"crop": crop_amt},
+                        },
+                        reason=(
+                            f"Coordinatore: {crop_amt} grano d'emergenza "
+                            f"verso '{tname}' in carestia"
+                        ),
+                    ),
+                    village_id=my_id,
+                )
+        # Un muro per donatore per ciclo: le truppe sono partite, le
+        # rimanenti destinazioni saranno rivalutate al ciclo successivo.
+        break
+
+
 def _append_history(account_id: str, state: GameState, action: Action) -> None:
     """Salva lo storico decisionale per-villaggio (DB + JSONL di backup)."""
     try:
@@ -833,6 +1027,39 @@ async def monitor_all_villages(
                     logger.warning(
                         "%s Errore modulo difesa (non bloccante): %s",
                         vprefix, d_exc,
+                    )
+
+            # 3.55 Smart Reinforce Coordinator: il villaggio corrente,
+            #     se non minacciato, valuta il registro attacchi e manda
+            #     un muro di rinforzo ai villaggi alleati sotto attacco.
+            if (
+                defense_mgr is not None
+                and settings.defense.enabled
+                and settings.defense.reinforce_coordination
+            ):
+                rally_co = find_rally_point(state.interior_fields())
+                market_co = find_market(state.interior_fields())
+                try:
+                    await _coordinate_inter_village_defense(
+                        executor=executor,
+                        observer=observer,
+                        settings=settings,
+                        village=village,
+                        state=state,
+                        villages=villages,
+                        last_states=last_states,
+                        defense_mgr=defense_mgr,
+                        replenish_mgr=replenish_mgr,
+                        rally_slot=rally_co.slot_id if rally_co else 0,
+                        market_slot=market_co.slot_id if market_co else 0,
+                        prefix=vprefix,
+                        now=time.time(),
+                    )
+                except Exception as rc_exc:
+                    logger.warning(
+                        "%s Errore coordinatore rinforzi "
+                        "(non bloccante): %s",
+                        vprefix, rc_exc,
                     )
 
             # 3.6 Reclaim & Chiefing: wave pianificate il cui depart_ts

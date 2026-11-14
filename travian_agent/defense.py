@@ -56,6 +56,17 @@ _TRAINER_GIDS = {GID_BARRACKS, GID_STABLE, GID_WORKSHOP}
 # Margine di sicurezza: mai spedire risorse/difese sotto questo stock
 _DRAIN_KEEP = 200
 
+# Smart Reinforce Coordinator: prima di richiamare i rinforzi il
+# villaggio ospite non deve avere altre minacce reali in arrivo entro
+# questa finestra (spec: "verificato che non vi siano altre ondate
+# imminenti entro 15 minuti").
+_RECALL_THREAT_WINDOW = 900.0
+
+# Validita' di una voce del registro minacce dopo l'impatto previsto
+_THREAT_STALE_SECONDS = 30.0
+# Quanto resta visibile un rinforzo inviato nel feed di coordinamento
+_REINFORCE_LOG_TTL = 3600.0
+
 
 @dataclass
 class PendingDodge:
@@ -86,6 +97,27 @@ class PendingRecall:
 
 
 @dataclass
+class PendingReinforce:
+    """Rinforzo inviato da un villaggio donatore verso un bersaglio.
+
+    Registrato dopo l'invio (move_type=2) per il feed di coordinamento
+    della dashboard e per la deduplica: lo stesso donatore non manda
+    due muri sulla stessa ondata. Il rientro e' gestito dalla catena
+    PendingRecall creata in ``register_reinforce``.
+    """
+
+    donor_village_id: int
+    donor_name: str
+    target_village_id: int
+    target_name: str
+    target_x: int | None
+    target_y: int | None
+    attack_arrival_ts: float
+    troops: dict[str, int] = field(default_factory=dict)
+    sent_ts: float = 0.0
+
+
+@dataclass
 class DefenseManager:
     """Gestore della reazione anti-attacco per un account."""
 
@@ -93,6 +125,13 @@ class DefenseManager:
     state_path: Path | None = None
     dodges: dict[str, PendingDodge] = field(default_factory=dict)   # key: village_id
     recalls: list[PendingRecall] = field(default_factory=list)
+    # Smart Reinforce Coordinator:
+    # - threats: str(village_id) -> {name, x, y, arrival_ts, count, read_ts}
+    #   registro delle minacce reali viste sull'account (aggiornato a
+    #   ogni visita del villaggio, consumato dai donatori);
+    # - reinforces: rinforzi gia' inviati (deduplica + feed dashboard).
+    threats: dict[str, dict] = field(default_factory=dict)
+    reinforces: list[PendingReinforce] = field(default_factory=list)
     # Lock temporaneo (spec 4.1): village_id -> ts di fine emergenza.
     # Mentre attivo, replenishment.py viene congelato dall'orchestrator per
     # evitare conflitti sulla spesa delle risorse appena svuotate.
@@ -132,9 +171,21 @@ class DefenseManager:
                     str(k): float(v)
                     for k, v in (data.get("emergency_until") or {}).items()
                 }
+                self.threats = {
+                    str(k): dict(v)
+                    for k, v in (data.get("threats") or {}).items()
+                    if isinstance(v, dict)
+                }
+                self.reinforces = [
+                    PendingReinforce(**v)
+                    for v in (data.get("reinforces") or [])
+                    if isinstance(v, dict)
+                ]
         except Exception:
             self.dodges = {}
             self.recalls = []
+            self.threats = {}
+            self.reinforces = []
             self.emergency_until = {}
 
     def _save(self) -> None:
@@ -143,6 +194,8 @@ class DefenseManager:
                 {
                     "dodges": {k: vars(v) for k, v in self.dodges.items()},
                     "recalls": [vars(r) for r in self.recalls],
+                    "threats": self.threats,
+                    "reinforces": [vars(r) for r in self.reinforces],
                     "emergency_until": self.emergency_until,
                 },
                 indent=2,
@@ -175,6 +228,115 @@ class DefenseManager:
     def _lock_village(self, village_id: int | str, until_ts: float) -> None:
         self.emergency_until[str(village_id)] = until_ts
         self._save()
+
+    # ------------------------------------------------------------------
+    # Smart Reinforce Coordinator: registro minacce + rinforzi inviati
+    # ------------------------------------------------------------------
+    def record_threats(
+        self,
+        village: "Village",
+        threats: list[IncomingAttack],
+        now: float,
+    ) -> None:
+        """Aggiorna il registro minacce per il villaggio appena visitato.
+
+        Una voce vive finche' le minacce restano reali: quando il
+        villaggio e' di nuovo pulito la voce viene rimossa, cosi' i
+        donatori non inseguono allarmi rientrati.
+        """
+        key = str(village.village_id or 0)
+        if threats:
+            nearest = min(threats, key=lambda a: a.arrival_ts)
+            entry = {
+                "name": village.name or "",
+                "x": village.x,
+                "y": village.y,
+                "arrival_ts": float(nearest.arrival_ts),
+                "count": len(threats),
+                "read_ts": now,
+            }
+            if self.threats.get(key) != entry:
+                self.threats[key] = entry
+                self._save()
+        elif key in self.threats:
+            self.threats.pop(key, None)
+            self._save()
+
+    def active_threats(self, now: float) -> dict[str, dict]:
+        """Registro minacce reali non scadute (village_id -> info)."""
+        changed = False
+        for vid in list(self.threats):
+            arrival = float(self.threats[vid].get("arrival_ts") or 0.0)
+            if arrival <= now - _THREAT_STALE_SECONDS:
+                self.threats.pop(vid, None)
+                changed = True
+        if changed:
+            self._save()
+        return self.threats
+
+    def reinforce_sent(
+        self, target_village_id: int, donor_village_id: int, arrival_ts: float
+    ) -> bool:
+        """True se il donatore ha gia' un muro in viaggio su quel bersaglio.
+
+        La finestra +-5 minuti copre le ondate dello stesso assalto:
+        un rinforzo spedito per la prima ondata vale anche per quelle
+        ravvicinate senza duplicare l'invio.
+        """
+        for r in self.reinforces:
+            if (
+                r.target_village_id == int(target_village_id or 0)
+                and r.donor_village_id == int(donor_village_id or 0)
+                and abs(r.attack_arrival_ts - arrival_ts) <= 300.0
+            ):
+                return True
+        return False
+
+    def register_reinforce(
+        self,
+        rec: PendingReinforce,
+        *,
+        donor_x: int | None,
+        donor_y: int | None,
+        recall_delay_seconds: float,
+        auto_recall: bool = True,
+    ) -> None:
+        """Registra il rinforzo inviato e programma il rientro (spec 3).
+
+        Il PendingRecall punta al villaggio bersaglio (host): quando
+        l'orchestratore lo visita dopo l'impatto, le truppe tornano al
+        donatore (home). ``auto_recall=False`` lascia il muro in sede.
+        """
+        self.reinforces.append(rec)
+        if auto_recall:
+            self.recalls.append(
+                PendingRecall(
+                    host_village_id=rec.target_village_id,
+                    home_village_id=rec.donor_village_id,
+                    home_name=rec.donor_name,
+                    home_x=donor_x,
+                    home_y=donor_y,
+                    recall_at_ts=rec.attack_arrival_ts + recall_delay_seconds,
+                    troops=dict(rec.troops),
+                )
+            )
+        self._prune_reinforces(time.time())
+        self._save()
+
+    def _prune_reinforces(self, now: float) -> None:
+        self.reinforces = [
+            r
+            for r in self.reinforces
+            if r.attack_arrival_ts > now - _REINFORCE_LOG_TTL
+        ]
+
+    def reinforce_status(self, now: float) -> list[PendingReinforce]:
+        """Rinforzi ancora rilevanti per il feed della dashboard."""
+        return [
+            r
+            for r in self.reinforces
+            if r.attack_arrival_ts > now - _REINFORCE_LOG_TTL
+        ]
 
     # ------------------------------------------------------------------
     # Entry point: chiamato dall'orchestrator per ogni villaggio del ciclo
@@ -211,6 +373,7 @@ class DefenseManager:
             rally_slot=rally_slot,
             prefix=prefix,
             now=now,
+            observer=observer,
         )
 
         # B) Fuga programmata scaduta (registrata in un ciclo precedente)
@@ -235,6 +398,10 @@ class DefenseManager:
             a for a in attacks
             if a.is_threat and not a.is_likely_fake(cfg.fake_troop_threshold)
         ]
+        # Registro minacce inter-villaggio (Smart Reinforce Coordinator):
+        # le minacce reali restano disponibili ai villaggi donatori
+        # visitati nei passi successivi del ciclo.
+        self.record_threats(village, threats, now)
         if not threats:
             return
 
@@ -647,11 +814,13 @@ class DefenseManager:
         rally_slot: int,
         prefix: str,
         now: float,
+        observer: "GameObserver | None" = None,
     ) -> None:
         """Se questo villaggio ospita truppe evacuate scadute, le rimanda a casa."""
         if not self.recalls or not rally_slot:
             return
         remaining: list[PendingRecall] = []
+        upcoming: list[IncomingAttack] | None = None
         for rec in self.recalls:
             # Il rientro parte dal villaggio che ospita le truppe
             if rec.host_village_id and rec.host_village_id != village.village_id:
@@ -662,6 +831,35 @@ class DefenseManager:
                 continue
             if rec.home_x is None or rec.home_y is None or not rec.troops:
                 continue  # dati insufficienti: scarta
+
+            # Spec 3: niente rientro se sul villaggio ospite stanno
+            # arrivando altre ondate reali entro 15 minuti — il muro
+            # serve ancora. Il rientro e' riprogrammato dopo l'ultima
+            # ondata nota (lettura condivisa tra i recall del ciclo).
+            if observer is not None:
+                if upcoming is None:
+                    upcoming = await observer.get_incoming_attacks(
+                        rally_slot, village.village_id
+                    )
+                imminent = [
+                    a
+                    for a in upcoming
+                    if a.is_threat
+                    and a.arrival_ts > now
+                    and (a.arrival_ts - now) <= _RECALL_THREAT_WINDOW
+                ]
+                if imminent:
+                    rec.recall_at_ts = (
+                        max(a.arrival_ts for a in imminent)
+                        + settings.defense.recall_delay_seconds
+                    )
+                    remaining.append(rec)
+                    logger.info(
+                        "%s Recall rinviato: %d ondate reali ancora in "
+                        "arrivo su '%s'.",
+                        prefix, len(imminent), village.name,
+                    )
+                    continue
 
             action = Action(
                 type=ActionType.SEND_CUSTOM_RAID,

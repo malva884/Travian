@@ -310,6 +310,25 @@ def get_hero_data(account_id: str) -> dict:
         return {}
 
 
+def get_defense_data(account_id: str) -> dict:
+    """Stato modulo difesa (kv DB, fallback file legacy):
+    minacce reali e rinforzi in transito del Smart Reinforce Coordinator."""
+    safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
+    raw = db.kv_read(f"defense_{safe_id}.json")
+    if raw:
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
+    def_file = STATE_DIR / f"defense_{safe_id}.json"
+    if not def_file.exists():
+        return {}
+    try:
+        return json.loads(def_file.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+
+
 def get_account_session_info(acc: Settings) -> dict:
     f = acc.state_file or (STATE_DIR / f"session_{acc.account_id}.json")
     if f.exists():
@@ -1908,6 +1927,50 @@ if page == "Farming & Eroe":
                     key="defense_drain_target",
                 )
 
+            # ----- Smart Reinforce Coordinator (rinforzi tra villaggi) -----
+            st.markdown("#### 🧱 Coordinatore Rinforzi Inter-Villaggio")
+            reinforce_coord = st.toggle(
+                "Abilita coordinamento rinforzi automatici tra villaggi",
+                value=getattr(mod_acc.defense, "reinforce_coordination", False),
+                key="defense_reinforce_coord",
+                help="Se un villaggio alleato subisce un attacco reale, i "
+                     "villaggi sicuri inviano le truppe difensive come "
+                     "rinforzo (move_type=2) quando la marcia arriva in tempo.",
+            )
+            rc1, rc2, rc3 = st.columns(3)
+            with rc1:
+                reinforce_margin = st.slider(
+                    "Margine arrivo prima dell'impatto (sec)",
+                    min_value=15, max_value=600, step=15,
+                    value=int(
+                        getattr(mod_acc.defense, "reinforce_margin_seconds", 60)
+                    ),
+                    help="Il rinforzo parte solo se arriva almeno N secondi "
+                         "prima dell'impatto nemico. Default 60s.",
+                )
+            with rc2:
+                mobilize_pct = st.slider(
+                    "Truppe difensive mobilitabili per villaggio (%)",
+                    min_value=10, max_value=100, step=5,
+                    value=int(
+                        getattr(mod_acc.defense, "mobilize_def_pct", 0.85)
+                        * 100
+                    ),
+                    help="Quota del muro spedita in rinforzo; il resto resta "
+                         "a presidio del donatore. Default 85%.",
+                ) / 100.0
+            with rc3:
+                auto_recall_r = st.toggle(
+                    "Rientro automatico dopo la difesa",
+                    value=getattr(
+                        mod_acc.defense, "auto_recall_reinforce", True
+                    ),
+                    key="defense_auto_recall",
+                    help="Passato l'attacco (e senza altre ondate entro "
+                         "15 min) i rinforzi tornano al villaggio "
+                         "d'origine.",
+                )
+
             st.divider()
 
             # ------------- SMART TROOP REPLENISHMENT (Rimpiazzo Perdite) -------------
@@ -2094,6 +2157,10 @@ if page == "Farming & Eroe":
             mod_acc.defense.dodge_target = defense_dodge.strip()
             mod_acc.defense.drain_via_market = bool(defense_drain_mkt)
             mod_acc.defense.drain_target_village = defense_drain_target.strip()
+            mod_acc.defense.reinforce_coordination = bool(reinforce_coord)
+            mod_acc.defense.reinforce_margin_seconds = int(reinforce_margin)
+            mod_acc.defense.mobilize_def_pct = float(mobilize_pct)
+            mod_acc.defense.auto_recall_reinforce = bool(auto_recall_r)
 
             # Smart Troop Replenishment
             mod_acc.replenishment.enabled = bool(repl_enabled)

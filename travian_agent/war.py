@@ -75,6 +75,30 @@ UNIT_SPEED: dict[str, float] = {
 # Unita' "capo" per tribu' (Senatore / Comandante / Capotribu')
 CHIEF_UNITS = {"romans": "t9", "teutons": "t19", "gauls": "t29"}
 
+# Unita' difensive da muro per tribu' (Smart Reinforce Coordinator).
+# Spec: "Falangi, Lancieri, Pretoriani, Paladini, Druidi" — slot
+# infantry_def + cavalry_def dei preset; t1 (Legionario) incluso
+# perche' unita' base da presidio romana. Esclusi raider puri,
+# macchine d'assedio, nobili e coloni (t10/t20/t30).
+DEFENSIVE_UNITS: dict[str, set[str]] = {
+    "romans": {"t1", "t2"},
+    "teutons": {"t12", "t15"},
+    "gauls": {"t21", "t25"},
+}
+
+
+def is_defensive_unit(unit_key: str, tribe: str = "") -> bool:
+    """True se l'unita' e' da muro (rinforzabile, non raid/colono).
+
+    Con ``tribe`` noto filtra solo le unita' difensive di quella tribu';
+    senza tribu' accetta qualunque unita' difensiva nota.
+    """
+    k = _unit_key(unit_key)
+    t = str(tribe or "").strip().lower()
+    if t in DEFENSIVE_UNITS:
+        return k in DEFENSIVE_UNITS[t]
+    return any(k in units for units in DEFENSIVE_UNITS.values())
+
 # Riduzione lealta' per colpo di nobile, in punti percentuali (spec:
 # 20-25% a colpo -> 4-5 colpi puliti da 100% a 0%). Usata solo per
 # stimare quante wave 'chief' servono nel treno.

@@ -216,6 +216,12 @@ class DefenseConfig:
     drain_via_market: bool = False       # surplus residuo -> mercato verso alleato
     drain_target_village: str = ""       # nome destinazione drain (vuoto = nessuna)
     dodge_target: str = ""               # nome villaggio o "x|y" (vuoto = proprio piu' vicino)
+    # --- Smart Reinforce Coordinator (rinforzi tra villaggi) ---
+    reinforce_coordination: bool = False # coordinamento rinforzi inter-villaggio
+    reinforce_margin_seconds: int = 60   # rinforzo solo se arriva >= N sec prima dell'impatto
+    mobilize_def_pct: float = 0.85       # quota del muro spedita in rinforzo
+    min_home_defense_pct: float = 0.15   # guarnigione minima lasciata al donatore
+    auto_recall_reinforce: bool = True   # rientro automatico dopo l'attacco
 
 
 @dataclass
@@ -557,6 +563,11 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                 "drain_via_market": acc.defense.drain_via_market,
                 "drain_target_village": acc.defense.drain_target_village,
                 "dodge_target": acc.defense.dodge_target,
+                "reinforce_coordination": acc.defense.reinforce_coordination,
+                "reinforce_margin_seconds": acc.defense.reinforce_margin_seconds,
+                "mobilize_def_pct": acc.defense.mobilize_def_pct,
+                "min_home_defense_pct": acc.defense.min_home_defense_pct,
+                "auto_recall_reinforce": acc.defense.auto_recall_reinforce,
             },
             "replenishment_settings": {
                 "enabled": acc.replenishment.enabled,
