@@ -19,7 +19,7 @@ import os
 import random
 import sys
 
-from travian_agent import selectors
+from travian_agent import db, selectors
 from travian_agent.browser import TravianBrowser
 from travian_agent.config import BASE_DIR, Settings, load_accounts, load_settings
 from travian_agent.orchestrator import run_all_accounts, run_single_account_loop
