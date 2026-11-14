@@ -382,3 +382,6 @@ class Action:
 class ActionResult:
     success: bool
     message: str = ""
+    # Dati strutturati opzionali (es. anti-ghost raid: coordinate per
+    # cui il browser ha confermato visivamente l'invio truppe).
+    data: dict = field(default_factory=dict)

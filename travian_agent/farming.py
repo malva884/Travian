@@ -373,11 +373,46 @@ class FarmingManager:
             ),
         )
         result = await executor.execute(action, village_id=village.village_id)
-        # Registra per-target l'esito del tentativo (spec 1.2:
-        # fail_reason esplicito sui mancati invii, timestamp sui riusciti).
+        # Anti-ghost (hotfix): last_raid_ts si aggiorna SOLO per i
+        # target la cui uscita truppe e' stata confermata visivamente
+        # dal browser (result.data['sent_coords']); il successo del
+        # batch non basta piu' — un submit su form non valido non deve
+        # toccare il timestamp. Senza payload strutturato (executor
+        # datato/test) si ricade sul comportamento precedente.
+        _sent = (result.data or {}).get("sent_coords")
+        _sent_coords: set[tuple[int, int]] = set()
+        if _sent is not None:
+            for _c in _sent:
+                try:
+                    _sent_coords.add((int(_c[0]), int(_c[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        _failed = (result.data or {}).get("failed_targets") or []
         for t in selected:
+            try:
+                _coord = (int(t.x), int(t.y))
+            except (TypeError, ValueError):
+                _coord = (t.x, t.y)
+            _t_sent = (
+                _coord in _sent_coords
+                if _sent is not None
+                else bool(result.success)
+            )
+            _reason = result.message
+            if not _t_sent:
+                for _ft in _failed:
+                    try:
+                        if (
+                            int(_ft.get("x")), int(_ft.get("y"))
+                        ) == _coord:
+                            _reason = str(
+                                _ft.get("reason") or _reason
+                            )
+                            break
+                    except (TypeError, ValueError):
+                        continue
             farm_store.record_raid_attempt(
-                t.x, t.y, result.success, result.message
+                t.x, t.y, _t_sent, _reason
             )
         if result.success:
             logger.info(

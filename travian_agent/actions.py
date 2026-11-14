@@ -687,6 +687,30 @@ class ActionExecutor:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Dump HTML mercato fallito: %s", exc)
 
+    async def _dump_raid_debug(self, page, tag: str) -> None:
+        """Screenshot + HTML del Punto di Raduno dopo un invio raid fallito.
+
+        Hotfix 'ghost execution': ogni mancato invio deve lasciare un
+        artefatto diagnostico in debug/<account>/ per ispezionare lo
+        stato reale del DOM al momento del fallimento.
+        """
+        try:
+            debug_dir = getattr(self.settings, "debug_dir", None)
+            if debug_dir is None:
+                return
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            safe = "".join(c if c.isalnum() else "_" for c in str(tag))
+            stamp = time.strftime("%H%M%S")
+            (debug_dir / f"raid_fail_{safe}_{stamp}.html").write_text(
+                await page.content(), encoding="utf-8"
+            )
+            await page.screenshot(
+                path=str(debug_dir / f"raid_fail_{safe}_{stamp}.png"),
+                full_page=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Dump debug raid fallito: %s", exc)
+
     async def _select_send_resources_tab(self, page) -> bool:
         """Clicca sul tab 'Invia risorse' (secondo tab, t=5) nel mercato se non e' gia' attivo."""
         # Se siamo già sulla scheda t=5, la consideriamo già aperta
@@ -1645,6 +1669,8 @@ class ActionExecutor:
         assert page is not None
 
         sent_count = 0
+        sent_coords: list[list[int]] = []
+        failed_targets: list[dict] = []
         errors: list[str] = []
 
         for tgt in raw_targets:
@@ -1653,10 +1679,16 @@ class ActionExecutor:
             troops = dict(tgt.get("troops") or {})
             if tx is None or ty is None:
                 errors.append(f"target senza coordinate ({tx}|{ty})")
+                failed_targets.append(
+                    {"x": tx, "y": ty, "reason": "missing_coords"}
+                )
                 continue
             if not troops:
                 errors.append(
                     f"truppe non specificate per ({tx}|{ty})"
+                )
+                failed_targets.append(
+                    {"x": tx, "y": ty, "reason": "missing_troops"}
                 )
                 continue
             # Smart Hero Combat Evaluator: l'eroe parte con l'invio solo se
@@ -1680,55 +1712,106 @@ class ActionExecutor:
                     """
                     (payload) => {
                         const { x, y, troops, moveType, includeHero } = payload;
+                        const pick = (sels) => {
+                            for (const s of sels) {
+                                const el = document.querySelector(s);
+                                if (el) return el;
+                            }
+                            return null;
+                        };
+                        const setVal = (el, v) => {
+                            el.value = String(v);
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                        };
 
-                        // Coordinate X / Y
-                        const xIn = document.querySelector('input[name="x"], input#xCoordInput, #xCoord');
-                        const yIn = document.querySelector('input[name="y"], input#yCoordInput, #yCoord');
-                        if (xIn) { xIn.value = String(x); xIn.dispatchEvent(new Event('input', {bubbles: true})); }
-                        if (yIn) { yIn.value = String(y); yIn.dispatchEvent(new Event('input', {bubbles: true})); }
+                        // Coordinate X / Y (T4.x: name="x"/"y",
+                        // id #xCoordInput/#yCoordInput)
+                        const xIn = pick([
+                            'input[name="x"]', '#xCoordInput', '#xCoord',
+                            'input[name*="xCoord" i]', 'input#x',
+                        ]);
+                        const yIn = pick([
+                            'input[name="y"]', '#yCoordInput', '#yCoord',
+                            'input[name*="yCoord" i]', 'input#y',
+                        ]);
+                        if (xIn) setVal(xIn, x);
+                        if (yIn) setVal(yIn, y);
 
-                        // Radiobutton tipo movimento: 2=Rinforzo, 3=Attacco, 4=Saccheggio
-                        const raidRadio = document.querySelector(
-                            `input[type="radio"][value="${moveType}"], ` +
-                            `input[name="c"][value="${moveType}"], ` +
-                            `label:has(input[value="${moveType}"]) input`
-                        );
+                        // Radio tipo movimento: 2=Rinforzo, 3=Attacco,
+                        // 4=Saccheggio
+                        const raidRadio = pick([
+                            `input[type="radio"][name="c"][value="${moveType}"]`,
+                            `input[name="c"][value="${moveType}"]`,
+                            `input[type="radio"][value="${moveType}"]`,
+                            `label:has(input[value="${moveType}"]) input`,
+                        ]);
                         if (raidRadio) {
                             raidRadio.checked = true;
-                            raidRadio.dispatchEvent(new Event('change', {bubbles: true}));
+                            raidRadio.dispatchEvent(
+                                new Event('change', {bubbles: true})
+                            );
                         }
 
-                        // Compilazione quantità truppe
-                        let filledAny = false;
+                        // Quantita' truppe: il form T4.x usa slot
+                        // RELATIVI troop[t1]..troop[t10] per le unita'
+                        // del villaggio (t11 = eroe). Le chiavi globali
+                        // t1..t30 vanno rimappate sullo slot relativo.
+                        const filled = [];
+                        const missed = [];
                         for (const [key, qty] of Object.entries(troops)) {
-                            if (qty <= 0) continue;
-                            const norm = key.toLowerCase().replace('u', 't');
-                            const input = document.querySelector(
-                                `input[name="${norm}"], input[name*="[${norm}]"], input[name="${key}"]`
-                            );
+                            const q = parseInt(qty, 10) || 0;
+                            if (q <= 0) continue;
+                            const m = String(key).match(/(\\d+)/);
+                            if (!m) { missed.push(String(key)); continue; }
+                            const num = parseInt(m[1], 10);
+                            const rel = ((num - 1) % 10) + 1;
+                            const sels = [
+                                `input[name="troop[t${rel}]"]`,
+                                `input[name="t${rel}"]`,
+                                `input[name*="[t${rel}]"]`,
+                            ];
+                            // Form a nomi globali (versioni datate):
+                            // t11 e' sempre l'eroe, mai riempirlo qui.
+                            if (num !== 11) {
+                                sels.push(`input[name="troop[t${num}]"]`);
+                                sels.push(`input[name="t${num}"]`);
+                            }
+                            const input = pick(sels);
                             if (input && !input.disabled) {
-                                input.value = String(qty);
-                                input.dispatchEvent(new Event('input', {bubbles: true}));
-                                filledAny = true;
+                                setVal(input, q);
+                                filled.push(String(key));
+                            } else {
+                                missed.push(String(key));
                             }
                         }
 
-                        // Eroe: slot dedicato nel form (input t11 / hero).
-                        // Fallback di sicurezza: se manca o e' disabilitato
-                        // (eroe partito per un'avventura) il raid parte
-                        // comunque senza eroe.
+                        // Eroe (slot t11): best-effort — se manca o e'
+                        // disabilitato il raid parte comunque senza.
                         if (includeHero) {
-                            const heroIn = document.querySelector(
-                                'input[name="t11"], input[name="troop[t11]"], ' +
-                                'input[name*="hero" i], input#hero'
-                            );
+                            const heroIn = pick([
+                                'input[name="t11"]',
+                                'input[name="troop[t11]"]',
+                                'input[name*="hero" i]', 'input#hero',
+                            ]);
                             if (heroIn && !heroIn.disabled) {
-                                heroIn.value = '1';
-                                heroIn.dispatchEvent(new Event('input', {bubbles: true}));
+                                setVal(heroIn, '1');
                             }
                         }
 
-                        return { ok: !!(xIn && yIn && filledAny) };
+                        const problems = [];
+                        if (!xIn || !yIn) problems.push('coord_inputs');
+                        if (!raidRadio) problems.push('move_radio');
+                        if (!filled.length) problems.push('troop_inputs');
+                        if (missed.length) {
+                            problems.push('missed:' + missed.join(','));
+                        }
+                        return {
+                            ok: !!(xIn && yIn && filled.length > 0),
+                            reason: problems.join('|'),
+                            filled: filled,
+                            url: location.href,
+                        };
                     }
                     """,
                     {
@@ -1738,7 +1821,18 @@ class ActionExecutor:
                 )
 
                 if not fill_res or not fill_res.get("ok"):
-                    errors.append(f"compilazione form fallita per target ({tx}|{ty})")
+                    _reason = str((fill_res or {}).get("reason") or "n/d")
+                    logger.error(
+                        "Custom raid: compilazione form fallita (%s|%s): %s",
+                        tx, ty, _reason,
+                    )
+                    await self._dump_raid_debug(page, f"fill_{tx}_{ty}")
+                    errors.append(
+                        f"compilazione form fallita ({tx}|{ty}): {_reason}"
+                    )
+                    failed_targets.append(
+                        {"x": tx, "y": ty, "reason": _reason}
+                    )
                     continue
 
                 await sleep_human(
@@ -1751,13 +1845,22 @@ class ActionExecutor:
                     [
                         'button#btn_ok',
                         'button[type="submit"]',
+                        'input[type="submit"]',
                         '#ok',
                         'button:has-text("Invia")',
                         'button:has-text("Send")',
                     ],
                     timeout_ms=3000,
                 ):
+                    logger.error(
+                        "Custom raid: pulsante invio non trovato (%s|%s)",
+                        tx, ty,
+                    )
+                    await self._dump_raid_debug(page, f"submit_{tx}_{ty}")
                     errors.append(f"primo invio fallito per ({tx}|{ty})")
+                    failed_targets.append(
+                        {"x": tx, "y": ty, "reason": "send_button_missing"}
+                    )
                     continue
 
                 await sleep_human(0.8, 1.5)
@@ -1769,31 +1872,129 @@ class ActionExecutor:
                         'button#btn_ok',
                         'button[name="s1"]',
                         'input[name="s1"]',
+                        'input[type="submit"]',
                         'button[type="submit"]',
                         'button:has-text("Conferma")',
                         'button:has-text("Confirm")',
                     ],
                     timeout_ms=3500,
                 ):
+                    logger.error(
+                        "Custom raid: pulsante conferma non trovato (%s|%s)",
+                        tx, ty,
+                    )
+                    await self._dump_raid_debug(page, f"confirm_{tx}_{ty}")
                     errors.append(f"conferma raid fallita per ({tx}|{ty})")
+                    failed_targets.append(
+                        {"x": tx, "y": ty, "reason": "confirm_missing"}
+                    )
+                    continue
+
+                # 5. Anti-ghost: l'invio conta solo con riscontro visivo.
+                # Se il gioco ha rifiutato il submit (validazione, truppe
+                # insufficienti) la pagina resta sul form tt=2 o mostra
+                # un box di errore: senza questo controllo il click sul
+                # pulsante veniva registrato come "raid inviato" pur
+                # senza alcun movimento truppe reale.
+                await sleep_human(0.6, 1.2)
+                verify = await page.evaluate(
+                    """
+                    () => {
+                        const url = location.href || '';
+                        const vis = (e) => !!(e && (
+                            e.offsetParent !== null ||
+                            (e.getClientRects && e.getClientRects().length)
+                        ));
+                        const errs = Array.from(document.querySelectorAll(
+                            '.error, .errorBox, .errorMessage, .formError, ' +
+                            '.alert.error, .notice.error, ' +
+                            '[class*="error" i]'
+                        )).filter(e => vis(e) && (e.innerText || '').trim());
+                        if (errs.length) {
+                            return {
+                                ok: false,
+                                reason: 'error_box:' + errs.slice(0, 3).map(
+                                    e => (e.innerText || '')
+                                        .trim().slice(0, 80)
+                                ).join(' | '),
+                                url: url,
+                            };
+                        }
+                        const stillForm =
+                            /tt=2(?:&|$)/.test(url) &&
+                            !!document.querySelector(
+                                'input[name="x"], #xCoordInput, ' +
+                                'input[name="y"], #yCoordInput, ' +
+                                'input[name*="xCoord" i]'
+                            );
+                        if (stillForm) {
+                            return {
+                                ok: false, reason: 'still_on_send_form',
+                                url: url,
+                            };
+                        }
+                        const mov = document.querySelector(
+                            '#movements, .troopMovements, ' +
+                            '[id*="troopMovement" i], .movement'
+                        );
+                        return { ok: true, url: url, movement: !!mov };
+                    }
+                    """
+                )
+                if not (verify or {}).get("ok"):
+                    _vreason = str((verify or {}).get("reason") or "n/d")
+                    logger.error(
+                        "Custom raid: invio NON confermato (%s|%s): %s "
+                        "(anti-ghost)",
+                        tx, ty, _vreason,
+                    )
+                    await self._dump_raid_debug(page, f"verify_{tx}_{ty}")
+                    errors.append(
+                        f"invio non confermato ({tx}|{ty}): {_vreason}"
+                    )
+                    failed_targets.append(
+                        {"x": tx, "y": ty, "reason": _vreason}
+                    )
                     continue
 
                 sent_count += 1
+                sent_coords.append([int(tx), int(ty)])
                 logger.info(
-                    "AI Scout: raid dinamico inviato con successo a (%s|%s) con truppe %s",
+                    "Raid dinamico confermato a (%s|%s) con truppe %s",
                     tx, ty, troops,
                 )
                 await sleep_human(1.0, 2.5)
 
             except Exception as exc:
+                logger.error(
+                    "Custom raid: eccezione invio (%s|%s): %s",
+                    tx, ty, exc, exc_info=True,
+                )
+                try:
+                    await self._dump_raid_debug(page, f"exc_{tx}_{ty}")
+                except Exception:  # noqa: BLE001
+                    pass
                 errors.append(f"eccezione su ({tx}|{ty}): {exc}")
+                failed_targets.append(
+                    {"x": tx, "y": ty, "reason": str(exc)}
+                )
 
+        _data = {
+            "sent_coords": sent_coords,
+            "failed_targets": failed_targets,
+        }
         if sent_count > 0:
             return ActionResult(
                 True,
-                f"inviati {sent_count}/{len(raw_targets)} raid dinamici AI ({', '.join(errors) if errors else 'tutti riusciti'})",
+                f"inviati {sent_count}/{len(raw_targets)} raid dinamici "
+                f"({', '.join(errors) if errors else 'tutti riusciti'})",
+                data=_data,
             )
-        return ActionResult(False, f"nessun raid dinamico inviato: {'; '.join(errors)}")
+        return ActionResult(
+            False,
+            f"nessun raid dinamico inviato: {'; '.join(errors)}",
+            data=_data,
+        )
 
     async def _found_village(self, action: Action, village_id: int = 0) -> ActionResult:
         """Fonda un nuovo villaggio sul tile libero (x, y) via karte.php.
