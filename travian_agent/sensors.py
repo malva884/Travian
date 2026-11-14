@@ -103,6 +103,18 @@ def _italian_plurals(word: str) -> list[str]:
     return []
 
 
+def _abs_game_url(current_url: str, path: str) -> str:
+    """URL di gioco assoluto dalla root del dominio.
+
+    urljoin(base, 'dorf1.php') con path relativo risolve nella
+    sottocartella corrente: dopo una visita al baule eroe la base e'
+    /hero/ e la navigazione finisce su /hero/dorf1.php (pagina senza il
+    DOM delle truppe). Forzando il leading '/' la destinazione e'
+    sempre /dorf1.php qualunque sia la pagina di partenza.
+    """
+    return urljoin(current_url or "", "/" + str(path).lstrip("/"))
+
+
 def _troop_label_map() -> dict[str, str]:
     """{'legionario': 'u1', 'legionari': 'u1', ...} per il parser truppe.
 
@@ -793,7 +805,7 @@ class TravianParser:
         current_url = page.url or ""
         if selectors.PATH_DORF2 not in current_url:
             match = _NEWDID.search(current_url)
-            target_url = urljoin(current_url, selectors.PATH_DORF2)
+            target_url = _abs_game_url(current_url, selectors.PATH_DORF2)
             if match:
                 target_url += f"?newdid={match.group(1)}"
             await page.goto(target_url, wait_until="domcontentloaded")
@@ -890,7 +902,7 @@ class TravianParser:
             current_url = page.url or ""
             if "production.php" not in current_url:
                 match = _NEWDID.search(current_url)
-                target_url = urljoin(current_url, "production.php")
+                target_url = _abs_game_url(current_url, "production.php")
                 if match:
                     target_url += f"?newdid={match.group(1)}"
                 await page.goto(target_url, wait_until="domcontentloaded")
@@ -1068,7 +1080,7 @@ class TravianParser:
         try:
             if f"id={rally_slot}" not in (self.page.url or ""):
                 await self.page.goto(
-                    urljoin(self.page.url or "", url),
+                    _abs_game_url(self.page.url or "", url),
                     wait_until="domcontentloaded",
                     timeout=20000,
                 )
@@ -1232,7 +1244,7 @@ class TravianParser:
             url += f"&newdid={village_id}"
         try:
             await self.page.goto(
-                urljoin(self.page.url or "", url),
+                _abs_game_url(self.page.url or "", url),
                 wait_until="domcontentloaded",
             )
         except Exception:
@@ -1288,7 +1300,7 @@ class TravianParser:
                 url += f"&newdid={village_id}"
             try:
                 await self.page.goto(
-                    urljoin(self.page.url or "", url),
+                    _abs_game_url(self.page.url or "", url),
                     wait_until="domcontentloaded",
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1302,7 +1314,7 @@ class TravianParser:
             # un markup diverso (spec bugfix parser truppe).
             try:
                 await self.page.goto(
-                    urljoin(
+                    _abs_game_url(
                         self.page.url or "",
                         selectors.PATH_DORF1
                         + (f"?newdid={village_id}" if village_id else ""),
@@ -1435,7 +1447,7 @@ class TravianParser:
             url += f"&newdid={village_id}"
         try:
             await self.page.goto(
-                urljoin(self.page.url or "", url),
+                _abs_game_url(self.page.url or "", url),
                 wait_until="domcontentloaded",
             )
         except Exception:
@@ -1489,7 +1501,7 @@ class TravianParser:
             url += f"&newdid={village_id}"
         try:
             await self.page.goto(
-                urljoin(self.page.url or "", url),
+                _abs_game_url(self.page.url or "", url),
                 wait_until="domcontentloaded",
             )
         except Exception:
@@ -1535,7 +1547,7 @@ class TravianParser:
         for path in ("position_details.php", selectors.PATH_MAP):
             try:
                 await self.page.goto(
-                    urljoin(self.page.url or "", f"{path}?x={x}&y={y}"),
+                    _abs_game_url(self.page.url or "", f"{path}?x={x}&y={y}"),
                     wait_until="domcontentloaded",
                 )
             except Exception:
@@ -1605,7 +1617,7 @@ class TravianParser:
             return None
         try:
             await self.page.goto(
-                urljoin(
+                _abs_game_url(
                     self.page.url or "",
                     f"{selectors.PATH_MAP}?newdid={village_id}",
                 ),
@@ -1684,7 +1696,7 @@ class TravianParser:
             return []
         try:
             await self.page.goto(
-                urljoin(self.page.url or "", f"{selectors.PATH_MAP}?x={center_x}&y={center_y}"),
+                _abs_game_url(self.page.url or "", f"{selectors.PATH_MAP}?x={center_x}&y={center_y}"),
                 wait_until="domcontentloaded",
             )
             # T4.5/T4.6: la griglia mappa e' renderizzata via JS dopo il
@@ -1839,7 +1851,7 @@ class TravianParser:
             return []
         try:
             await self.page.goto(
-                urljoin(self.page.url or "", "berichte.php?t=1"),
+                _abs_game_url(self.page.url or "", "berichte.php?t=1"),
                 wait_until="domcontentloaded",
             )
         except Exception:

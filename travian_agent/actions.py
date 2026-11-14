@@ -1865,7 +1865,68 @@ class ActionExecutor:
 
                 await sleep_human(0.8, 1.5)
 
-                # 4. Secondo submit: conferma del raid
+                # 4. Attesa della pagina di riepilogo (secondo step del
+                # flow tt=2): il server puo' rispondere allo stesso form
+                # con un box errore rosso (campo mancante, truppe
+                # insufficienti). In quel caso il click di conferma
+                # sarebbe cieco: loggiamo il messaggio esatto del
+                # server e passiamo al target successivo.
+                try:
+                    await page.wait_for_load_state(
+                        "domcontentloaded", timeout=8000
+                    )
+                except Exception:  # noqa: BLE001 — nessun reload (SPA)
+                    pass
+                await sleep_human(0.5, 1.0)
+
+                mid = await page.evaluate(
+                    """
+                    () => {
+                        const vis = (e) => !!(e && (
+                            e.offsetParent !== null ||
+                            (e.getClientRects && e.getClientRects().length)
+                        ));
+                        const errs = Array.from(document.querySelectorAll(
+                            '.error, .errorBox, .errorMessage, .formError, ' +
+                            '.alert, .notice, [class*="error" i]'
+                        )).filter(e => vis(e) && (e.innerText || '').trim());
+                        // Input coordinate VISIBILI = ancora sul form di
+                        // invio. Sul riepilogo tt=2 x/y sono hidden.
+                        const coordInputs = Array.from(
+                            document.querySelectorAll(
+                                'input[name="x"], #xCoordInput, ' +
+                                'input[name="y"], #yCoordInput, ' +
+                                'input[name*="xCoord" i]'
+                            )
+                        ).filter(e => vis(e));
+                        return {
+                            onForm: coordInputs.length > 0,
+                            err: errs.slice(0, 3).map(
+                                e => (e.innerText || '')
+                                    .trim().replace(/\\s+/g, ' ').slice(0, 120)
+                            ).join(' | '),
+                        };
+                    }
+                    """
+                )
+                if (mid or {}).get("onForm"):
+                    _merr = str((mid or {}).get("err") or "nessun messaggio")
+                    logger.error(
+                        "Custom raid: primo submit rifiutato (%s|%s): "
+                        "form tt=2 ancora attivo, messaggio server: %s",
+                        tx, ty, _merr,
+                    )
+                    await self._dump_raid_debug(page, f"reject_{tx}_{ty}")
+                    errors.append(
+                        f"submit rifiutato ({tx}|{ty}): {_merr}"
+                    )
+                    failed_targets.append(
+                        {"x": tx, "y": ty,
+                         "reason": f"submit_rejected:{_merr}"}
+                    )
+                    continue
+
+                # 5. Secondo submit: conferma del raid (pagina riepilogo)
                 if not await self._click_first(
                     page,
                     [
@@ -1890,7 +1951,7 @@ class ActionExecutor:
                     )
                     continue
 
-                # 5. Anti-ghost: l'invio conta solo con riscontro visivo.
+                # 6. Anti-ghost: l'invio conta solo con riscontro visivo.
                 # Se il gioco ha rifiutato il submit (validazione, truppe
                 # insufficienti) la pagina resta sul form tt=2 o mostra
                 # un box di errore: senza questo controllo il click sul
@@ -1922,14 +1983,20 @@ class ActionExecutor:
                         }
                         const stillForm =
                             /tt=2(?:&|$)/.test(url) &&
-                            !!document.querySelector(
+                            Array.from(document.querySelectorAll(
                                 'input[name="x"], #xCoordInput, ' +
                                 'input[name="y"], #yCoordInput, ' +
                                 'input[name*="xCoord" i]'
-                            );
+                            )).some(e => vis(e));
                         if (stillForm) {
                             return {
-                                ok: false, reason: 'still_on_send_form',
+                                ok: false,
+                                reason: 'still_on_send_form' +
+                                    (errs.length ? ' | ' + errs.slice(0, 3)
+                                        .map(e => (e.innerText || '')
+                                            .trim().replace(/\\s+/g, ' ')
+                                            .slice(0, 80))
+                                        .join(' | ') : ''),
                                 url: url,
                             };
                         }
