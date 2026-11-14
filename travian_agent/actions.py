@@ -1954,54 +1954,47 @@ class ActionExecutor:
                     )
                     continue
 
-                # 5. Secondo submit: conferma del raid (pagina riepilogo
-                # dentro #build/#content — T4.6: #btn_ok, .green,
-                # .textButtonV1, name=s1). Selettori generici
-                # button[type=submit] EVITATI: intercetterebbero bottoni
-                # nascosti o di altri form (barra ricerca, sidebar).
+                # 5. Secondo submit: conferma del raid nella schermata
+                # riepilogo. ATTENZIONE: sotto la tabella truppe ci sono
+                # TRE pulsanti — "Modifica" (verde, PRIMO nel DOM),
+                # "Generatore di invio truppe" (gold) e "Conferma"
+                # (verde, ULTIMO). Selettori posizionali (#btn_ok,
+                # .green, name=s1) catturano "Modifica" che ricarica il
+                # form -> falso still_on_send_form. Priorita' alla
+                # etichetta testuale, escludendo i bottoni di ritorno.
                 confirmed_click = await self._click_first(
                     page,
                     [
-                        '#build button#btn_ok',
-                        '#content button#btn_ok',
-                        '#build button.green[type="submit"]',
-                        '#content button.green[type="submit"]',
-                        '#build button[name="s1"]',
-                        '#build input[name="s1"]',
                         '#build button:has-text("Conferma")',
                         '#content button:has-text("Conferma")',
                         '#build button:has-text("Confirm")',
+                        '#content button:has-text("Confirm")',
+                        '#build button[type="submit"]:not(:has-text("Modifica")):not(:has-text("Edit"))',
+                        '#content button[type="submit"]:not(:has-text("Modifica")):not(:has-text("Edit"))',
                     ],
                     timeout_ms=3500,
                 )
                 if not confirmed_click:
-                    # Fallback JS limitato all'area contenuto del
-                    # rally (#build / #content): cerca un pulsante
-                    # visibile green/#btn_ok o con testo conferma.
+                    # Fallback JS limitato all'area contenuto del rally
+                    # (#build / #content): scarta esplicitamente i
+                    # bottoni di ritorno (Modifica/Edit/Indietro/Back/
+                    # Annulla/Cancel) e clicca solo "Conferma".
                     confirmed_click = bool(
                         await page.evaluate(
                             """
                             () => {
-                                const scope = document.querySelector(
-                                    '#build, #content'
-                                );
+                                const scope = document.querySelector('#build, #content');
                                 if (!scope) return false;
                                 const btns = Array.from(
-                                    scope.querySelectorAll(
-                                        'button, input[type="submit"]'
-                                    )
-                                ).filter(
-                                    b => !b.disabled &&
-                                        b.offsetParent !== null
-                                );
-                                const target = btns.find(b =>
-                                    b.id === 'btn_ok' ||
-                                    b.classList.contains('green') ||
-                                    /conferma|confirm|invia|send|ok/i.test(
-                                        (b.innerText || b.value || '')
-                                            .trim()
-                                    )
-                                ) || btns[btns.length - 1];
+                                    scope.querySelectorAll('button, input[type="submit"]')
+                                ).filter(b => !b.disabled && b.offsetParent !== null);
+                                const target = btns.find(b => {
+                                    const txt = (b.innerText || b.value || '').trim().toLowerCase();
+                                    if (/modifica|edit|indietro|back|annulla|cancel/.test(txt)) {
+                                        return false;
+                                    }
+                                    return /conferma|confirm|ok/.test(txt);
+                                });
                                 if (!target) return false;
                                 target.click();
                                 return true;
