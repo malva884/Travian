@@ -2,9 +2,11 @@
 
 Flusso (eseguito una volta per ciclo account, dopo il giro dei villaggi):
 
-1. Individua il villaggio fondatore: `expansion.founder_village` se
-   configurato, altrimenti il primo villaggio con Residenza/Palazzo
-   (gid 25/26) negli edifici interni rilevati durante il ciclo.
+1. Individua il villaggio fondatore con ricerca dinamica: prima il
+   villaggio con ruolo 'founder' (early_cropper_founder), poi
+   `expansion.founder_village` se configurato, infine il primo
+   villaggio con Residenza/Palazzo (gid 25/26) >= 10. I villaggi
+   con ruolo hammer o feeder sono esclusi a prescindere.
 2. Legge i Punti Cultura sulla pagina della residenza
    (read_culture_points): se non bastano, esce.
 3. Conta i coloni pronti (sensore truppe sulle icone u10/u20/u30).
@@ -45,6 +47,7 @@ from .models import (
     GID_MARKETPLACE,
     GID_PALACE,
     GID_RESIDENCE,
+    VillageRole,
 )
 
 if TYPE_CHECKING:
@@ -76,6 +79,13 @@ CELEBRATION_COOLDOWN_SECONDS = 6.0 * 3600.0
 # Retry breve quando la scansione mappa non legge tile (layout/pagina ko):
 # il cooldown pieno di 3h si applica solo a scansioni andate a buon fine.
 MAP_SCAN_RETRY_SECONDS = 600.0
+
+# Livello minimo Residenza/Palazzo per addestrare i 3 coloni.
+SETTLER_RESIDENCE_MIN_LEVEL = 10
+# Ruoli che non possono MAI ospitare la base di fondazione: un hammer
+# o un feeder non addestra coloni ne' funge da feed_target, a
+# prescindere dall'ordine nell'array dei villaggi o dalla config.
+_FOUNDER_BLOCKED_ROLES = frozenset({VillageRole.HAMMER, VillageRole.FEEDER})
 
 # Store condiviso dei candidati cropper (human-in-the-loop)
 _cropper_stores: dict[str, CropperStore] = {}
@@ -329,15 +339,29 @@ class ExpansionManager:
         cfg: ExpansionConfig,
         villages: list["Village"],
         interior_map: dict[str, list[Field]],
+        exclude: set[str] | None = None,
     ) -> tuple["Village | None", Field | None]:
         """Villaggio fondatore e suo edificio Residenza/Palazzo.
 
-        Se `cfg.expansion_slot` e' impostato (es. 26/31/32), usa quello
-        slot designato per l'addestramento coloni, verificando che sia
-        un edificio di tipo Residenza/Palazzo quando rilevato.
+        Priorita' di selezione (ricerca dinamica, spec correzione
+        villaggio sorgente):
+          1. villaggio con ruolo 'founder' (early_cropper_founder) —
+             e' la base designata anche senza residenza rilevata;
+          2. `expansion.founder_village` esplicito (nome o newdid);
+          3. fallback strutturale: Residenza/Palazzo >= 10 (con slot
+             di espansione liberi: il check finale resta lato gioco);
+          4. qualunque residenza >= 1 / slot designato.
+
+        Esclusione rigida: i villaggi con ruolo hammer o feeder non
+        sono MAI candidati, a prescindere dall'ordine nell'array o
+        dalla configurazione esplicita.
+
+        `exclude` contiene nomi villaggio gia' scartati dalla
+        validazione pre-training (ricalcolo della base).
         """
         cfg_name = (cfg.founder_village or "").strip()
         slot = int(cfg.expansion_slot or 0)
+        excluded = {n.strip().lower() for n in (exclude or set()) if n}
         vkey = lambda v: v.name or str(v.village_id)  # noqa: E731
 
         def _residence_for(v: "Village") -> Field | None:
@@ -355,24 +379,47 @@ class ExpansionManager:
                 )
             return find_residence(interior)
 
+        def _blocked(v: "Village") -> bool:
+            return (
+                VillageRole.parse(getattr(v, "role", None))
+                in _FOUNDER_BLOCKED_ROLES
+            )
+
+        candidates = [
+            v for v in villages
+            if not _blocked(v)
+            and (v.name or "").strip().lower() not in excluded
+        ]
+
+        # 1. Ricerca per ruolo: il founder designato vince sempre, anche
+        #    senza residenza rilevata (feed_target lo finanzia comunque).
+        for v in candidates:
+            if (
+                VillageRole.parse(getattr(v, "role", None))
+                is VillageRole.EARLY_CROPPER_FOUNDER
+            ):
+                return v, _residence_for(v)
+
+        # 2. Override esplicito da config (solo se eleggibile).
         if cfg_name:
-            for v in villages:
+            for v in candidates:
                 if v.name == cfg_name or str(v.village_id) == cfg_name:
                     return v, _residence_for(v)
             logger.warning(
-                "Espansione: founder_village '%s' non trovato tra i villaggi.",
+                "Espansione: founder_village '%s' non trovato tra i "
+                "villaggi eleggibili (hammer/feeder esclusi).",
                 cfg_name,
             )
-            return None, None
-        # Auto: primo villaggio con residenza/palazzo >= 10 (fallback >= 1)
-        for min_level in (10, 1):
-            for v in villages:
+
+        # 3-4. Fallback strutturale: residenza >= 10, poi >= 1,
+        #      infine qualunque residenza dallo slot designato.
+        for min_level in (SETTLER_RESIDENCE_MIN_LEVEL, 1):
+            for v in candidates:
                 res = _residence_for(v)
                 if res is not None and res.level >= min_level:
                     return v, res
-        # Ultimo fallback: qualunque residenza trovata dallo slot designato
         if slot > 0:
-            for v in villages:
+            for v in candidates:
                 res = _residence_for(v)
                 if res is not None:
                     return v, res
@@ -589,10 +636,21 @@ class ExpansionManager:
             return
 
         founder, residence = self._pick_founder(cfg, villages, interior_map)
-        if founder is None or residence is None:
+        if founder is None:
             logger.info(
-                "%s Espansione: nessun villaggio con Residenza/Palazzo trovato.",
+                "%s Espansione: nessun villaggio eleggibile come fondatore.",
                 prefix,
+            )
+            return
+        if residence is None:
+            # Founder designato (ruolo) senza Residenza/Palazzo rilevata:
+            # i feeder lo finanziano comunque — deve COSTRUIRE la residenza.
+            self.feed_target = founder.name
+            self._save()
+            logger.info(
+                "%s Espansione: founder '%s' senza Residenza/Palazzo "
+                "rilevata; feeder attivi per la costruzione.",
+                prefix, founder.name,
             )
             return
 
@@ -624,6 +682,45 @@ class ExpansionManager:
                 now=now,
             )
             return
+
+        # Validazione pre-training (spec: correzione villaggio sorgente):
+        # i coloni si addestrano solo da Residenza/Palazzo >= 10. Se il
+        # livello letto e' inferiore, si forza il ricalcolo della base
+        # escludendo il founder corrente (level 0 = non rilevato: ok).
+        if 0 < residence.level < SETTLER_RESIDENCE_MIN_LEVEL:
+            logger.error(
+                "%s Espansione: '%s' ha Residenza/Palazzo livello %d (<%d): "
+                "coloni non addestrabili. Ricalcolo base di fondazione...",
+                prefix, founder.name, residence.level,
+                SETTLER_RESIDENCE_MIN_LEVEL,
+            )
+            alt_founder, alt_residence = self._pick_founder(
+                cfg, villages, interior_map,
+                exclude={founder.name or str(founder.village_id)},
+            )
+            if (
+                alt_founder is not None
+                and alt_residence is not None
+                and not 0 < alt_residence.level < SETTLER_RESIDENCE_MIN_LEVEL
+            ):
+                logger.info(
+                    "%s Espansione: base di fondazione ricalcolata -> '%s'.",
+                    prefix, alt_founder.name,
+                )
+                founder, residence = alt_founder, alt_residence
+            else:
+                # Nessun sostituto idoneo: feed_target resta sul founder
+                # designato — i feeder finanziano l'upgrade a Residenza 10,
+                # ma niente tentativo di addestramento su livello basso.
+                self.feed_target = founder.name
+                self._save()
+                logger.warning(
+                    "%s Espansione: nessun villaggio alternativo con "
+                    "Residenza/Palazzo >= %d; feed_target su '%s' per "
+                    "finanziare l'upgrade della Residenza.",
+                    prefix, SETTLER_RESIDENCE_MIN_LEVEL, founder.name,
+                )
+                return
 
         # 2. Coloni disponibili?
         settlers = await get_available_settlers(
