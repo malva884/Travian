@@ -1854,16 +1854,23 @@ class ActionExecutor:
                     self.settings.action_delay_min, self.settings.action_delay_max
                 )
 
-                # 3. Primo submit: invio ordine truppe
+                # 3. Primo submit: invio ordine truppe (scopato al
+                # contenuto del Punto di Raduno: button[type=submit]
+                # generico intercetterebbe bottoni di altri form).
                 if not await self._click_first(
                     page,
                     [
+                        '#build button#btn_ok',
+                        '#content button#btn_ok',
                         'button#btn_ok',
-                        'button[type="submit"]',
-                        'input[type="submit"]',
+                        '#build button[type="submit"]',
+                        '#content button[type="submit"]',
+                        '#build input[type="submit"]',
+                        '#content input[type="submit"]',
                         '#ok',
-                        'button:has-text("Invia")',
-                        'button:has-text("Send")',
+                        '#build button:has-text("Invia")',
+                        '#content button:has-text("Invia")',
+                        '#build button:has-text("Send")',
                     ],
                     timeout_ms=3000,
                 ):
@@ -1947,20 +1954,64 @@ class ActionExecutor:
                     )
                     continue
 
-                # 5. Secondo submit: conferma del raid (pagina riepilogo)
-                if not await self._click_first(
+                # 5. Secondo submit: conferma del raid (pagina riepilogo
+                # dentro #build/#content — T4.6: #btn_ok, .green,
+                # .textButtonV1, name=s1). Selettori generici
+                # button[type=submit] EVITATI: intercetterebbero bottoni
+                # nascosti o di altri form (barra ricerca, sidebar).
+                confirmed_click = await self._click_first(
                     page,
                     [
-                        'button#btn_ok',
-                        'button[name="s1"]',
-                        'input[name="s1"]',
-                        'input[type="submit"]',
-                        'button[type="submit"]',
-                        'button:has-text("Conferma")',
-                        'button:has-text("Confirm")',
+                        '#build button#btn_ok',
+                        '#content button#btn_ok',
+                        '#build button.green[type="submit"]',
+                        '#content button.green[type="submit"]',
+                        '#build button.textButtonV1',
+                        '#content button.textButtonV1',
+                        '#build button[name="s1"]',
+                        '#build input[name="s1"]',
+                        '#build button:has-text("Conferma")',
+                        '#content button:has-text("Conferma")',
+                        '#build button:has-text("Confirm")',
                     ],
                     timeout_ms=3500,
-                ):
+                )
+                if not confirmed_click:
+                    # Fallback JS limitato all'area contenuto del
+                    # rally (#build / #content): cerca un pulsante
+                    # visibile green/#btn_ok o con testo conferma.
+                    confirmed_click = bool(
+                        await page.evaluate(
+                            """
+                            () => {
+                                const scope = document.querySelector(
+                                    '#build, #content'
+                                );
+                                if (!scope) return false;
+                                const btns = Array.from(
+                                    scope.querySelectorAll(
+                                        'button, input[type="submit"]'
+                                    )
+                                ).filter(
+                                    b => !b.disabled &&
+                                        b.offsetParent !== null
+                                );
+                                const target = btns.find(b =>
+                                    b.id === 'btn_ok' ||
+                                    b.classList.contains('green') ||
+                                    /conferma|confirm|invia|send|ok/i.test(
+                                        (b.innerText || b.value || '')
+                                            .trim()
+                                    )
+                                ) || btns[btns.length - 1];
+                                if (!target) return false;
+                                target.click();
+                                return true;
+                            }
+                            """
+                        )
+                    )
+                if not confirmed_click:
                     logger.error(
                         "Custom raid: pulsante conferma non trovato (%s|%s)",
                         tx, ty,
