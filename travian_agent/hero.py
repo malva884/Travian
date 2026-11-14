@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import db
 from .browser import sleep_human
 from .config import BASE_DIR, Settings
 
@@ -184,6 +185,58 @@ _ATTRIBUTE_LABELS: dict[str, tuple[str, ...]] = {
     "resources": ("risorse", "resources", "produzione", "production", "ressourcen"),
 }
 
+
+def is_hero_combat_ready(
+    hero_state: dict,
+    config=None,
+    *,
+    fast_raid: bool = False,
+    critical: bool = False,
+) -> tuple[bool, str]:
+    """Hard gates dello Smart Hero Combat Evaluator.
+
+    ``hero_state`` e' lo snapshot persistito da HeroManager
+    (kv ``hero_<acc>.json``): status, health, adventures, is_mounted.
+    ``config`` e' HeroConfig (soglia ``min_combat_health``, flag
+    ``tactical_hero_enabled`` e ``auto_adventures``); None = default.
+
+    ``fast_raid`` (solo cavalleria): l'eroe entra solo se montato;
+    un ``is_mounted`` None (slot equipaggiamento non rilevati) e'
+    trattato come 'a cavallo' per non bloccare la feature.
+    ``critical`` (es. riconquista) bypassa la priorita' avventure.
+
+    Ritorna ``(pronto, motivo_rifiuto)``.
+    """
+    state = hero_state or {}
+
+    # Gate 1 — Stato fisico: l'eroe deve essere a casa nel villaggio di
+    # partenza (non in avventura, non in viaggio, non morto).
+    status = str(state.get("status") or "")
+    if status != "home":
+        return False, f"eroe non a casa (stato={status or 'sconosciuto'})"
+
+    # Gate 2 — Soglia salute configurabile (default >=65%): se ferito
+    # resta a curarsi.
+    min_hp = int(getattr(config, "min_combat_health", 65) or 65)
+    health = int(state.get("health") or 0)
+    if health < min_hp:
+        return False, f"salute {health}% sotto soglia {min_hp}%"
+
+    # Gate 3 — Priorita' avventure: con auto_adventures attivo e
+    # avventure in scadenza l'eroe e' riservato, salvo op. critiche.
+    auto_adv = bool(getattr(config, "auto_adventures", True))
+    adventures = int(state.get("adventures") or 0)
+    if auto_adv and adventures > 0 and not critical:
+        return False, f"riservato a {adventures} avventure disponibili"
+
+    # Gate 4 — Velocita' di marcia: niente eroe a piedi su raid di sola
+    # cavalleria (rallenterebbe l'intera squadra).
+    if fast_raid and state.get("is_mounted") is False:
+        return False, "eroe a piedi: escluso da raid di sola cavalleria"
+
+    return True, ""
+
+
 _JS_HERO_STATE = """
     () => {
         const parseNum = (str) => {
@@ -291,12 +344,32 @@ _JS_HERO_STATE = """
             if (m) level = parseInt(m[1], 10);
         }
 
+        // --- Cavalcatura: cavallo nello slot 'mount' o nel box eroe ---
+        // null = non determinabile (nessun slot equipaggiamento renderizzato);
+        // i raid veloci trattano il non determinabile come 'a cavallo'.
+        let isMounted = null;
+        const mountEl = document.querySelector(
+            '.heroImage .horse, .hero_image .horse, .heroItem.horse, ' +
+            '[class*="mount" i], img[alt*="horse" i], img[alt*="cavall" i], ' +
+            'img[src*="horse" i], img[src*="mount" i], .equipment .item.horse'
+        );
+        if (mountEl) {
+            isMounted = true;
+        } else {
+            const slots = document.querySelectorAll(
+                '.heroItem, .equipment .item, .heroImage [class*="slot" i], ' +
+                '.heroAttributes [class*="item" i]'
+            );
+            if (slots.length) isMounted = false;
+        }
+
         return {
             health: Math.min(100, Math.max(0, health)),
             status: status,
             adventures: adventures,
             free_points: freePoints,
             level: level,
+            is_mounted: isMounted,
         };
     }
 """
@@ -312,20 +385,24 @@ class HeroManager:
     snapshot: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self._kv_key: str | None = None
         if self.state_path is None:
             safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in self.account_id)
-            self.state_path = STATE_DIR / f"hero_{safe}.json"
+            self._kv_key = f"hero_{safe}.json"
+            self.state_path = STATE_DIR / self._kv_key
 
     # ------------------------------------------------------------------
     # Persistenza snapshot (letto dalla dashboard)
     # ------------------------------------------------------------------
     def _save(self) -> None:
         try:
+            payload = json.dumps(self.snapshot, indent=2)
+            if self._kv_key is not None:
+                db.kv_write(self._kv_key, payload)
+                return
             assert self.state_path is not None
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(
-                json.dumps(self.snapshot, indent=2), encoding="utf-8"
-            )
+            self.state_path.write_text(payload, encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.debug("Salvataggio snapshot eroe fallito: %s", exc)
 
@@ -480,12 +557,13 @@ class HeroManager:
                 state.setdefault("adventures", 0)
                 state.setdefault("free_points", 0)
                 state.setdefault("level", 0)
+                state.setdefault("is_mounted", None)
                 return state
         except Exception as exc:  # noqa: BLE001
             logger.debug("Lettura stato eroe fallita: %s", exc)
         return {
             "health": 100, "status": "home", "adventures": 0,
-            "free_points": 0, "level": 0,
+            "free_points": 0, "level": 0, "is_mounted": None,
         }
 
     async def _sense_inventory_resources(

@@ -32,6 +32,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from . import db
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -147,10 +149,16 @@ def plan_chiefing_train(
         travel = travel_seconds(
             troops, int(spec.get("x", 0)), int(spec.get("y", 0)), tx, ty
         )
+        kind = str(spec.get("kind") or ("hammer" if idx == 0 else "chief"))
+        # Scenario B (Smart Hero Combat): la cleaner/hammer wave porta
+        # l'eroe per il bonus d'attacco sull'intera onda. Le wave chief
+        # (nobili + scorta) restano senza: devono atterrare dopo la
+        # pulizia e non devono esporre l'eroe.
+        include_hero = kind == "hammer"
         out.append(
             {
                 "wave_id": idx,
-                "kind": str(spec.get("kind") or ("hammer" if idx == 0 else "chief")),
+                "kind": kind,
                 "source_id": str(spec.get("source_id") or ""),
                 "source_name": str(spec.get("source_name") or ""),
                 "x": int(spec.get("x", 0)),
@@ -161,6 +169,10 @@ def plan_chiefing_train(
                 "depart_ts": 0.0,
                 "impact_ts": 0.0,
                 "status": WAVE_PLANNED,
+                "include_hero": include_hero,
+                "hero_reason": (
+                    "Bonus attacco onda principale" if include_hero else ""
+                ),
             }
         )
     if not out:
@@ -186,11 +198,13 @@ class WarStore:
     targets: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self._kv_key: str | None = None
         if self.state_path is None:
             safe = "".join(
                 c if c.isalnum() or c in "._-" else "_" for c in self.account_id
             )
-            self.state_path = STATE_DIR / f"war_targets_{safe}.json"
+            self._kv_key = f"war_targets_{safe}.json"
+            self.state_path = STATE_DIR / self._kv_key
         self._load()
 
     # ------------------------------------------------------------------
@@ -198,10 +212,15 @@ class WarStore:
     # ------------------------------------------------------------------
     def _load(self) -> None:
         try:
-            if self.state_path and self.state_path.exists():
+            data = None
+            if self._kv_key is not None:
+                text = db.kv_read(self._kv_key)
+                data = json.loads(text) if text else None
+            elif self.state_path and self.state_path.exists():
                 data = json.loads(
                     self.state_path.read_text(encoding="utf-8-sig")
                 )
+            if data is not None:
                 raw = data.get("targets") if isinstance(data, dict) else data
                 if isinstance(raw, list):
                     self.targets = [
@@ -215,14 +234,15 @@ class WarStore:
 
     def _save(self) -> None:
         try:
+            payload = json.dumps(
+                {"targets": self.targets}, indent=2, ensure_ascii=False
+            )
+            if self._kv_key is not None:
+                db.kv_write(self._kv_key, payload)
+                return
             assert self.state_path is not None
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(
-                json.dumps(
-                    {"targets": self.targets}, indent=2, ensure_ascii=False
-                ),
-                encoding="utf-8",
-            )
+            self.state_path.write_text(payload, encoding="utf-8")
         except OSError:
             logger.debug("Salvataggio war targets fallito", exc_info=True)
 

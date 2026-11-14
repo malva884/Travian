@@ -148,6 +148,9 @@ async def main() -> int:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
+    # DB centrale: schema + migrazione una-tantum dei JSON legacy in state/
+    db.init_db()
+
     accounts = load_accounts()
     if not accounts:
         try:

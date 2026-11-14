@@ -69,6 +69,9 @@ class VillageConfig:
     is_reclaim_source: bool = False
     farm_enabled: bool = True       # include questo villaggio nei cicli di raid
     farm_unit: str = ""             # unita' da saccheggio (vuoto = truppe leggere auto)
+    # Custom Farm Target: unita' inviate per ogni raid mirato
+    # (0 = auto: distribuisce i raider disponibili sui target approvati)
+    farm_unit_qty: int = 0
     market_slot: int = 0            # slot dorf2 del Mercato (0 = auto-detect via gid=17)
     x: int | None = None            # coordinata X del villaggio
     y: int | None = None            # coordinata Y del villaggio
@@ -132,6 +135,11 @@ class FarmingConfig:
     interval_max_minutes: float = 18.0
     farm_list: str = ""                 # nome lista preferita (vuoto = prima disponibile)
     unit: str = ""                      # unita' da saccheggio default (vuoto = leggera)
+    # Custom Farm Target Manager: raid mirati sui target 'approved' dello
+    # store condiviso (state/farm_targets_<acc>.json) al posto della farm
+    # list nativa del Gold Club (tt=99).
+    targets_per_wave: int = 3           # max target approved per ciclo di raid
+    auto_scan: bool = True              # scoperta target via scansione mappa periodica
 
 
 @dataclass
@@ -157,6 +165,10 @@ class HeroConfig:
     heal_threshold: int = 50            # % salute sotto cui usare gli unguenti
     min_health_to_adventure: int = 40   # % salute minima per la spedizione
     attribute_focus: str = "auto"       # auto|strength|off|def|resources
+    # Smart Hero Combat Evaluator: aggregazione tattica dell'eroe ai raid
+    # (oasi con belve, target ad alto bottino, cleaner wave dei chiefing)
+    tactical_hero_enabled: bool = True
+    min_combat_health: int = 65         # % salute minima per il combattimento
     # Emergency Unpack: su spesa fallita per risorse mancanti consuma i
     # pacchi del baule eroe per coprire il delta (spec 3.2)
     emergency_unpack: bool = True
@@ -398,6 +410,7 @@ def _parse_account_item(item: dict) -> Settings:
                                     ),
                                     farm_enabled=bool(cfg.get("farm_enabled", True)),
                                     farm_unit=str(cfg.get("farm_unit", "")),
+                                    farm_unit_qty=int(cfg.get("farm_unit_qty", 0) or 0),
                                     defense_enabled=bool(cfg.get("defense_enabled", True)),
                                     market_slot=int(cfg.get("market_slot", 0) or 0),
                                     min_net_crop_threshold=float(cfg.get("min_net_crop_threshold", 0.0) or 0.0),
@@ -511,6 +524,8 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                 "interval_max_minutes": acc.farming.interval_max_minutes,
                 "farm_list": acc.farming.farm_list,
                 "unit": acc.farming.unit,
+                "targets_per_wave": acc.farming.targets_per_wave,
+                "auto_scan": acc.farming.auto_scan,
             },
             "scout_brain_settings": {
                 "enabled": acc.scout_brain.enabled,
@@ -528,6 +543,8 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                 "heal_threshold": acc.hero.heal_threshold,
                 "min_health_to_adventure": acc.hero.min_health_to_adventure,
                 "attribute_focus": acc.hero.attribute_focus,
+                "tactical_hero_enabled": acc.hero.tactical_hero_enabled,
+                "min_combat_health": acc.hero.min_combat_health,
                 "emergency_unpack": acc.hero.emergency_unpack,
             },
             "defense_settings": {
@@ -578,6 +595,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                     "is_reclaim_source": cfg.is_reclaim_source,
                     "farm_enabled": cfg.farm_enabled,
                     "farm_unit": cfg.farm_unit,
+                    "farm_unit_qty": int(cfg.farm_unit_qty or 0),
                     "defense_enabled": cfg.defense_enabled,
                     "market_slot": int(cfg.market_slot or 0),
                     "min_net_crop_threshold": float(cfg.min_net_crop_threshold or 0.0),

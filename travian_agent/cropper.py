@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .config import BASE_DIR
+from . import db
 from .models import Village
 
 if TYPE_CHECKING:
@@ -119,11 +120,16 @@ class CropperStore:
     """Persistenza dei candidati su state/cropper_candidates.json."""
 
     def __init__(self, path: Path | None = None) -> None:
+        # path esplicito -> file JSON (test/override); default -> tabella DB
+        self._db_mode = path is None
         self.path = path or CANDIDATES_PATH
         self._data: dict[str, list[dict]] = {}
         self._load()
 
     def _load(self) -> None:
+        if self._db_mode:
+            self._data = db.cropper_load()
+            return
         try:
             if self.path.exists():
                 raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
@@ -138,6 +144,9 @@ class CropperStore:
             self._data = {}
 
     def _save(self) -> None:
+        if self._db_mode:
+            db.cropper_save(self._data)
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(

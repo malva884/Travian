@@ -6,6 +6,7 @@ import ctypes
 import datetime
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -14,6 +15,9 @@ import uuid
 from pathlib import Path
 
 import streamlit as st
+
+import ui_theme as ui
+from travian_agent import db
 from travian_agent.builder import load_build_plans
 from travian_agent.config import (
     BASE_DIR,
@@ -32,6 +36,13 @@ from travian_agent.cropper import (
     STATUS_SETTLING,
     CropperStore,
 )
+from travian_agent.farm_store import (
+    STATUS_APPROVED as FARM_STATUS_APPROVED,
+    STATUS_BLACKLISTED as FARM_STATUS_BLACKLISTED,
+    STATUS_PENDING as FARM_STATUS_PENDING,
+    STATUS_REJECTED as FARM_STATUS_REJECTED,
+    FarmTargetStore,
+)
 from travian_agent.models import STATIC_TROOP_LABELS, VillageRole
 from travian_agent.presets import (
     allowed_unit_slots_for_role,
@@ -49,12 +60,27 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+ui.inject_theme()
+
 STATE_DIR = BASE_DIR / "state"
 DEBUG_DIR = BASE_DIR / "debug"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = STATE_DIR / "agent.log"
 PYTHON_EXE = sys.executable
+
+# Regex per il tab Audits: formato "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+_LOG_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:[,.]\d+)?\s+"
+    r"(?P<level>[A-Z]+)\s+(?P<logger>[\w.]+):\s*(?P<msg>.*)$"
+)
+_LOG_LEVEL_TONE = {
+    "DEBUG": "neutral",
+    "INFO": "info",
+    "WARNING": "warning",
+    "ERROR": "danger",
+    "CRITICAL": "danger",
+}
 
 if "agent_processes" not in st.session_state:
     # account_id -> subprocess.Popen degli agenti avviati da questa sessione
@@ -209,14 +235,17 @@ def set_account_pause(account_id: str, paused: bool) -> None:
 
 
 def get_latest_village_snapshots(account_id: str) -> dict[str, dict]:
-    """Estrae l'ultimo snapshot registrato per ciascun villaggio dal JSONL dello storico.
+    """Ultimo snapshot registrato per ciascun villaggio (tabella village_snapshots).
 
-    Filtraggio stretto per account: usa solo `safe_id`, lo stesso nome file
-    che l'orchestratore scrive in `_append_history`. Nessun fallback su nomi
-    raw: due account con id simili (es. 'server 11' vs 'server_11')
-    non devono mai leggere lo storico l'uno dell'altro.
+    Chiave DB = `safe_id` (stessa sanitizzazione di `_append_history`):
+    due account con id simili non condividono mai lo storico.
+    Fallback sul JSONL se la tabella e' vuota (es. DB rimosso).
     """
     safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
+    snapshots = db.history_latest(safe_id)
+    if snapshots:
+        return snapshots
+
     history_file = STATE_DIR / "history" / f"history_{safe_id}.jsonl"
     if not history_file.exists():
         return {}
@@ -246,8 +275,14 @@ def get_latest_village_snapshots(account_id: str) -> dict[str, dict]:
 
 
 def get_scout_brain_data(account_id: str) -> dict:
-    """Carica i dati di intelligence radar, report e valutazione globale dell'AI Scout Brain."""
+    """Dati intelligence AI Scout (kv DB, fallback file legacy)."""
     safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
+    raw = db.kv_read(f"scout_{safe_id}.json")
+    if raw:
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
     scout_file = STATE_DIR / f"scout_{safe_id}.json"
     if not scout_file.exists():
         return {}
@@ -258,8 +293,14 @@ def get_scout_brain_data(account_id: str) -> dict:
 
 
 def get_hero_data(account_id: str) -> dict:
-    """Carica l'ultimo snapshot dell'eroe scritto da HeroManager."""
+    """Ultimo snapshot dell'eroe (kv DB, fallback file legacy)."""
     safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
+    raw = db.kv_read(f"hero_{safe_id}.json")
+    if raw:
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
     hero_file = STATE_DIR / f"hero_{safe_id}.json"
     if not hero_file.exists():
         return {}
@@ -279,15 +320,78 @@ def get_account_session_info(acc: Settings) -> dict:
     return {"exists": False, "time": "-", "size": "-"}
 
 
+def _sidebar_nav() -> str:
+    """Menu laterale a gruppi (layout console). Ritorna la pagina attiva.
+
+    Ogni voce e' un bottone ghost; quella attiva e' evidenziata in accent.
+    La selezione persiste in st.session_state["nav_page"].
+    """
+    cur = st.session_state.get("nav_page", "Overview")
+    groups = [
+        ("Agent", ["Overview", "Controllo", "Villaggi", "War Room"]),
+        ("Automazioni", ["Farming & Eroe", "Espansione"]),
+        ("Ops", ["Account", "Audits", "Debug"]),
+    ]
+    for gname, items in groups:
+        ui.section(gname)
+        for it in items:
+            if st.button(
+                it,
+                key=f"navbtn_{it}",
+                use_container_width=True,
+                type="primary" if cur == it else "secondary",
+            ):
+                st.session_state["nav_page"] = it
+                st.rerun()
+    return st.session_state.get("nav_page", "Overview")
+
+
+def _selected_account() -> "Settings | None":
+    """Account attivo scelto nel selettore globale della sidebar.
+
+    Tutte le pagine condividono la stessa selezione
+    (``st.session_state['sel_account_id']``); se l'id non esiste piu'
+    (account rimosso) ricade sul primo configurato.
+    """
+    if not accounts:
+        return None
+    cur = st.session_state.get("sel_account_id")
+    return next(
+        (a for a in accounts if a.account_id == cur),
+        accounts[0],
+    )
+
+
 # Caricamento account configurati
 accounts = load_accounts()
 
 # --- BARRA LATERALE ---
 with st.sidebar:
-    st.title("🛡️ Travian Agent")
-    st.caption("Multi-Account & Multi-Server Dashboard")
+    ui.brand_block()
+
+    # Navigazione a gruppi (layout console)
+    page = _sidebar_nav()
 
     st.divider()
+    ui.section("Account")
+    if accounts:
+        _acc_ids = [a.account_id for a in accounts]
+        _cur_id = st.session_state.get("sel_account_id")
+        _sel_idx = st.selectbox(
+            "Account attivo:",
+            range(len(accounts)),
+            index=_acc_ids.index(_cur_id) if _cur_id in _acc_ids else 0,
+            format_func=lambda i: accounts[i].account_id,
+            key="sidebar_account_sel",
+            on_change=_on_village_account_change,
+        )
+        st.session_state["sel_account_id"] = accounts[_sel_idx].account_id
+        st.caption(accounts[_sel_idx].server_url)
+    else:
+        st.info("Nessun account configurato.")
+
+    st.divider()
+    ui.section("Controlli")
 
     # Stato Bot (sessione + orfani rilevati dai PID file)
     running_agents = find_running_agents()
@@ -296,13 +400,23 @@ with st.sidebar:
         # Controllo stato di pausa per l'account principale/attivo
         paused_any = any(is_account_paused(acc.account_id) for acc in accounts)
         if paused_any:
-            st.warning("⏸️ **Agente in PAUSA d'emergenza**")
+            st.markdown(
+                ui.pill("PAUSA D'EMERGENZA", "warning", "⏸"),
+                unsafe_allow_html=True,
+            )
         else:
             if running_agents:
                 labels = ", ".join(f"{a} (PID {p})" for a, p in running_agents)
-                st.success(f"🟢 **In esecuzione**: {labels}")
+                st.markdown(
+                    ui.pill("RUNNING", "success")
+                    + f" <span class='dim'>{ui.esc(labels)}</span>",
+                    unsafe_allow_html=True,
+                )
             else:
-                st.success("🟢 **In esecuzione**")
+                st.markdown(
+                    ui.pill("RUNNING", "success"),
+                    unsafe_allow_html=True,
+                )
 
         # Toggle Pausa / Riprendi
         c_pause, c_stop = st.columns(2)
@@ -344,41 +458,131 @@ with st.sidebar:
                 time.sleep(0.5)
                 st.rerun()
     else:
-        st.info("⚪ **Agente fermo**")
-
-    st.divider()
-
-    st.subheader(f"👥 Account Attivi ({len(accounts)})")
-    if accounts:
-        for acc in accounts:
-            s_info = get_account_session_info(acc)
-            icon = "🔑" if s_info["exists"] else "⚠️"
-            st.write(f"{icon} **{acc.account_id}** ({acc.server_url})")
-            if s_info["exists"]:
-                st.caption(f"Sessione valida: {s_info['time']}")
-    else:
-        st.warning("Nessun account configurato.")
+        st.markdown(
+            ui.pill("AGENTE FERMO", "neutral", "⏹"),
+            unsafe_allow_html=True,
+        )
 
     st.divider()
     st.caption("⚠️ **Promemoria ToS**: Solo a scopo didattico / test.")
 
 
-# --- CONTENUTO PRINCIPALE ---
-tab_control, tab_villages, tab_warroom, tab_modules, tab_expansion, tab_accounts, tab_logs, tab_debug = st.tabs(
-    [
-        "🎮 Controllo & Avvio",
-        "🏰 Villaggi & Strategia",
-        "⚔️ War Room & AI Scout",
-        "🌾 Farming & Espansione",
-        "🌍 Espansione & Cropper",
-        "👥 Gestione Account / Server",
-        "📜 Log Paralleli",
-        "🖼️ Debug & Screenshot",
-    ]
-)
+# --- CONTENUTO PRINCIPALE (dispatch pagine dal menu laterale) ---
+if page == "Overview":
+    ui.page_header(
+        "Overview",
+        "Stato operativo di agenti, villaggi e minacce in tempo reale.",
+    )
+    _running_ids_hdr = {a for a, _ in find_running_agents()}
+    _hdr_villages = 0
+    _hdr_attacks = 0
+    for _acc in accounts:
+        _snaps_h = get_latest_village_snapshots(_acc.account_id)
+        _hdr_villages += len(_snaps_h) or len(_acc.villages)
+        _hdr_attacks += sum(
+            s.get("incoming_attacks", 0) for s in _snaps_h.values()
+        )
+    _hdr_farms = 0
+    _hdr_pending = 0
+    for _acc in accounts:
+        try:
+            _fts = FarmTargetStore(_acc.account_id).list_targets()
+            _hdr_farms += len(_fts)
+            _hdr_pending += sum(
+                1 for t in _fts if t.status == FARM_STATUS_PENDING
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _hdr_pending += sum(
+                1
+                for c in CropperStore().list_candidates(_acc.account_id)
+                if c.status == STATUS_PENDING
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
-# 1. TAB CONTROLLO & AVVIO
-with tab_control:
+    ui.kpi_row(
+        [
+            ui.kpi_card(
+                "Agenti",
+                len(accounts),
+                "🤖",
+                f"<b class='ok'>{len(_running_ids_hdr)} Running</b> | "
+                f"<b class='bad'>{len(accounts) - len(_running_ids_hdr)} Stopped</b>",
+            ),
+            ui.kpi_card("Villaggi", _hdr_villages, "🏰", "villaggi monitorati"),
+            ui.kpi_card("Farm Targets", _hdr_farms, "🎯", "nel catalogo raid"),
+            ui.kpi_card(
+                "Approvazioni",
+                _hdr_pending,
+                "⏳",
+                "<b class='warn'>in attesa di decisione</b>"
+                if _hdr_pending
+                else "<b class='ok'>nessuna in sospeso</b>",
+                "danger" if _hdr_pending else "",
+            ),
+            ui.kpi_card(
+                "Attacchi",
+                _hdr_attacks,
+                "⚔️",
+                "<b class='bad'>in arrivo</b>"
+                if _hdr_attacks
+                else "<b class='ok'>nessuno in arrivo</b>",
+                "danger" if _hdr_attacks else "",
+            ),
+        ]
+    )
+
+    ui.section("Agenti")
+    if accounts:
+        _agent_rows: list[list[str]] = []
+        for acc in accounts:
+            s_info = get_account_session_info(acc)
+            _snaps_a = get_latest_village_snapshots(acc.account_id)
+            _atk_a = sum(
+                s.get("incoming_attacks", 0) for s in _snaps_a.values()
+            )
+            if acc.account_id in _running_ids_hdr:
+                _status = ui.pill("Running", "success")
+            elif is_account_paused(acc.account_id):
+                _status = ui.pill("Paused", "warning")
+            else:
+                _status = ui.pill("Stopped", "neutral")
+            _sess = (
+                ui.pill(f"Valid · {s_info['time']}", "success")
+                if s_info["exists"]
+                else ui.pill("Missing", "danger")
+            )
+            _agent_rows.append(
+                [
+                    f"<b>{ui.esc(acc.account_id)}</b>",
+                    f"<span class='mono dim'>{ui.esc(acc.server_url)}</span>",
+                    _status,
+                    _sess,
+                    str(len(_snaps_a) or len(acc.villages)),
+                    ui.pill(str(_atk_a), "danger", "⚔")
+                    if _atk_a
+                    else "<span class='dim'>0</span>",
+                    f"<span class='dim'>{ui.esc(acc.username or 'login manuale')}</span>",
+                ]
+            )
+        ui.render_table(
+            ["Agent", "Server", "Status", "Sessione", "Villaggi", "Attacchi", "Utente"],
+            _agent_rows,
+        )
+    else:
+        st.info(
+            "Nessun account configurato — aggiungine uno dalla pagina Account."
+        )
+
+
+# 1. PAGINA CONTROLLO & AVVIO
+if page == "Controllo":
+    ui.page_header(
+        "Controllo",
+        "Login assistito, avvio e arresto degli agenti.",
+    )
     st.subheader("1. Login Manuale Assistito")
     st.write(
         "Effettua il login sul browser per l'account desiderato per salvare cookie e sessione (`session_<account_id>.json`)."
@@ -389,9 +593,12 @@ with tab_control:
     else:
         col_acc_sel, col_btn_login = st.columns([2, 2])
         with col_acc_sel:
-            account_names = [f"{acc.account_id} ({acc.server_url})" for acc in accounts]
-            selected_idx = st.selectbox("Seleziona Account per il Login:", range(len(accounts)), format_func=lambda i: account_names[i])
-            chosen_acc = accounts[selected_idx]
+            chosen_acc = _selected_account()
+            st.markdown(
+                f"Account selezionato (sidebar): **{ui.esc(chosen_acc.account_id)}**"
+                f"<br><span class='dim'>{ui.esc(chosen_acc.server_url)}</span>",
+                unsafe_allow_html=True,
+            )
 
         with col_btn_login:
             st.write(" ")
@@ -424,8 +631,12 @@ with tab_control:
         )
         target_account = None
         if "Solo un account" in run_mode and accounts:
-            acc_i = st.selectbox("Scegli Account:", range(len(accounts)), format_func=lambda i: account_names[i])
-            target_account = accounts[acc_i].account_id
+            _sel = _selected_account()
+            target_account = _sel.account_id
+            st.caption(
+                f"Account da eseguire: **{target_account}**"
+                " (selettore nella sidebar)"
+            )
 
         brain_choice = st.selectbox(
             "Cervello Decisionale:",
@@ -496,24 +707,25 @@ with tab_control:
                 st.rerun()
 
 
-# 2. TAB VILLAGGI & STRATEGIA
-with tab_villages:
-    st.subheader("🏰 Situazione Villaggi & Gestione Strategica (Macro / Micro)")
-    st.caption("Visualizza capienza magazzini, code e attacchi in tempo reale e modifica i ruoli con applicazione immediata a caldo (senza riavviare il bot).")
+# 2. PAGINA VILLAGGI & STRATEGIA
+if page == "Villaggi":
+    ui.page_header(
+        "Villaggi",
+        "Risorse, code e attacchi in tempo reale — ruoli strategici con applicazione a caldo (senza riavvio).",
+    )
 
     if not accounts:
         st.warning("Nessun account configurato.")
     else:
-        # Selezione account
+        # Account attivo: selettore globale in sidebar
         col_acc, col_strat = st.columns([1, 1])
         with col_acc:
-            acc_opts = [f"{a.account_id} ({a.server_url})" for a in accounts]
-            sel_v_acc_idx = st.selectbox(
-                "Seleziona Account:", range(len(accounts)),
-                format_func=lambda i: acc_opts[i], key="v_acc_sel",
-                on_change=_on_village_account_change,
+            cur_acc = _selected_account()
+            st.markdown(
+                f"**{ui.esc(cur_acc.account_id)}**"
+                f"<br><span class='dim'>{ui.esc(cur_acc.server_url)}</span>",
+                unsafe_allow_html=True,
             )
-            cur_acc = accounts[sel_v_acc_idx]
 
         with col_strat:
             strategy_profiles = ["balanced", "aggressive_hammer", "defensive_wall", "croplog_focus", "economic_growth"]
@@ -570,66 +782,15 @@ with tab_villages:
             for vname in all_vnames:
                 snap = snapshots.get(vname, {})
                 vcfg = cur_acc.villages.get(vname, VillageConfig(name=vname))
-                vrole = vcfg.role or "standard"
-
-                with st.container(border=True):
-                    head_col1, head_col2 = st.columns([3, 1])
-                    with head_col1:
-                        badge_color = {
-                            "hammer": "🔴 Hammer (Offensivo)",
-                            "defensive": "🛡️ Defensive (Scudo)",
-                            "croplog": "🌾 Croplog (Capitale)",
-                            "feeder": "📦 Feeder (Economico)",
-                            "chiefing": "👑 Chiefing (Espansione/Nobili)",
-                            "early_cropper_founder": "🚀 Founder (Pioniere 15c)",
-                            "standard": "⚙️ Standard",
-                        }.get(vrole, f"⚙️ {vrole}")
-                        target_info = f" ➡️ Target: `{vcfg.target_village}`" if vcfg.target_village else ""
-                        st.markdown(f"### 🏰 `{vname}` — **{badge_color}**{target_info}")
-                    with head_col2:
-                        if snap:
-                            ts_str = datetime.datetime.fromtimestamp(snap.get("ts", 0)).strftime("%H:%M:%S")
-                            st.caption(f"Ultimo aggiornamento: **{ts_str}**")
-                        else:
-                            st.caption("In attesa di scansione...")
-
-                    if snap:
-                        res = snap.get("resources", {})
-                        wood = res.get("wood", 0)
-                        clay = res.get("clay", 0)
-                        iron = res.get("iron", 0)
-                        crop = res.get("crop", 0)
-                        wh_cap = res.get("warehouse_cap", 0) or 1
-                        gr_cap = res.get("granary_cap", 0) or 1
-
-                        # Metriche risorse
-                        mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
-                        mc1.metric("🪵 Legno", f"{wood:,}")
-                        mc2.metric("🧱 Argilla", f"{clay:,}")
-                        mc3.metric("⛓️ Ferro", f"{iron:,}")
-                        mc4.metric("🌾 Grano", f"{crop:,}")
-                        mc5.metric("🔨 Coda", snap.get("build_queue", 0))
-                        attacks = snap.get("incoming_attacks", 0)
-                        if attacks > 0:
-                            mc6.metric("⚔️ Attacchi", attacks, delta="In arrivo!", delta_color="inverse")
-                        else:
-                            mc6.metric("⚔️ Attacchi", 0)
-
-                        # Barre di capienza
-                        wh_pct = min(1.0, max(wood, clay, iron) / wh_cap)
-                        gr_pct = min(1.0, crop / gr_cap)
-
-                        pc1, pc2 = st.columns(2)
-                        with pc1:
-                            st.write(f"**Magazzino**: {max(wood, clay, iron):,} / {wh_cap:,} ({wh_pct*100:.1f}%)")
-                            st.progress(wh_pct)
-                        with pc2:
-                            st.write(f"**Granaio**: {crop:,} / {gr_cap:,} ({gr_pct*100:.1f}%)")
-                            st.progress(gr_pct)
-
-                        action_text = snap.get("action", "-")
-                        reason_text = snap.get("reason", "-")
-                        st.caption(f"Ultima decisione: `{action_text}` — {reason_text}")
+                st.markdown(
+                    ui.village_card(
+                        name=vname,
+                        role=vcfg.role or "standard",
+                        target=vcfg.target_village,
+                        snap=snap,
+                    ),
+                    unsafe_allow_html=True,
+                )
 
         st.divider()
 
@@ -1225,17 +1386,18 @@ with tab_villages:
                 st.rerun()
 
 
-# 2.2 TAB WAR ROOM & AI SCOUT BRAIN
-with tab_warroom:
-    st.subheader("⚔️ War Room: Intelligence Imperiale & AI Scout Radar")
-    st.caption("Pannello di controllo strategico globale: bilancio della potenza militare, radar mappa, target saccheggio e raccomandazioni tattiche con Gemini AI.")
+# 2.2 PAGINA WAR ROOM & AI SCOUT BRAIN
+if page == "War Room":
+    ui.page_header(
+        "War Room",
+        "Intelligence radar, potenza militare, target saccheggio e raccomandazioni Gemini AI.",
+    )
 
     if not accounts:
         st.warning("Nessun account configurato.")
     else:
-        w_acc_opts = [f"{a.account_id} ({a.server_url})" for a in accounts]
-        w_acc_idx = st.selectbox("Seleziona Account War Room:", range(len(accounts)), format_func=lambda i: w_acc_opts[i], key="warroom_acc_sel")
-        w_acc = accounts[w_acc_idx]
+        w_acc = _selected_account()
+        st.caption(f"Account attivo: **{w_acc.account_id}** — {w_acc.server_url}")
 
         scout_data = get_scout_brain_data(w_acc.account_id)
         targets_list = scout_data.get("targets", [])
@@ -1297,46 +1459,47 @@ with tab_warroom:
                     continue
                 filtered_tgts.append(t)
 
+            _wr_rows = []
             for t in filtered_tgts:
                 is_bl = t.get("is_blacklisted", False)
-                with st.container(border=True):
-                    tc1, tc2, tc3, tc4 = st.columns([2, 1, 1, 2])
-                    with tc1:
-                        icon = "⛔" if is_bl else ("🏝️" if t.get("is_oasis") else "🏕️")
-                        st.markdown(f"**{icon} {t.get('village_name')}** `({t.get('x')}|{t.get('y')})`")
-                        if t.get("player_name"):
-                            st.caption(f"Giocatore: {t.get('player_name')} | Pop: {t.get('population', 0)}")
-                    with tc2:
-                        st.write(f"📏 Dist: **{t.get('distance', 0):.1f}**")
-                    with tc3:
-                        loot = t.get("last_loot_ratio", 1.0)
-                        st.write(f"💰 Bottino: **{int(loot*100)}%**")
-                    with tc4:
-                        if is_bl:
-                            st.error(f"Blacklist: {t.get('notes', 'Perdite rilevate')}")
-                        else:
-                            st.success("Target Valido / Pronto")
+                icon = "⛔" if is_bl else ("🏝️" if t.get("is_oasis") else "🏕️")
+                loot = t.get("last_loot_ratio", 1.0)
+                _wr_rows.append(
+                    [
+                        f"{icon} <b>{ui.esc(t.get('village_name', ''))}</b>",
+                        f"<span class='mono'>({t.get('x')}|{t.get('y')})</span>",
+                        f"<span class='dim'>{ui.esc(t.get('player_name') or '—')}"
+                        f" · pop {t.get('population', 0)}</span>",
+                        f"{t.get('distance', 0):.1f}",
+                        f"{int(loot * 100)}%",
+                        ui.pill("blacklisted", "danger")
+                        if is_bl
+                        else ui.pill("valid", "success"),
+                        f"<span class='dim'>{ui.esc(t.get('notes', ''))}</span>"
+                        if is_bl and t.get("notes")
+                        else "",
+                    ]
+                )
+            ui.render_table(
+                ["Target", "Coord", "Giocatore", "Dist", "Bottino", "Stato", "Note"],
+                _wr_rows,
+            )
         else:
             st.info("Nessun tile scansionato finora. L'agente esplorerà la mappa al prossimo ciclo con il sensore mappa attivo.")
 
 
-# 2.5 TAB FARMING & ESPANSIONE
-with tab_modules:
-    st.subheader("🌾 Automazioni: Saccheggio (Farm List) e Fondazione Villaggi")
-    st.caption(
-        "Attiva i moduli autonomi. Le modifiche vengono salvate su accounts.json "
-        "e applicate a caldo dall'agente al prossimo ciclo (senza riavvio)."
+# 2.5 PAGINA FARMING & EROE
+if page == "Farming & Eroe":
+    ui.page_header(
+        "Farming & Eroe",
+        "Moduli autonomi: farm list, eroe, difesa e replenishment — salvataggio a caldo su accounts.json.",
     )
 
     if not accounts:
         st.warning("Nessun account configurato.")
     else:
-        mod_acc_opts = [f"{a.account_id} ({a.server_url})" for a in accounts]
-        mod_acc_idx = st.selectbox(
-            "Seleziona Account:", range(len(accounts)),
-            format_func=lambda i: mod_acc_opts[i], key="mod_acc_sel",
-        )
-        mod_acc = accounts[mod_acc_idx]
+        mod_acc = _selected_account()
+        st.caption(f"Account attivo: **{mod_acc.account_id}** — {mod_acc.server_url}")
 
         # ---------------- STATUS EROE ----------------
         hero_data = get_hero_data(mod_acc.account_id)
@@ -1410,6 +1573,8 @@ with tab_modules:
                 farm_list_name = st.text_input(
                     "Nome Farm List preferita (vuoto = prima disponibile):",
                     value=mod_acc.farming.farm_list,
+                    help="Lista nativa Gold Club (tt=99): usata solo come "
+                         "fallback quando non ci sono Custom Farm Targets approved.",
                 )
             with f_col2:
                 cur_unit = mod_acc.farming.unit or unit_choices[0]
@@ -1418,6 +1583,24 @@ with tab_modules:
                 farm_unit_g = st.selectbox(
                     "Unità di saccheggio predefinita:", unit_choices,
                     index=unit_choices.index(cur_unit),
+                )
+
+            f_col3, f_col4 = st.columns(2)
+            with f_col3:
+                farm_wave_sel = st.number_input(
+                    "Max target per ondata (Custom Farm):",
+                    min_value=1, max_value=10,
+                    value=int(mod_acc.farming.targets_per_wave or 3),
+                    help="Quanti bersagli 'approved' vengono razziati in ogni "
+                         "ciclo di farming per villaggio (raid mirati tt=2).",
+                )
+            with f_col4:
+                farm_autoscan_sel = st.toggle(
+                    "Scoperta automatica target (scansione mappa)",
+                    value=bool(getattr(mod_acc.farming, "auto_scan", True)),
+                    key="farm_autoscan_toggle",
+                    help="Scansiona periodicamente la mappa per catalogare oasi "
+                         "e villaggi razziabili come 'pending' nella tabella sotto.",
                 )
 
             st.markdown("#### Per-villaggio")
@@ -1448,6 +1631,14 @@ with tab_modules:
                             help="Se attivo, il villaggio attiva drain risorse "
                                  "e fuga truppe in caso di attacco reale.",
                         )
+                    st.number_input(
+                        "Unità per raid custom (0 = auto — divide i raider sui target):",
+                        min_value=0, max_value=5000,
+                        value=int(getattr(vcfg, "farm_unit_qty", 0) or 0),
+                        key=f"farm_qty_{mod_acc.account_id}_{idx}",
+                        help="Truppe inviate per ogni raid mirato sui Custom "
+                             "Farm Targets approvati (tt=2, non Gold Club).",
+                    )
 
             st.divider()
 
@@ -1599,6 +1790,22 @@ with tab_modules:
                 value=mod_acc.hero.auto_adventures,
                 key="hero_auto_adv",
                 help="Invia l'eroe alla prima avventura disponibile quando e' a casa.",
+            )
+            hero_tactical = st.toggle(
+                "Consenti uso tattico dell'Eroe in combattimento",
+                value=getattr(mod_acc.hero, "tactical_hero_enabled", True),
+                key="hero_tactical",
+                help=(
+                    "Smart Hero Combat Evaluator: aggrega l'eroe ai raid ad "
+                    "alto valore (oasi con belve, wave hammer dei chiefing, "
+                    "target ad alto bottino). Mai sui micro-raid ripetitivi."
+                ),
+            )
+            hero_combat_hp_sel = st.slider(
+                "Salute minima per combattimento %",
+                min_value=10, max_value=100,
+                value=int(getattr(mod_acc.hero, "min_combat_health", 65)),
+                help="Sotto questa soglia l'eroe resta a casa a curarsi.",
             )
             hr_col1, hr_col2, hr_col3 = st.columns(3)
             with hr_col1:
@@ -1770,6 +1977,8 @@ with tab_modules:
             mod_acc.farming.unit = (
                 "" if farm_unit_g == unit_choices[0] else farm_unit_g
             )
+            mod_acc.farming.targets_per_wave = int(farm_wave_sel)
+            mod_acc.farming.auto_scan = bool(farm_autoscan_sel)
 
             # Farming per-villaggio
             for idx, vname in enumerate(mod_known):
@@ -1787,6 +1996,12 @@ with tab_modules:
                 )
                 sel_unit = st.session_state[f"troop_type_{mod_acc.account_id}_{idx}"]
                 vcfg.farm_unit = "" if sel_unit == unit_choices[0] else sel_unit
+                vcfg.farm_unit_qty = int(
+                    st.session_state.get(
+                        f"farm_qty_{mod_acc.account_id}_{idx}",
+                        getattr(vcfg, "farm_unit_qty", 0),
+                    )
+                )
                 mod_acc.villages[vname] = vcfg
 
             # Espansione
@@ -1866,6 +2081,8 @@ with tab_modules:
             mod_acc.hero.heal_threshold = int(hero_heal_sel)
             mod_acc.hero.min_health_to_adventure = int(hero_min_hp_sel)
             mod_acc.hero.attribute_focus = hero_attr_sel
+            mod_acc.hero.tactical_hero_enabled = hero_tactical
+            mod_acc.hero.min_combat_health = int(hero_combat_hp_sel)
 
             # Difesa
             mod_acc.defense.enabled = defense_enabled
@@ -1895,24 +2112,190 @@ with tab_modules:
             time.sleep(1)
             st.rerun()
 
+        # ---------------- CUSTOM FARM TARGETS (Human-in-the-Loop) ----------------
+        st.divider()
+        st.subheader("🎯 Custom Farm Targets (alternativa al Gold Club)")
+        st.caption(
+            "Bersagli di saccheggio scoperti dalla scansione mappa (oasi e "
+            "villaggi) o inseriti a mano. L'agente invia raid mirati (tt=2) "
+            "SOLO sui target `approved` — nessuna farm list nativa richiesta. "
+            "Perdite o difensori nei report -> auto-blacklist anti-suicidio."
+        )
+        _fstore = FarmTargetStore(mod_acc.account_id)
+        _ft_all = _fstore.list_targets()
+        _fc = {
+            s: sum(1 for t in _ft_all if t.status == s)
+            for s in (
+                FARM_STATUS_PENDING, FARM_STATUS_APPROVED,
+                FARM_STATUS_REJECTED, FARM_STATUS_BLACKLISTED,
+            )
+        }
+        fm1, fm2, fm3, fm4 = st.columns(4)
+        fm1.metric("🕐 Pending", _fc[FARM_STATUS_PENDING])
+        fm2.metric("✅ Approved", _fc[FARM_STATUS_APPROVED])
+        fm3.metric("⛔ Blacklisted", _fc[FARM_STATUS_BLACKLISTED])
+        fm4.metric("❌ Scartati", _fc[FARM_STATUS_REJECTED])
 
-# 2.6 TAB ESPANSIONE & CROPPER (Human-in-the-Loop)
-with tab_expansion:
-    st.subheader("🌍 Cropper Finder: Candidati in Attesa di Approvazione")
-    st.caption(
-        "Il bot scansiona la mappa attorno ai villaggi e cataloga i tile 9c/15c liberi. "
-        "La fondazione parte SOLO dopo l'approvazione umana (stato `approved`)."
+        ff1, ff2, ff3 = st.columns(3)
+        with ff1:
+            _ft_status = st.selectbox(
+                "Filtro stato:",
+                ["Tutti", FARM_STATUS_PENDING, FARM_STATUS_APPROVED,
+                 FARM_STATUS_REJECTED, FARM_STATUS_BLACKLISTED],
+                key="farm_f_status",
+            )
+        with ff2:
+            _ft_type = st.selectbox(
+                "Filtro tipo:", ["Tutti", "Oasi", "Villaggi"],
+                key="farm_f_type",
+            )
+        with ff3:
+            _ft_maxdist = st.number_input(
+                "Distanza max (campi, 0 = tutte):",
+                min_value=0.0, max_value=400.0, value=0.0, step=5.0,
+                key="farm_f_dist",
+            )
+
+        _ft_filtered = [
+            t for t in _ft_all
+            if (_ft_status == "Tutti" or t.status == _ft_status)
+            and (_ft_type == "Tutti"
+                 or (_ft_type == "Oasi" and t.is_oasis)
+                 or (_ft_type == "Villaggi" and not t.is_oasis))
+            and (not _ft_maxdist or t.distance <= _ft_maxdist or t.distance == 0)
+        ]
+
+        if not _ft_filtered:
+            st.info(
+                "Nessun target in catalogo. La scansione mappa dell'agente "
+                "(farming.auto_scan o AI Scout) popola questa lista; oppure "
+                "inserisci le coordinate a mano qui sotto."
+            )
+        else:
+            _farm_tone = {
+                FARM_STATUS_PENDING: ("pending", "warning"),
+                FARM_STATUS_APPROVED: ("approved", "success"),
+                FARM_STATUS_REJECTED: ("rejected", "neutral"),
+                FARM_STATUS_BLACKLISTED: ("blacklisted", "danger"),
+            }
+            _ft_rows = []
+            _ft_label = {}
+            for _t in _ft_filtered:
+                _lbl, _tone = _farm_tone.get(_t.status, (_t.status, "neutral"))
+                _ft_label[_t.id] = f"({_t.x}|{_t.y}) {_t.name or ''}"
+                _ft_rows.append(
+                    [
+                        f"<span class='mono'>({_t.x}|{_t.y})</span>",
+                        ui.esc(_t.name or "—") + (" ✋" if _t.manual else ""),
+                        "🌿 Oasi" if _t.is_oasis else "🏘️ Vill.",
+                        f"{_t.distance:.0f}" if _t.distance else "—",
+                        str(_t.population or "—"),
+                        str(_t.estimated_loot or "—"),
+                        f"{_t.last_loot_ratio:.0%}",
+                        str(_t.losses_recorded or "—"),
+                        ui.pill(_lbl, _tone),
+                    ]
+                )
+            ui.render_table(
+                ["Coord", "Nome", "Tipo", "Dist", "Pop", "Loot st.",
+                 "Loot%", "Perdite", "Stato"],
+                _ft_rows,
+            )
+
+            # Azioni bulk sui target selezionati (stile console)
+            ba1, ba2, ba3, ba4 = st.columns([3, 1, 1, 1])
+            with ba1:
+                _ft_sel = st.multiselect(
+                    "Seleziona target:",
+                    options=list(_ft_label.keys()),
+                    format_func=lambda tid: _ft_label[tid],
+                    key=f"farm_bulk_{mod_acc.account_id}",
+                    label_visibility="collapsed",
+                    placeholder="Seleziona i target per le azioni...",
+                )
+            with ba2:
+                if st.button("✅ Approva", use_container_width=True,
+                             key=f"fbapp_{mod_acc.account_id}"):
+                    for tid in _ft_sel:
+                        _fstore.approve(tid)
+                    st.rerun()
+            with ba3:
+                if st.button("❌ Scarta", use_container_width=True,
+                             key=f"fbrej_{mod_acc.account_id}"):
+                    for tid in _ft_sel:
+                        _fstore.reject(tid)
+                    st.rerun()
+            with ba4:
+                if st.button("↩️ Ripristina", use_container_width=True,
+                             key=f"fbrst_{mod_acc.account_id}"):
+                    for tid in _ft_sel:
+                        _fstore.set_status(tid, FARM_STATUS_PENDING)
+                    st.rerun()
+            # (azioni per-riga sostituite dalle azioni bulk sopra)
+
+        # --- Inserimento manuale target ---
+        st.markdown("**➕ Inserimento Manuale Target**")
+        st.caption(
+            "Conosci un' oasi abbandonata o un villaggio inattivo da "
+            "saccheggiare? Inseriscilo qui: entra come pending e va approvato "
+            "come gli altri."
+        )
+        mt1, mt2, mt3, mt4, mt5 = st.columns([0.9, 0.9, 1.8, 0.9, 1.3])
+        with mt1:
+            _mt_x = st.number_input(
+                "Coord. X:", min_value=-400, max_value=400, value=0,
+                step=1, key=f"fmtx_{mod_acc.account_id}",
+            )
+        with mt2:
+            _mt_y = st.number_input(
+                "Coord. Y:", min_value=-400, max_value=400, value=0,
+                step=1, key=f"fmty_{mod_acc.account_id}",
+            )
+        with mt3:
+            _mt_name = st.text_input(
+                "Nome (opz.):", key=f"fmtn_{mod_acc.account_id}",
+            )
+        with mt4:
+            _mt_oasis = st.checkbox(
+                "Oasi", key=f"fmto_{mod_acc.account_id}",
+            )
+        with mt5:
+            st.write(" ")
+            if st.button(
+                "Aggiungi Target",
+                key=f"fmtb_{mod_acc.account_id}",
+            ):
+                _mx, _my = int(_mt_x), int(_mt_y)
+                if _fstore.status_at(_mx, _my) is not None:
+                    st.warning(
+                        f"({_mx}|{_my}) gia' presente in catalogo."
+                    )
+                else:
+                    _new_t = _fstore.add_manual_target(
+                        _mx, _my,
+                        name=_mt_name.strip(),
+                        is_oasis=bool(_mt_oasis),
+                    )
+                    if _new_t is not None:
+                        st.success(
+                            f"Target ({_mx}|{_my}) aggiunto come pending. "
+                            "Approva per attivare i raid."
+                        )
+                        st.rerun()
+
+
+# 2.6 PAGINA ESPANSIONE & CROPPER (Human-in-the-Loop)
+if page == "Espansione":
+    ui.page_header(
+        "Espansione",
+        "Cropper finder e fondazione villaggi — i tile partono solo dopo approvazione umana.",
     )
 
     if not accounts:
         st.info("Nessun account configurato.")
     else:
-        e_opts = [f"{a.account_id} ({a.server_url})" for a in accounts]
-        e_acc_idx = st.selectbox(
-            "Seleziona Account:", range(len(accounts)),
-            format_func=lambda i: e_opts[i], key="cropper_acc_sel",
-        )
-        e_acc = accounts[e_acc_idx]
+        e_acc = _selected_account()
+        st.caption(f"Account attivo: **{e_acc.account_id}** — {e_acc.server_url}")
         store = CropperStore()
         candidates = store.list_candidates(e_acc.account_id)
 
@@ -1947,63 +2330,68 @@ with tab_expansion:
                 "lista durante il ciclo dell'agente (richiede `cropper_scan` attivo)."
             )
         else:
-            _status_label = {
-                STATUS_PENDING: "🕐 In attesa",
-                STATUS_APPROVED: "✅ Approvato",
-                STATUS_REJECTED: "❌ Scartato",
-                STATUS_SETTLING: "🚀 Coloni in viaggio",
-                STATUS_SETTLED: "🏘️ Fondato",
+            _crop_tone = {
+                STATUS_PENDING: ("pending", "warning"),
+                STATUS_APPROVED: ("approved", "success"),
+                STATUS_REJECTED: ("rejected", "neutral"),
+                STATUS_SETTLING: ("settling", "info"),
+                STATUS_SETTLED: ("settled", "success"),
             }
             _type_label = {
                 "15c": "15 Grani", "9c": "9 Grani", "6c": "Standard",
             }
-            h = st.columns([1.4, 1.1, 1.2, 2.0, 1.4, 2.0])
-            for col, title in zip(h, ("Coordinate", "Tipo", "Distanza", "Oasi Bonus", "Stato", "Azioni")):
-                col.markdown(f"**{title}**")
-            st.divider()
+            _cand_rows = []
+            _cand_label = {}
             for cand in filtered:
-                r = st.columns([1.4, 1.1, 1.2, 2.0, 1.4, 2.0])
-                r[0].write(f"({cand.x} | {cand.y})")
-                r[1].write(
-                    _type_label.get(cand.type, cand.type)
-                    + (" \u270b" if getattr(cand, "manual", False) else "")
-                )
-                r[2].write(f"{cand.distance_hours:.1f} ore")
+                _lbl, _tone = _crop_tone.get(cand.status, (cand.status, "neutral"))
+                _cand_label[cand.id] = f"({cand.x}|{cand.y}) {cand.type}"
                 oases_txt = ", ".join(
                     f"+{o.get('bonus', 25)}% {o.get('type', 'crop')}"
                     for o in (cand.oases or [])
                 ) or "—"
-                r[3].write(oases_txt)
-                r[4].write(_status_label.get(cand.status, cand.status))
-                with r[5]:
-                    if cand.status == STATUS_PENDING:
-                        b1, b2 = st.columns(2)
-                        with b1:
-                            if st.button(
-                                "Approva",
-                                key=f"app_{e_acc.account_id}_{cand.id}",
-                                type="primary",
-                            ):
-                                store.approve(e_acc.account_id, cand.id)
-                                st.rerun()
-                        with b2:
-                            if st.button(
-                                "Scarta",
-                                key=f"rej_{e_acc.account_id}_{cand.id}",
-                            ):
-                                store.reject(e_acc.account_id, cand.id)
-                                st.rerun()
-                    elif cand.status == STATUS_APPROVED:
-                        st.caption("In coda fondazione")
-                    elif cand.status == STATUS_REJECTED:
-                        if st.button(
-                            "Ripristina",
-                            key=f"rst_{e_acc.account_id}_{cand.id}",
-                        ):
-                            store.set_status(
-                                e_acc.account_id, cand.id, STATUS_PENDING
-                            )
-                            st.rerun()
+                _cand_rows.append(
+                    [
+                        f"<span class='mono'>({cand.x} | {cand.y})</span>",
+                        ui.esc(_type_label.get(cand.type, cand.type))
+                        + (" \u270b" if getattr(cand, "manual", False) else ""),
+                        f"{cand.distance_hours:.1f} ore",
+                        f"<span class='dim'>{ui.esc(oases_txt)}</span>",
+                        ui.pill(_lbl, _tone),
+                    ]
+                )
+            ui.render_table(
+                ["Coordinate", "Tipo", "Distanza", "Oasi Bonus", "Stato"],
+                _cand_rows,
+            )
+
+            ca1, ca2, ca3, ca4 = st.columns([3, 1, 1, 1])
+            with ca1:
+                _cand_sel = st.multiselect(
+                    "Seleziona candidati:",
+                    options=list(_cand_label.keys()),
+                    format_func=lambda cid: _cand_label[cid],
+                    key=f"crop_bulk_{e_acc.account_id}",
+                    label_visibility="collapsed",
+                    placeholder="Seleziona i candidati per le azioni...",
+                )
+            with ca2:
+                if st.button("✅ Approva", use_container_width=True,
+                             key=f"cbapp_{e_acc.account_id}"):
+                    for cid in _cand_sel:
+                        store.approve(e_acc.account_id, cid)
+                    st.rerun()
+            with ca3:
+                if st.button("❌ Scarta", use_container_width=True,
+                             key=f"cbrej_{e_acc.account_id}"):
+                    for cid in _cand_sel:
+                        store.reject(e_acc.account_id, cid)
+                    st.rerun()
+            with ca4:
+                if st.button("↩️ Ripristina", use_container_width=True,
+                             key=f"cbrst_{e_acc.account_id}"):
+                    for cid in _cand_sel:
+                        store.set_status(e_acc.account_id, cid, STATUS_PENDING)
+                    st.rerun()
 
         # --- Inserimento manuale candidato ---
         # Tile conosciuti via passaparola/alleanza: entrano in watchlist
@@ -2093,10 +2481,12 @@ with tab_expansion:
                     )
 
 
-# 3. TAB GESTIONE ACCOUNT
-with tab_accounts:
-    st.subheader("Configurazione Multi-Account / Multi-Server")
-    st.write("Aggiungi più server o account. Ognuno manterrà i propri cookie di sessione separati.")
+# 3. PAGINA GESTIONE ACCOUNT
+if page == "Account":
+    ui.page_header(
+        "Account",
+        "Configurazione multi-account / multi-server — cookie di sessione separati per agente.",
+    )
 
     # Form Aggiunta/Modifica
     with st.expander("➕ Aggiungi un Nuovo Account / Server", expanded=len(accounts) == 0):
@@ -2158,61 +2548,127 @@ with tab_accounts:
                     time.sleep(1)
                     st.rerun()
 
-    # Tabella account esistenti con opzione elimina
-    st.markdown("#### Elenco Account Registrati")
+    # Rimozione account (la tabella agenti e' nella pagina Overview)
+    ui.section("Rimuovi account")
     if accounts:
-        for idx, acc in enumerate(accounts):
-            with st.container(border=True):
-                c_info, c_action = st.columns([3, 1])
-                s_info = get_account_session_info(acc)
-                with c_info:
-                    st.markdown(f"### 🛡️ `{acc.account_id}`")
-                    st.write(f"**Server:** `{acc.server_url}` | **User:** `{acc.username or '(Login manuale)'}`")
-                    st.write(f"**Sessione Salvata:** {s_info['time']} ({s_info['size'] if s_info['exists'] else 'Nessuna'})")
-                with c_action:
-                    st.write(" ")
-                    if st.button("🗑️ Rimuovi Account", key=f"del_{acc.account_id}"):
-                        remaining = [a for a in accounts if a.account_id != acc.account_id]
-                        # Rimozione esplicita: consentito svuotare la lista
-                        save_accounts(remaining, allow_empty=True)
-                        if acc.state_file and acc.state_file.exists():
-                            acc.state_file.unlink(missing_ok=True)
-                        st.toast(f"Account {acc.account_id} rimosso.")
-                        time.sleep(0.5)
-                        st.rerun()
+        d1, d2 = st.columns([3, 1])
+        with d1:
+            del_sel = st.selectbox(
+                "Seleziona account da rimuovere:",
+                [a.account_id for a in accounts],
+                key="del_acc_sel",
+            )
+        with d2:
+            st.write(" ")
+            if st.button(
+                "🗑️ Rimuovi Account", key="del_acc_btn", use_container_width=True
+            ):
+                remaining = [a for a in accounts if a.account_id != del_sel]
+                # Rimozione esplicita: consentito svuotare la lista
+                save_accounts(remaining, allow_empty=True)
+                victim = next(
+                    (a for a in accounts if a.account_id == del_sel), None
+                )
+                if victim and victim.state_file and victim.state_file.exists():
+                    victim.state_file.unlink(missing_ok=True)
+                st.toast(f"Account {del_sel} rimosso.")
+                time.sleep(0.5)
+                st.rerun()
     else:
         st.info("Nessun account presente.")
 
 
-# 3. TAB LOG
-with tab_logs:
-    st.subheader("Log di Esecuzione (un file per account)")
+# 3. PAGINA AUDITS (log eventi stile console)
+if page == "Audits":
+    ui.page_header(
+        "Audits",
+        "Esplora gli eventi di esecuzione generati dagli agenti (un file di log per account).",
+    )
     # Ogni agente scrive su agent_<id>.log; agent.log resta per i log legacy.
     log_files = sorted(STATE_DIR.glob("agent*.log"))
+    auto_refresh = False
     if not log_files:
-        st.info("Nessun file di log trovato. Avvia l'agente per generare i log.")
-        auto_refresh = False
+        st.info("Nessun file di log trovato. Avvia l'agente per generare gli eventi.")
     else:
         sel_log = st.selectbox("File di log:", log_files, format_func=lambda p: p.name)
         c_log1, c_log2 = st.columns([1, 4])
         with c_log1:
-            auto_refresh = st.checkbox("Auto-aggiorna log", value=True)
+            auto_refresh = st.checkbox("Auto-aggiorna", value=True)
             if st.button("🗑️ Pulisci log"):
                 sel_log.write_text("", encoding="utf-8")
                 st.rerun()
 
+        # --- Toolbar filtri stile console ---
+        f1, f2 = st.columns([2, 2])
+        with f1:
+            search_q = st.text_input(
+                "Cerca evento:",
+                "",
+                placeholder="🔍 Filtra per modulo o messaggio...",
+                label_visibility="collapsed",
+            )
+        with f2:
+            sel_levels = st.pills(
+                "Livello",
+                ["INFO", "WARNING", "ERROR", "CRITICAL", "DEBUG"],
+                selection_mode="multi",
+                default=["INFO", "WARNING", "ERROR", "CRITICAL"],
+                label_visibility="collapsed",
+            )
+
         log_content = sel_log.read_text(encoding="utf-8", errors="replace")
-        lines = log_content.splitlines()[-120:]
-        st.code("\n".join(lines) if lines else "Nessun log disponibile.", language="text")
+        events: list[dict] = []
+        for _ln in log_content.splitlines():
+            if not _ln.strip():
+                continue
+            m = _LOG_LINE_RE.match(_ln)
+            if m:
+                events.append(m.groupdict())
+            elif events:
+                # Continuazioni (traceback) accodate all'evento precedente
+                events[-1]["msg"] += "  " + _ln.strip()
+            else:
+                events.append(
+                    {"ts": "", "level": "", "logger": "", "msg": _ln.strip()}
+                )
+        events.reverse()  # eventi più recenti in alto
+
+        _audit_rows: list[list[str]] = []
+        _q = search_q.strip().lower()
+        for ev in events:
+            _lvl = ev["level"]
+            if sel_levels and _lvl and _lvl not in sel_levels:
+                continue
+            if _q and _q not in f"{ev['logger']} {ev['msg']}".lower():
+                continue
+            _ts = ev["ts"].replace("T", " ")[5:] if ev["ts"] else "—"
+            _audit_rows.append(
+                [
+                    f"<span class='mono dim'>{ui.esc(_ts)}</span>",
+                    ui.pill(_lvl or "LOG", _LOG_LEVEL_TONE.get(_lvl, "neutral")),
+                    f"<span class='dim'>{ui.esc(ev['logger'].replace('travian_agent.', ''))}</span>",
+                    ui.esc(ev["msg"]),
+                ]
+            )
+            if len(_audit_rows) >= 200:
+                break
+
+        if _audit_rows:
+            ui.render_table(["Time", "Level", "Module", "Message"], _audit_rows)
+            st.caption(
+                f"{len(events)} eventi nel file — mostrati {len(_audit_rows)} più recenti."
+            )
+        else:
+            st.info("Nessun evento corrisponde ai filtri.")
 
     if auto_refresh and is_agent_running():
         time.sleep(3)
         st.rerun()
 
 
-# 4. TAB DEBUG
-with tab_debug:
-    st.subheader("Screenshot di Debug")
+# 4. PAGINA DEBUG
+if page == "Debug":
+    ui.page_header("Debug", "Screenshot e artefatti di diagnostica.")
     if DEBUG_DIR.exists():
         pngs = list(DEBUG_DIR.rglob("*.png"))
         if pngs:

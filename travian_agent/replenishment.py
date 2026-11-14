@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import db
 from .config import BASE_DIR
 
 if TYPE_CHECKING:
@@ -179,11 +180,13 @@ class TroopReplenishmentManager:
     last_events: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self._kv_key: str | None = None
         if self.state_path is None:
             safe = "".join(
                 c if c.isalnum() or c in "._-" else "_" for c in self.account_id
             )
-            self.state_path = STATE_DIR / f"replenish_{safe}.json"
+            self._kv_key = f"replenish_{safe}.json"
+            self.state_path = STATE_DIR / self._kv_key
         self._load()
 
     # ------------------------------------------------------------------
@@ -191,8 +194,13 @@ class TroopReplenishmentManager:
     # ------------------------------------------------------------------
     def _load(self) -> None:
         try:
-            if self.state_path and self.state_path.exists():
+            data: dict | None = None
+            if self._kv_key is not None:
+                text = db.kv_read(self._kv_key)
+                data = json.loads(text) if text else None
+            elif self.state_path and self.state_path.exists():
                 data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if data:
                 self.blocked_targets = {
                     str(k): dict(v)
                     for k, v in (data.get("blocked_targets") or {}).items()
@@ -216,23 +224,24 @@ class TroopReplenishmentManager:
 
     def _save(self) -> None:
         try:
+            payload = json.dumps(
+                {
+                    "blocked_targets": self.blocked_targets,
+                    "frozen_units": self.frozen_units,
+                    "frozen_villages": self.frozen_villages,
+                    "fail_streaks": self.fail_streaks,
+                    "last_events": self.last_events[-30:],
+                    "updated_at": time.time(),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            if self._kv_key is not None:
+                db.kv_write(self._kv_key, payload)
+                return
             assert self.state_path is not None
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(
-                json.dumps(
-                    {
-                        "blocked_targets": self.blocked_targets,
-                        "frozen_units": self.frozen_units,
-                        "frozen_villages": self.frozen_villages,
-                        "fail_streaks": self.fail_streaks,
-                        "last_events": self.last_events[-30:],
-                        "updated_at": time.time(),
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
+            self.state_path.write_text(payload, encoding="utf-8")
         except Exception:
             logger.debug("Salvataggio stato replenishment fallito", exc_info=True)
 

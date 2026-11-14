@@ -1653,6 +1653,13 @@ class ActionExecutor:
             troops = dict(tgt.get("troops") or {})
             if tx is None or ty is None or not troops:
                 continue
+            # Smart Hero Combat Evaluator: l'eroe parte con l'invio solo se
+            # il planner (Scenario A/B/C) lo ha incluso. Il fill e' best-
+            # effort: se lo slot eroe manca/disabilitato il raid parte
+            # comunque senza bloccare l'azione.
+            include_hero = bool(
+                tgt.get("include_hero") or params.get("include_hero")
+            )
 
             try:
                 # 1. Naviga al form di invio truppe del Punto di Raduno
@@ -1666,7 +1673,7 @@ class ActionExecutor:
                 fill_res = await page.evaluate(
                     """
                     (payload) => {
-                        const { x, y, troops, moveType } = payload;
+                        const { x, y, troops, moveType, includeHero } = payload;
 
                         // Coordinate X / Y
                         const xIn = document.querySelector('input[name="x"], input#xCoordInput, #xCoord');
@@ -1700,10 +1707,28 @@ class ActionExecutor:
                             }
                         }
 
+                        // Eroe: slot dedicato nel form (input t11 / hero).
+                        // Fallback di sicurezza: se manca o e' disabilitato
+                        // (eroe partito per un'avventura) il raid parte
+                        // comunque senza eroe.
+                        if (includeHero) {
+                            const heroIn = document.querySelector(
+                                'input[name="t11"], input[name="troop[t11]"], ' +
+                                'input[name*="hero" i], input#hero'
+                            );
+                            if (heroIn && !heroIn.disabled) {
+                                heroIn.value = '1';
+                                heroIn.dispatchEvent(new Event('input', {bubbles: true}));
+                            }
+                        }
+
                         return { ok: !!(xIn && yIn && filledAny) };
                     }
                     """,
-                    {"x": tx, "y": ty, "troops": troops, "moveType": move_type},
+                    {
+                        "x": tx, "y": ty, "troops": troops,
+                        "moveType": move_type, "includeHero": include_hero,
+                    },
                 )
 
                 if not fill_res or not fill_res.get("ok"):

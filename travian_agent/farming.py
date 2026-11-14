@@ -23,12 +23,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import db
 from .config import BASE_DIR, Settings
 from .models import Action, ActionType, GID_RALLY_POINT
 
 if TYPE_CHECKING:
     from .actions import ActionExecutor
     from .browser import TravianBrowser
+    from .farm_store import FarmTargetStore
     from .sensors import GameObserver
     from .models import Field, Village
 
@@ -47,6 +49,13 @@ RETRY_MAX_SECONDS = 420.0
 # warning ripetuti.
 NO_LIST_RETRY_MIN_SECONDS = 3600.0
 NO_LIST_RETRY_MAX_SECONDS = 5400.0
+
+# Custom Farm Target: cooldown della scansione mappa di scoperta per
+# villaggio (i tile trovati entrano nello store come 'pending').
+SCAN_MIN_SECONDS = 5400.0   # 1.5h
+SCAN_MAX_SECONDS = 9000.0   # 2.5h
+# Minimo di unita' per raid quando farm_unit_qty = auto
+AUTO_QTY_FLOOR = 3
 
 # Alias delle truppe "leggere da saccheggio" per verificare la presenza
 # quando non e' configurata un'unita' specifica: le chiavi del sensore
@@ -123,11 +132,15 @@ class FarmingManager:
     account_id: str
     state_path: Path | None = None
     next_due: dict[str, float] = field(default_factory=dict)
+    # Prossima scansione mappa di scoperta per villaggio (custom farm)
+    next_scan: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self._kv_key: str | None = None
         if self.state_path is None:
             safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in self.account_id)
-            self.state_path = STATE_DIR / f"farming_{safe}.json"
+            self._kv_key = f"farming_{safe}.json"
+            self.state_path = STATE_DIR / self._kv_key
         self._load()
 
     # ------------------------------------------------------------------
@@ -135,22 +148,38 @@ class FarmingManager:
     # ------------------------------------------------------------------
     def _load(self) -> None:
         try:
-            if self.state_path and self.state_path.exists():
+            data: dict | None = None
+            if self._kv_key is not None:
+                text = db.kv_read(self._kv_key)
+                data = json.loads(text) if text else None
+            elif self.state_path and self.state_path.exists():
                 data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if data:
                 self.next_due = {
                     str(k): float(v) for k, v in (data.get("next_due") or {}).items()
                 }
+                self.next_scan = {
+                    str(k): float(v) for k, v in (data.get("next_scan") or {}).items()
+                }
         except Exception:
             self.next_due = {}
+            self.next_scan = {}
 
     def _save(self) -> None:
         try:
+            payload = json.dumps(
+                {
+                    "next_due": self.next_due,
+                    "next_scan": self.next_scan,
+                },
+                indent=2,
+            )
+            if self._kv_key is not None:
+                db.kv_write(self._kv_key, payload)
+                return
             assert self.state_path is not None
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(
-                json.dumps({"next_due": self.next_due}, indent=2),
-                encoding="utf-8",
-            )
+            self.state_path.write_text(payload, encoding="utf-8")
         except Exception:
             logger.debug("Salvataggio stato farming fallito", exc_info=True)
 
@@ -208,6 +237,154 @@ class FarmingManager:
         return any(troops.get(k, 0) > 0 for k in keys)
 
     # ------------------------------------------------------------------
+    # Custom Farm Target: unita' e quantita' per i raid mirati
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _raider_key(troops: dict[str, int], unit_pref: str) -> str:
+        """Chiave 'tN' dell'unita' da saccheggio.
+
+        Se `unit_pref` e' configurata la risolve via unit_label_to_key;
+        altrimenti sceglie la prima unita' leggera disponibile a casa.
+        """
+        from .replenishment import unit_label_to_key  # import ritardato
+
+        if unit_pref:
+            key = unit_label_to_key(unit_pref)
+            if key:
+                return key
+        # Auto: prima unita' raider presente (uN -> tN)
+        for uk in sorted(_LIGHT_RAIDERS, key=lambda k: int(k[1:])):
+            if troops.get(uk, 0) > 0:
+                return "t" + uk[1:]
+        return ""
+
+    def _schedule_scan(self, village_key: str, now: float | None = None) -> None:
+        """Pianifica la prossima scansione mappa di scoperta target."""
+        now = now if now is not None else time.time()
+        self.next_scan[village_key] = now + random.uniform(
+            SCAN_MIN_SECONDS, SCAN_MAX_SECONDS
+        )
+        self._save()
+
+    async def _discover_targets(
+        self,
+        *,
+        observer: "GameObserver",
+        farm_store: "FarmTargetStore",
+        village: "Village",
+        vkey: str,
+        settings: Settings,
+        prefix: str,
+        now: float,
+    ) -> None:
+        """Scansione mappa periodica: i tile razziabili diventano pending."""
+        if not settings.farming.auto_scan:
+            return
+        if village.x is None or village.y is None:
+            return
+        if now < self.next_scan.get(vkey, 0.0):
+            return
+        try:
+            scanned = await observer.scan_map_area(
+                village.x, village.y,
+                radius=max(5, settings.scout_brain.scan_radius),
+            )
+            if scanned:
+                new = farm_store.register_scanned(
+                    scanned,
+                    origin_x=village.x,
+                    origin_y=village.y,
+                    nearest_village=village.name or "",
+                    skip_names={village.name} if village.name else None,
+                )
+                logger.info(
+                    "%s FarmTargets: scansione da '%s' -> %d tile, "
+                    "%d nuovi pending.",
+                    prefix, village.name, len(scanned), new,
+                )
+        except Exception as scan_exc:
+            logger.debug(
+                "%s FarmTargets: scansione fallita (%s)", prefix, scan_exc
+            )
+        finally:
+            self._schedule_scan(vkey, now)
+
+    async def _send_approved_raids(
+        self,
+        *,
+        executor: "ActionExecutor",
+        farm_store: "FarmTargetStore",
+        settings: Settings,
+        village: "Village",
+        rally_slot: int,
+        troops: dict[str, int],
+        unit_pref: str,
+        farm_unit_qty: int,
+        prefix: str,
+    ) -> bool:
+        """Invia raid mirati (tt=2, move_type=4) sui target approved.
+
+        Ritorna True se almeno un raid e' partito.
+        """
+        approved = farm_store.get_approved_targets(
+            near_x=village.x, near_y=village.y
+        )
+        if not approved:
+            return False
+
+        unit_key = self._raider_key(troops, unit_pref)
+        if not unit_key:
+            logger.info(
+                "%s FarmTargets: nessuna unita' da saccheggio risolta "
+                "per '%s'.",
+                prefix, village.name,
+            )
+            return False
+
+        max_wave = max(1, int(settings.farming.targets_per_wave or 1))
+        selected = approved[:max_wave]
+        available = troops.get("u" + unit_key[1:], troops.get(unit_key, 0))
+        if farm_unit_qty and farm_unit_qty > 0:
+            qty = farm_unit_qty
+        else:
+            qty = max(AUTO_QTY_FLOOR, available // max(1, len(selected)))
+        if available > 0:
+            qty = min(qty, available)
+
+        raid_targets = [
+            {
+                "x": t.x,
+                "y": t.y,
+                "target_name": t.name,
+                "troops": {unit_key: qty},
+            }
+            for t in selected
+        ]
+        action = Action(
+            type=ActionType.SEND_CUSTOM_RAID,
+            params={
+                "rally_slot": rally_slot,
+                "move_type": "4",  # 4 = saccheggio
+                "targets": raid_targets,
+            },
+            reason=(
+                f"Custom Farm Targets: {len(raid_targets)} raid mirati "
+                f"({unit_key} x{qty}) da '{village.name}'"
+            ),
+        )
+        result = await executor.execute(action, village_id=village.village_id)
+        if result.success:
+            logger.info(
+                "%s FarmTargets: %s", prefix, result.message
+            )
+            return True
+        logger.warning(
+            "%s FarmTargets: raid custom non inviato: %s",
+            prefix, result.message,
+        )
+        return False
+
+    # ------------------------------------------------------------------
     # Ciclo principale per villaggio
     # ------------------------------------------------------------------
     async def run_for_village(
@@ -220,11 +397,14 @@ class FarmingManager:
         village: "Village",
         rally_slot: int,
         prefix: str,
+        farm_store: "FarmTargetStore | None" = None,
         now: float | None = None,
     ) -> bool:
-        """Se scaduto e truppe disponibili, lancia un raid dalla farm list.
+        """Se scaduto e truppe disponibili, lancia i raid di farming.
 
-        Ritorna True se un raid e' stato avviato con successo.
+        Priorita' ai Custom Farm Targets (store approved -> raid mirati
+        tt=2); in assenza di target approvati ricade sulla farm list
+        nativa del Gold Club (tt=99). Ritorna True se un raid e' partito.
         """
         cfg = settings.farming
         if not cfg.enabled:
@@ -252,6 +432,48 @@ class FarmingManager:
             self._schedule_retry(vkey, now)
             return False
 
+        # --- Custom Farm Target Manager (alternativa al Gold Club) ---
+        if farm_store is not None:
+            await self._discover_targets(
+                observer=observer,
+                farm_store=farm_store,
+                village=village,
+                vkey=vkey,
+                settings=settings,
+                prefix=prefix,
+                now=now,
+            )
+            sent = await self._send_approved_raids(
+                executor=executor,
+                farm_store=farm_store,
+                settings=settings,
+                village=village,
+                rally_slot=rally_slot,
+                troops=troops,
+                unit_pref=unit_pref,
+                farm_unit_qty=(vcfg.farm_unit_qty if vcfg else 0),
+                prefix=prefix,
+            )
+            if sent:
+                due = self.schedule_next(vkey, settings, now)
+                wait_min = (due - now) / 60.0
+                logger.info(
+                    "%s Farming: raid custom avviati da '%s'. "
+                    "Prossimo ciclo tra ~%.0f min.",
+                    prefix, village.name, wait_min,
+                )
+                return True
+            if farm_store.get_approved_targets():
+                # Target approved presenti ma invio fallito: retry breve
+                self._schedule_retry(vkey, now)
+                return False
+            logger.info(
+                "%s FarmTargets: nessun target approved per '%s' — "
+                "approva i target in dashboard (fallback farm list).",
+                prefix, village.name,
+            )
+
+        # --- Fallback: farm list nativa del Punto di Raduno (tt=99) ---
         action = Action(
             type=ActionType.SEND_RAID,
             params={

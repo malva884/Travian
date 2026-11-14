@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Literal
 
-from . import selectors
+from . import db, selectors
 from .actions import ActionExecutor
 from .ai_scout_brain import AIScoutBrain, assess_account_power
 from .brain import LLMBrain, RuleBasedBrain
@@ -32,6 +32,7 @@ from .config import (
 )
 from .defense import DefenseManager
 from .expansion import ExpansionManager, feeder_surplus, find_market
+from .farm_store import farm_target_store
 from .farming import FarmingManager, find_rally_point
 from .hero import HeroManager
 from .models import (
@@ -454,6 +455,7 @@ async def _dispatch_reclaim_waves(
                         "x": int(target["x"]),
                         "y": int(target["y"]),
                         "troops": dict(wave.get("troops") or {}),
+                        "include_hero": bool(wave.get("include_hero")),
                     }
                 ],
             },
@@ -479,9 +481,8 @@ async def _dispatch_reclaim_waves(
 
 
 def _append_history(account_id: str, state: GameState, action: Action) -> None:
-    """Salva lo storico decisionale per-villaggio in JSONL (state/history/)."""
+    """Salva lo storico decisionale per-villaggio (DB + JSONL di backup)."""
     try:
-        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
         entry = {
             "ts": state.timestamp,
@@ -501,6 +502,8 @@ def _append_history(account_id: str, state: GameState, action: Action) -> None:
             "action": action.type.value,
             "reason": action.reason,
         }
+        db.history_insert(safe_id, entry)
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         path: Path = HISTORY_DIR / f"history_{safe_id}.jsonl"
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -696,6 +699,10 @@ async def monitor_all_villages(
 
     # Edifici interni per villaggio: serve ai moduli farming/espansione
     interior_map: dict[str, list[Field]] = {}
+
+    # Custom Farm Target Manager: store condiviso dei bersagli di raid
+    # (scoperta via scansione mappa, approvazione dashboard, raid mirati).
+    farm_store = farm_target_store(settings.account_id)
 
     # 2. Itera su ciascun villaggio trovato
     for v_idx, village in enumerate(villages):
@@ -927,7 +934,8 @@ async def monitor_all_villages(
                             vprefix, unpack_exc,
                         )
 
-            # 4.1 Modulo farming: raid periodico dalla farm list, se scaduto
+            # 4.1 Modulo farming: raid sui Custom Farm Targets approvati
+            # (fallback: farm list nativa del Punto di Raduno), se scaduto
             if farming_mgr is not None:
                 rally = find_rally_point(state.interior_fields())
                 try:
@@ -939,6 +947,7 @@ async def monitor_all_villages(
                         village=village,
                         rally_slot=rally.slot_id if rally else 0,
                         prefix=vprefix,
+                        farm_store=farm_store,
                     )
                 except Exception as f_exc:
                     logger.warning("%s Errore modulo farming: %s", vprefix, f_exc)
@@ -962,6 +971,15 @@ async def monitor_all_villages(
                         )
                         if scanned:
                             scout_brain.update_targets_from_map(scanned, village.x or 0, village.y or 0)
+                            # Custom Farm Targets: la stessa scansione
+                            # alimenta lo store farm (tile -> pending).
+                            farm_store.register_scanned(
+                                scanned,
+                                origin_x=village.x or 0,
+                                origin_y=village.y or 0,
+                                nearest_village=village.name or "",
+                                skip_names={v.name for v in villages if v.name},
+                            )
 
                         reports = await observer.read_combat_reports(limit=10)
                         if reports:
@@ -978,6 +996,21 @@ async def monitor_all_villages(
                             logger.info("%s AI Scout: %s", vprefix, scout_res.message)
                     except Exception as s_exc:
                         logger.warning("%s Errore modulo AI Scout Brain: %s", vprefix, s_exc)
+
+            # 4.1.b2 Custom Farm Targets: esiti raid dai report ->
+            # aggiornamento loot ratio e auto-blacklist anti-suicidio.
+            # Riutilizza `reports` letto dallo scout; se lo scout e'
+            # spento lo legge qui (una sola volta per villaggio).
+            if settings.farming.enabled:
+                try:
+                    if reports is None:
+                        reports = await observer.read_combat_reports(limit=10)
+                    if reports:
+                        farm_store.process_combat_reports(reports)
+                except Exception as fs_exc:
+                    logger.warning(
+                        "%s Errore farm target store: %s", vprefix, fs_exc
+                    )
 
             # 4.1.c Smart Troop Replenishment: analisi post-battaglia e
             # rimpiazzo condizionato delle perdite (target - attuali - coda)

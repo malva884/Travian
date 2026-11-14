@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import db
 from .building_prereqs import (
     FIELD_GID_TYPES,
     GID_ACADEMY,
@@ -824,34 +825,34 @@ def plan_upgrades(
 # Persistenza per la dashboard
 # ---------------------------------------------------------------------------
 
-def _plan_path(account_id: str) -> Path:
-    return STATE_DIR / f"build_plan_{account_id}.json"
-
-
 def save_build_plan(
     account_id: str, village_name: str, plan: list[dict]
 ) -> None:
-    """Aggiorna la voce di un villaggio nel file piano dell'account."""
+    """Aggiorna la voce di un villaggio nel piano dell'account (kv DB)."""
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        path = _plan_path(account_id)
+        key = f"build_plan_{account_id}.json"
         data: dict = {}
-        if path.exists():
+        raw = db.kv_read(key)
+        if raw:
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+                data = json.loads(raw)
+            except ValueError:
                 data = {}
+        if not isinstance(data, dict):
+            data = {}
         data[village_name] = {"updated": time.time(), "items": plan}
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        db.kv_write(key, json.dumps(data, indent=2))
     except OSError as exc:
         logger.debug("save_build_plan fallito: %s", exc)
 
 
 def load_build_plans(account_id: str) -> dict:
-    """Piano upgrade per villaggio letto dalla dashboard."""
-    path = _plan_path(account_id)
+    """Piano upgrade per villaggio letto dalla dashboard (kv DB)."""
+    raw = db.kv_read(f"build_plan_{account_id}.json")
+    if not raw:
+        return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(raw)
+    except ValueError:
         return {}
     return data if isinstance(data, dict) else {}

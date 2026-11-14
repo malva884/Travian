@@ -21,7 +21,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from . import db
 from .config import BASE_DIR, Settings
+from .hero import is_hero_combat_ready
 from .models import (
     AccountPowerAssessment,
     Action,
@@ -255,9 +257,15 @@ Compito:
     "troops": {{"t1": 15}},
     "priority": 1,
     "expected_loot_ratio": 1.0,
+    "include_hero": false,
+    "hero_reason": "Pulizia oasi con belve | Alto bottino | Bonus attacco onda principale | vuoto",
     "reasoning": "Inattivo vicino, zero difese storiche, bottino pieno"
   }}
 ]
+
+5. Se 'hero_available' e' true, valuta l'impiego dell'eroe (include_hero=true) SOLO
+   per: oasi con difensori/belve (enemy_units > 0), villaggi ad alto bottino
+   stimato o con mura deboli. Mai sui micro-raid ripetitivi standard.
 """
 
     # Modelli EOL (API v1beta deprecata): rimappati su un modello supportato
@@ -384,6 +392,80 @@ def heuristic_evaluate_farming_targets(
 
 
 # --------------------------------------------------------------------------
+# 2b. Smart Hero Combat Evaluator: matrice scenari per l'uso tattico dell'eroe
+# --------------------------------------------------------------------------
+
+# Soglia di velocita' (campi/h) che distingue cavalleria/esploratori dalla
+# fanteria: usata per rilevare i "raid veloci" (gate 4 is_mounted).
+_CAV_SPEED_MIN = 9
+
+# Bottino stimato minimo (popolazione * produzione oraria grezza) oltre il
+# quale un villaggio inattivo rientra nello Scenario C (raid ad alto valore).
+_HIGH_LOOT_MIN_EST = 3000
+
+
+def _is_fast_raid(troops: dict) -> bool:
+    """True se la wave e' composta solo da unita' a cavallo (raid veloce)."""
+    any_troop = False
+    for key, qty in (troops or {}).items():
+        if int(qty or 0) <= 0:
+            continue
+        any_troop = True
+        stats = TROOP_STATS.get(normalize_unit_key(key))
+        if not stats or int(stats.get("speed", 0)) < _CAV_SPEED_MIN:
+            return False
+    return any_troop
+
+
+def evaluate_hero_use(
+    target_info: dict,
+    troops: dict,
+    hero_state: dict,
+    hero_cfg,
+) -> tuple[bool, str]:
+    """Decide se aggregare l'eroe a un singolo raid (matrice Scenari).
+
+    - Scenario A: oasi con belve (enemy_units > 0) -> assorbe i danni.
+    - Scenario C: villaggio inattivo ad alto bottino/difeso -> trasporto
+      extra + abbattimento resistenza passiva.
+    - Scenario D: micro-raid ripetitivo su farm pulita -> mai (default).
+
+    I 4 hard gate di ``is_hero_combat_ready`` (casa, salute, avventure,
+    cavalcatura su raid veloci) restano bloccanti in ogni scenario.
+
+    ``target_info`` accetta sia le voci ``get_candidate_targets`` sia i
+    record ``ScoutTarget`` serializzati. Ritorna ``(include, reason)``:
+    su rifiuto ``reason`` spiega il gate/scenario che ha escluso l'eroe.
+    """
+    t = target_info or {}
+    ready, why = is_hero_combat_ready(
+        hero_state, hero_cfg, fast_raid=_is_fast_raid(troops)
+    )
+    if not ready:
+        return False, f"gate: {why}"
+
+    enemy_units = int(t.get("enemy_units") or 0)
+    is_oasis = bool(t.get("is_oasis"))
+
+    # Scenario A — pulizia oasi con belve: l'eroe assorbe i danni e fa XP.
+    if is_oasis and enemy_units > 0:
+        return True, "Pulizia oasi con belve"
+
+    # Scenario C — target ad alto valore: difensori noti oppure bottino
+    # stimato elevato / mura basse (villaggio inattivo maturo).
+    est_loot = float(t.get("estimated_loot") or 0)
+    if est_loot <= 0:
+        est_loot = int(t.get("population") or 0) * 60
+    if enemy_units > 0:
+        return True, "Difensori rilevati: assorbimento danni"
+    if not is_oasis and est_loot >= _HIGH_LOOT_MIN_EST:
+        return True, "Alto bottino: trasporto extra dell'eroe"
+
+    # Scenario D — raid di massa ripetitivo: l'eroe resta a casa.
+    return False, "raid standard: eroe non impiegato"
+
+
+# --------------------------------------------------------------------------
 # 3. AIScoutBrain: Manager dello Stato, Radar e Blacklist
 # --------------------------------------------------------------------------
 
@@ -398,18 +480,28 @@ class AIScoutBrain:
     last_ai_recommendations: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self._kv_key: str | None = None
         if self.state_path is None:
             safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in self.account_id)
-            self.state_path = STATE_DIR / f"scout_{safe}.json"
+            self._kv_key = f"scout_{safe}.json"
+            self.state_path = STATE_DIR / self._kv_key
         self._load()
 
     def _target_key(self, x: int, y: int) -> str:
         return f"{x}_{y}"
 
+    def _read_doc(self) -> dict | None:
+        if self._kv_key is not None:
+            text = db.kv_read(self._kv_key)
+            return json.loads(text) if text else None
+        if self.state_path and self.state_path.exists():
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
+        return None
+
     def _load(self) -> None:
         try:
-            if self.state_path and self.state_path.exists():
-                data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            data = self._read_doc()
+            if data:
                 for item in data.get("targets", []):
                     t = ScoutTarget(
                         x=int(item["x"]),
@@ -435,14 +527,18 @@ class AIScoutBrain:
 
     def _save(self) -> None:
         try:
-            assert self.state_path is not None
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "targets": [asdict(t) for t in self.targets.values()],
                 "last_ai_recommendations": self.last_ai_recommendations,
                 "updated_at": time.time(),
             }
-            self.state_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            payload = json.dumps(data, indent=2, ensure_ascii=False)
+            if self._kv_key is not None:
+                db.kv_write(self._kv_key, payload)
+                return
+            assert self.state_path is not None
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(payload, encoding="utf-8")
         except Exception:
             logger.debug("Salvataggio stato scout fallito", exc_info=True)
 
@@ -556,6 +652,7 @@ class AIScoutBrain:
                 "population": t.population,
                 "distance": round(dist, 1),
                 "is_oasis": t.is_oasis,
+                "enemy_units": t.enemy_units,
                 "last_loot_ratio": round(t.last_loot_ratio, 2),
                 "losses_recorded": t.losses_recorded,
             })
@@ -603,3 +700,20 @@ class AIScoutBrain:
         self.last_ai_recommendations = recommendations
         self._save()
         return recommendations
+
+    def _hero_state(self) -> dict:
+        """Snapshot eroe condiviso (kv hero_<acc>.json) per i hard gate.
+
+        Scritto da HeroManager.run dopo ogni check DOM; restituisce {}
+        se il modulo eroe non ha ancora salvato nulla.
+        """
+        try:
+            safe = "".join(
+                c if c.isalnum() or c in "._-" else "_" for c in self.account_id
+            )
+            raw = db.kv_read(f"hero_{safe}.json")
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            logger.debug("Lettura snapshot eroe fallita", exc_info=True)
+            return {}

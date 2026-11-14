@@ -1,0 +1,11 @@
+# Tema dark "security console" (stile Raven.io / Aperture)
+[theme]
+base = "dark"
+primaryColor = "#84cc16"
+backgroundColor = "#0c0e12"
+secondaryBackgroundColor = "#14181e"
+textColor = "#e2e6ec"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
