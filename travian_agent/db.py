@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS farm_targets (
     status TEXT DEFAULT 'pending', manual INTEGER DEFAULT 0,
     updated_ts REAL DEFAULT 0,
     ord INTEGER DEFAULT 0,
+    target_type TEXT DEFAULT '', last_raid_ts REAL DEFAULT 0,
+    last_outcome TEXT DEFAULT '', fail_reason TEXT DEFAULT '',
     PRIMARY KEY (account_id, id)
 );
 CREATE TABLE IF NOT EXISTS cropper_candidates (
@@ -103,6 +105,27 @@ def _db():
         conn.close()
 
 
+# Colonne farm_targets aggiunte dopo lo schema iniziale: ALTER idempotente
+# per i DB creati prima dell'introduzione dei campi esito-raid.
+_FARM_LATE_COLS = (
+    ("target_type", "TEXT DEFAULT ''"),
+    ("last_raid_ts", "REAL DEFAULT 0"),
+    ("last_outcome", "TEXT DEFAULT ''"),
+    ("fail_reason", "TEXT DEFAULT ''"),
+)
+
+
+def _ensure_farm_columns(conn: sqlite3.Connection) -> None:
+    cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(farm_targets)")
+    }
+    for name, ddl in _FARM_LATE_COLS:
+        if name not in cols:
+            conn.execute(
+                f"ALTER TABLE farm_targets ADD COLUMN {name} {ddl}"
+            )
+
+
 def _ensure_ready(conn: sqlite3.Connection) -> None:
     """Schema + WAL + migrazione legacy, una sola volta per processo."""
     global _initialized
@@ -111,6 +134,7 @@ def _ensure_ready(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(_SCHEMA)
+    _ensure_farm_columns(conn)
     _migrate_legacy(conn)
     conn.commit()
     _initialized = True
@@ -158,7 +182,8 @@ def farm_load(acc_key: str) -> list[dict]:
             rows = conn.execute(
                 "SELECT id, x, y, name, is_oasis, population, estimated_loot,"
                 " last_loot_ratio, losses_recorded, distance, nearest_village,"
-                " status, manual, updated_ts"
+                " status, manual, updated_ts, target_type, last_raid_ts,"
+                " last_outcome, fail_reason"
                 " FROM farm_targets WHERE account_id = ? ORDER BY ord",
                 (acc_key,),
             ).fetchall()
@@ -171,6 +196,8 @@ def farm_load(acc_key: str) -> list[dict]:
                 "losses_recorded": r[8] or 0, "distance": r[9] or 0.0,
                 "nearest_village": r[10] or "", "status": r[11] or "pending",
                 "manual": bool(r[12]), "updated_ts": r[13] or 0.0,
+                "target_type": r[14] or "", "last_raid_ts": r[15] or 0.0,
+                "last_outcome": r[16] or "", "fail_reason": r[17] or "",
             }
             for r in rows
         ]
@@ -191,8 +218,9 @@ def farm_save(acc_key: str, rows: list[dict]) -> None:
                 "INSERT INTO farm_targets (account_id, id, x, y, name,"
                 " is_oasis, population, estimated_loot, last_loot_ratio,"
                 " losses_recorded, distance, nearest_village, status,"
-                " manual, updated_ts, ord)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " manual, updated_ts, ord, target_type, last_raid_ts,"
+                " last_outcome, fail_reason)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         acc_key, str(r.get("id") or ""),
@@ -209,12 +237,71 @@ def farm_save(acc_key: str, rows: list[dict]) -> None:
                         1 if r.get("manual") else 0,
                         float(r.get("updated_ts") or 0.0),
                         i,
+                        str(r.get("target_type") or ""),
+                        float(r.get("last_raid_ts") or 0.0),
+                        str(r.get("last_outcome") or ""),
+                        str(r.get("fail_reason") or ""),
                     )
                     for i, r in enumerate(rows)
                 ],
             )
     except Exception:
         logger.debug("farm_save(%s) fallito", acc_key, exc_info=True)
+
+
+# Campi modificabili con UPDATE mirato (whitelist anti SQL-injection:
+# i nomi colonna non arrivano mai dall'esterno).
+_FARM_PATCH_COLS = {
+    "status", "manual", "updated_ts", "last_raid_ts", "last_outcome",
+    "fail_reason", "last_loot_ratio", "losses_recorded", "name",
+    "population", "estimated_loot", "distance", "nearest_village",
+    "target_type", "is_oasis",
+}
+
+
+def farm_patch(
+    acc_key: str,
+    fields: dict,
+    *,
+    target_id: str | None = None,
+    x: int | None = None,
+    y: int | None = None,
+) -> bool:
+    """UPDATE mirato per-riga su farm_targets (nessun rewrite del catalogo).
+
+    Identifica la riga per `target_id` oppure per coordinate `(x, y)`.
+    Ritorna True se almeno una riga e' stata aggiornata. Pensato per le
+    mutazioni frequenti (approve/reject, esito raid): elimina la race
+    last-writer-wins del rewrite globale tra agente e dashboard.
+    """
+    sets: list[str] = []
+    vals: list = []
+    for col, val in fields.items():
+        if col in _FARM_PATCH_COLS:
+            sets.append(f"{col} = ?")
+            vals.append(val)
+    if not sets:
+        return False
+    where = "account_id = ?"
+    params = vals + [acc_key]
+    if target_id is not None:
+        where += " AND id = ?"
+        params.append(str(target_id))
+    elif x is not None and y is not None:
+        where += " AND x = ? AND y = ?"
+        params += [int(x), int(y)]
+    else:
+        return False
+    try:
+        with _db() as conn:
+            cur = conn.execute(
+                f"UPDATE farm_targets SET {', '.join(sets)} WHERE {where}",
+                params,
+            )
+        return cur.rowcount > 0
+    except Exception:
+        logger.debug("farm_patch(%s) fallito", acc_key, exc_info=True)
+        return False
 
 
 # ----------------------------------------------------------------------

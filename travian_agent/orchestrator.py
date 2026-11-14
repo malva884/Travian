@@ -1097,6 +1097,12 @@ async def monitor_all_villages(
                 state.culture_points_required = expansion_mgr.cp_required
                 state.culture_points_daily = expansion_mgr.cp_daily
 
+            # Routing risorse rigido: il founder in deficit coloni ha
+            # priorita' anche sull'overflow dei magazzini pieni (letto
+            # da _best_peer_for_surplus in brain.rule_emergency_overflow).
+            if expansion_mgr is not None:
+                state.feed_target = str(expansion_mgr.feed_target or "")
+
             action = brain.decide(state)
 
             # Smart Building planner: persiste i prossimi upgrade stimati
@@ -1570,9 +1576,14 @@ async def monitor_all_villages(
             # e' attivo, i villaggi maturi (magazzino > 50%) inviano
             # risorse al nuovo insediamento, cappate allo spazio libero
             # reale del target (peer_villages) per evitare overflow.
+            # Regola rigida: se il founder e' in deficit coloni
+            # (feed_target attivo) il bridge cede il passo — tutte le
+            # spedizioni dei feeder vanno prima al founder.
             bt = (
                 expansion_mgr.bootstrap_target
-                if expansion_mgr is not None else {}
+                if expansion_mgr is not None
+                and not expansion_mgr.feed_target
+                else {}
             )
             if bt:
                 b_id = int(bt.get("village_id") or 0)

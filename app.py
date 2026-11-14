@@ -41,7 +41,7 @@ from travian_agent.farm_store import (
     STATUS_BLACKLISTED as FARM_STATUS_BLACKLISTED,
     STATUS_PENDING as FARM_STATUS_PENDING,
     STATUS_REJECTED as FARM_STATUS_REJECTED,
-    FarmTargetStore,
+    farm_target_store,
 )
 from travian_agent.models import STATIC_TROOP_LABELS, VillageRole
 from travian_agent.presets import (
@@ -525,7 +525,7 @@ if page == "Overview":
     _hdr_pending = 0
     for _acc in accounts:
         try:
-            _fts = FarmTargetStore(_acc.account_id).list_targets()
+            _fts = farm_target_store(_acc.account_id).list_targets()
             _hdr_farms += len(_fts)
             _hdr_pending += sum(
                 1 for t in _fts if t.status == FARM_STATUS_PENDING
@@ -2213,7 +2213,7 @@ if page == "Farming & Eroe":
             "SOLO sui target `approved` — nessuna farm list nativa richiesta. "
             "Perdite o difensori nei report -> auto-blacklist anti-suicidio."
         )
-        _fstore = FarmTargetStore(mod_acc.account_id)
+        _fstore = farm_target_store(mod_acc.account_id)
         _ft_all = _fstore.list_targets()
         _fc = {
             s: sum(1 for t in _ft_all if t.status == s)

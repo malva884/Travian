@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -120,12 +121,18 @@ class FarmTarget:
 class FarmTargetStore:
     """Persistenza dei target farm su state/farm_targets_<acc>.json.
 
-    Una istanza per account: il file e' condiviso tra agente e dashboard
-    (lettura/scrittura non atomica ma best-effort, come gli altri store).
+    Una istanza per account, condivisa tra agente e dashboard. Thread-
+    safe: tutte le operazioni pubbliche sono sotto ``RLock`` e ogni
+    accesso riallinea ``_data`` allo storage (SQLite via ``db.py`` o
+    file JSON per i test), cosi' le mutazioni concorrenti non si
+    basano piu' su snapshot stale. Le mutazioni per-riga (status,
+    esiti raid) usano UPDATE mirati (``db.farm_patch``) invece del
+    rewrite globale del catalogo: niente lost-update tra i processi.
     """
 
     def __init__(self, account_id: str, path: Path | None = None) -> None:
         self.account_id = account_id
+        self._lock = threading.RLock()
         # path esplicito -> file JSON (test/override); default -> tabella DB
         self._db_key: str | None = None
         if path is None:
@@ -158,7 +165,7 @@ class FarmTargetStore:
                     ]
         except Exception:
             logger.debug("Lettura farm_targets fallita", exc_info=True)
-            self._data = {}
+            self._data = []
 
     def _save(self) -> None:
         if self._db_key is not None:
@@ -179,24 +186,30 @@ class FarmTargetStore:
     def list_targets(self, status: str | None = None) -> list[FarmTarget]:
         """Target dell'account (filtro opzionale per stato), per distanza."""
         out: list[FarmTarget] = []
-        for raw in self._data:
-            t = FarmTarget.from_dict(raw)
-            if t is not None and (status is None or t.status == status):
-                out.append(t)
+        with self._lock:
+            self._load()
+            for raw in self._data:
+                t = FarmTarget.from_dict(raw)
+                if t is not None and (status is None or t.status == status):
+                    out.append(t)
         out.sort(key=lambda t: (t.distance, t.x, t.y))
         return out
 
     def find(self, target_id: str) -> FarmTarget | None:
-        for raw in self._data:
-            if raw.get("id") == target_id:
-                return FarmTarget.from_dict(raw)
+        with self._lock:
+            self._load()
+            for raw in self._data:
+                if raw.get("id") == target_id:
+                    return FarmTarget.from_dict(raw)
         return None
 
     def status_at(self, x: int, y: int) -> str | None:
         """Stato del record associato alle coordinate, o None se assente."""
-        for raw in self._data:
-            if int(raw.get("x", 0)) == x and int(raw.get("y", 0)) == y:
-                return str(raw.get("status") or STATUS_PENDING)
+        with self._lock:
+            self._load()
+            for raw in self._data:
+                if int(raw.get("x", 0)) == x and int(raw.get("y", 0)) == y:
+                    return str(raw.get("status") or STATUS_PENDING)
         return None
 
     def get_approved_targets(
@@ -216,16 +229,25 @@ class FarmTargetStore:
         return approved
 
     def pending_count(self) -> int:
-        return sum(
-            1 for r in self._data
-            if r.get("status") == STATUS_PENDING
-        )
+        with self._lock:
+            self._load()
+            return sum(
+                1 for r in self._data
+                if r.get("status") == STATUS_PENDING
+            )
 
     # --------------------------------------------------------------
     # API di scrittura
     # --------------------------------------------------------------
     def upsert(self, target: FarmTarget) -> None:
         """Inserisce o aggiorna un target; non retrocede uno stato deciso."""
+        with self._lock:
+            self._load()
+            self._upsert_locked(target)
+
+    def _upsert_locked(self, target: FarmTarget) -> None:
+        """Variante di ``upsert``: chiamarla solo sotto ``self._lock``
+        dopo un ``_load()`` fresco (usata in bulk da ``register_scanned``)."""
         for i, raw in enumerate(self._data):
             if raw.get("id") == target.id or (
                 int(raw.get("x", 0)) == target.x
@@ -253,24 +275,49 @@ class FarmTargetStore:
     def set_status(self, target_id: str, status: str) -> bool:
         if status not in VALID_STATUSES:
             return False
-        for raw in self._data:
-            if raw.get("id") == target_id:
-                raw["status"] = status
-                raw["updated_ts"] = time.time()
-                self._save()
-                return True
+        with self._lock:
+            if self._db_key is not None:
+                # UPDATE mirato per-riga: non riscrive il catalogo e
+                # non puo' cancellare mutazioni concorrenti di altri
+                # processi/thread (lost-update eliminato alla radice).
+                ok = db.farm_patch(
+                    self._db_key,
+                    {"status": status, "updated_ts": time.time()},
+                    target_id=target_id,
+                )
+                if ok:
+                    self._load()
+                return ok
+            self._load()
+            for raw in self._data:
+                if raw.get("id") == target_id:
+                    raw["status"] = status
+                    raw["updated_ts"] = time.time()
+                    self._save()
+                    return True
         return False
 
     def set_status_at(self, x: int, y: int, status: str) -> bool:
         """Imposta lo stato del record alle coordinate (se esiste)."""
         if status not in VALID_STATUSES:
             return False
-        for raw in self._data:
-            if int(raw.get("x", 0)) == x and int(raw.get("y", 0)) == y:
-                raw["status"] = status
-                raw["updated_ts"] = time.time()
-                self._save()
-                return True
+        with self._lock:
+            if self._db_key is not None:
+                ok = db.farm_patch(
+                    self._db_key,
+                    {"status": status, "updated_ts": time.time()},
+                    x=x, y=y,
+                )
+                if ok:
+                    self._load()
+                return ok
+            self._load()
+            for raw in self._data:
+                if int(raw.get("x", 0)) == x and int(raw.get("y", 0)) == y:
+                    raw["status"] = status
+                    raw["updated_ts"] = time.time()
+                    self._save()
+                    return True
         return False
 
     def approve(self, target_id: str) -> bool:
@@ -303,6 +350,23 @@ class FarmTargetStore:
             return None
         if status not in VALID_STATUSES:
             status = STATUS_PENDING
+        with self._lock:
+            return self._insert_manual(
+                x, y, name, is_oasis, population, status, nearest_village
+            )
+
+    def _insert_manual(
+        self,
+        x: int,
+        y: int,
+        name: str,
+        is_oasis: bool,
+        population: int,
+        status: str,
+        nearest_village: str,
+    ) -> FarmTarget | None:
+        """Inserimento del record manuale: solo sotto ``self._lock``."""
+        self._load()
         tgt = FarmTarget(
             id=make_target_id(x, y),
             x=x,
@@ -328,18 +392,32 @@ class FarmTargetStore:
         last_raid_ts si aggiorna solo su invio riuscito; fail_reason
         conserva il motivo del mancato invio per la dashboard.
         """
-        changed = False
-        for raw in self._data:
-            if int(raw.get("x", 0)) != x or int(raw.get("y", 0)) != y:
-                continue
-            raw["fail_reason"] = "" if sent else str(reason or "")
-            if sent:
-                raw["last_raid_ts"] = time.time()
-            raw["updated_ts"] = time.time()
-            changed = True
-            break
-        if changed:
-            self._save()
+        with self._lock:
+            if self._db_key is not None:
+                fields: dict = {
+                    "fail_reason": "" if sent else str(reason or ""),
+                    "updated_ts": time.time(),
+                }
+                if sent:
+                    fields["last_raid_ts"] = fields["updated_ts"]
+                # UPDATE mirato: le approvazioni fatte dalla dashboard
+                # su altre righe non vengono toccate.
+                if db.farm_patch(self._db_key, fields, x=x, y=y):
+                    self._load()
+                return
+            changed = False
+            self._load()
+            for raw in self._data:
+                if int(raw.get("x", 0)) != x or int(raw.get("y", 0)) != y:
+                    continue
+                raw["fail_reason"] = "" if sent else str(reason or "")
+                if sent:
+                    raw["last_raid_ts"] = time.time()
+                raw["updated_ts"] = time.time()
+                changed = True
+                break
+            if changed:
+                self._save()
 
     # --------------------------------------------------------------
     # Discovery (Step 2 spec): tile scansionati -> pending
@@ -361,45 +439,47 @@ class FarmTargetStore:
         """
         skip = {n.strip().lower() for n in (skip_names or set()) if n}
         new_count = 0
-        for tile in scanned_tiles:
-            try:
-                x, y = int(tile["x"]), int(tile["y"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            is_oasis = bool(tile.get("is_oasis"))
-            name = str(
-                tile.get("village_name") or tile.get("name") or ""
-            )
-            population = int(tile.get("population") or 0)
-            if not is_oasis and population <= 0:
-                continue  # tile libero o non razziabile
-            if name and name.strip().lower() in skip:
-                continue  # villaggio proprio
+        with self._lock:
+            self._load()
+            for tile in scanned_tiles:
+                try:
+                    x, y = int(tile["x"]), int(tile["y"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                is_oasis = bool(tile.get("is_oasis"))
+                name = str(
+                    tile.get("village_name") or tile.get("name") or ""
+                )
+                population = int(tile.get("population") or 0)
+                if not is_oasis and population <= 0:
+                    continue  # tile libero o non razziabile
+                if name and name.strip().lower() in skip:
+                    continue  # villaggio proprio
 
-            dist = math.hypot(x - origin_x, y - origin_y)
-            existing_id = None
-            for raw in self._data:
-                if int(raw.get("x", 0)) == x and int(raw.get("y", 0)) == y:
-                    existing_id = raw.get("id")
-                    break
+                dist = math.hypot(x - origin_x, y - origin_y)
+                existing_id = None
+                for raw in self._data:
+                    if int(raw.get("x", 0)) == x and int(raw.get("y", 0)) == y:
+                        existing_id = raw.get("id")
+                        break
 
-            tgt = FarmTarget(
-                id=existing_id or make_target_id(x, y),
-                x=x,
-                y=y,
-                name=name or ("Oasi" if is_oasis else f"Tile ({x}|{y})"),
-                is_oasis=is_oasis,
-                population=population,
-                estimated_loot=_estimate_loot(population, is_oasis),
-                distance=round(dist, 1),
-                nearest_village=nearest_village,
-                target_type="oasis" if is_oasis else "farm",
-                status=STATUS_PENDING,
-            )
-            before = len(self._data)
-            self.upsert(tgt)
-            if existing_id is None and len(self._data) == before + 1:
-                new_count += 1
+                tgt = FarmTarget(
+                    id=existing_id or make_target_id(x, y),
+                    x=x,
+                    y=y,
+                    name=name or ("Oasi" if is_oasis else f"Tile ({x}|{y})"),
+                    is_oasis=is_oasis,
+                    population=population,
+                    estimated_loot=_estimate_loot(population, is_oasis),
+                    distance=round(dist, 1),
+                    nearest_village=nearest_village,
+                    target_type="oasis" if is_oasis else "farm",
+                    status=STATUS_PENDING,
+                )
+                before = len(self._data)
+                self._upsert_locked(tgt)
+                if existing_id is None and len(self._data) == before + 1:
+                    new_count += 1
         if new_count:
             logger.info(
                 "FarmTargetStore[%s]: %d nuovi target pending dalla "
@@ -423,39 +503,41 @@ class FarmTargetStore:
         """
         now = time.time()
         updated = 0
-        for r in reports:
-            x, y = r.get("x"), r.get("y")
-            if x is None or y is None:
-                continue
-            for raw in self._data:
-                if int(raw.get("x", 0)) != int(x) or int(raw.get("y", 0)) != int(y):
+        with self._lock:
+            self._load()
+            for r in reports:
+                x, y = r.get("x"), r.get("y")
+                if x is None or y is None:
                     continue
-                losses = int(r.get("losses", 0) or 0)
-                defenders = int(r.get("defenders", 0) or 0)
-                loot = float(r.get("loot_ratio", 1.0))
-                raw["last_loot_ratio"] = loot
-                raw["losses_recorded"] = int(
-                    raw.get("losses_recorded", 0) or 0
-                ) + losses
-                raw["last_raid_ts"] = now
-                raw["last_outcome"] = (
-                    "losses" if (losses > 0 or defenders > 0)
-                    else "clean" if loot > 0
-                    else "empty"
-                )
-                raw["updated_ts"] = now
-                updated += 1
-                if losses > 0 or defenders > 0:
-                    if raw.get("status") != STATUS_BLACKLISTED:
-                        raw["status"] = STATUS_BLACKLISTED
-                        logger.warning(
-                            "FarmTarget (%s|%s) BLACKLISTED: perdite=%d, "
-                            "difensori=%d.",
-                            x, y, losses, defenders,
-                        )
-                break  # una sola riga per coordinate
-        if updated:
-            self._save()
+                for raw in self._data:
+                    if int(raw.get("x", 0)) != int(x) or int(raw.get("y", 0)) != int(y):
+                        continue
+                    losses = int(r.get("losses", 0) or 0)
+                    defenders = int(r.get("defenders", 0) or 0)
+                    loot = float(r.get("loot_ratio", 1.0))
+                    raw["last_loot_ratio"] = loot
+                    raw["losses_recorded"] = int(
+                        raw.get("losses_recorded", 0) or 0
+                    ) + losses
+                    raw["last_raid_ts"] = now
+                    raw["last_outcome"] = (
+                        "losses" if (losses > 0 or defenders > 0)
+                        else "clean" if loot > 0
+                        else "empty"
+                    )
+                    raw["updated_ts"] = now
+                    updated += 1
+                    if losses > 0 or defenders > 0:
+                        if raw.get("status") != STATUS_BLACKLISTED:
+                            raw["status"] = STATUS_BLACKLISTED
+                            logger.warning(
+                                "FarmTarget (%s|%s) BLACKLISTED: perdite=%d, "
+                                "difensori=%d.",
+                                x, y, losses, defenders,
+                            )
+                    break  # una sola riga per coordinate
+            if updated:
+                self._save()
         return updated
 
 
@@ -468,12 +550,14 @@ def _estimate_loot(population: int, is_oasis: bool) -> int:
 
 # Cache degli store per account (dashboard + agente condividono l'istanza)
 _farm_stores: dict[str, FarmTargetStore] = {}
+_farm_stores_lock = threading.Lock()
 
 
 def farm_target_store(account_id: str) -> FarmTargetStore:
     """FarmTargetStore condiviso per account (dashboard + agente)."""
-    store = _farm_stores.get(account_id)
-    if store is None:
-        store = FarmTargetStore(account_id)
-        _farm_stores[account_id] = store
-    return store
+    with _farm_stores_lock:
+        store = _farm_stores.get(account_id)
+        if store is None:
+            store = FarmTargetStore(account_id)
+            _farm_stores[account_id] = store
+        return store

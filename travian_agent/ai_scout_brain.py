@@ -33,6 +33,9 @@ from .models import (
     ResourceType,
     ScoutTarget,
     Village,
+    safe_float,
+    safe_int,
+    safe_int_opt,
 )
 
 if TYPE_CHECKING:
@@ -319,7 +322,7 @@ def heuristic_evaluate_farming_targets(
     Usato come fallback infallibile o quando le chiamate AI sono spente.
     """
     troops_available = dict(account_status.get("troops_home") or {})
-    max_targets = int(account_status.get("max_targets_per_wave", 5))
+    max_targets = safe_int(account_status.get("max_targets_per_wave"), 5)
 
     # Individua l'unità da saccheggio preferita
     preferred_unit = "t1"
@@ -344,10 +347,10 @@ def heuristic_evaluate_farming_targets(
     for t in nearby_targets:
         if t.get("is_blacklisted", False):
             continue
-        dist = max(1.0, float(t.get("distance", 1.0)))
-        loot_ratio = float(t.get("last_loot_ratio", 1.0))
-        pop = max(2, int(t.get("population", 9)))
-        losses = int(t.get("losses_recorded", 0))
+        dist = max(1.0, safe_float(t.get("distance"), 1.0))
+        loot_ratio = safe_float(t.get("last_loot_ratio"), 1.0)
+        pop = max(2, safe_int(t.get("population"), 9))
+        losses = safe_int(t.get("losses_recorded"))
 
         if losses > 0:
             continue
@@ -373,14 +376,14 @@ def heuristic_evaluate_farming_targets(
         if remaining_troops < 2:
             break
         # Calibra truppe in base alla popolazione del villaggio (stimando produzione oraria)
-        est_res = int(tgt.get("population", 10)) * 60
+        est_res = safe_int(tgt.get("population"), 10) * 60
         needed_troops = max(3, min(est_res // max(1, carry_cap), troops_per_raid))
         allocated = min(remaining_troops, needed_troops)
         remaining_troops -= allocated
 
         recommendations.append({
-            "x": int(tgt["x"]),
-            "y": int(tgt["y"]),
+            "x": safe_int(tgt.get("x")),
+            "y": safe_int(tgt.get("y")),
             "target_name": str(tgt.get("village_name", f"Target ({tgt['x']}|{tgt['y']})")),
             "troops": {preferred_unit: allocated},
             "priority": prio,
@@ -408,11 +411,11 @@ def _is_fast_raid(troops: dict) -> bool:
     """True se la wave e' composta solo da unita' a cavallo (raid veloce)."""
     any_troop = False
     for key, qty in (troops or {}).items():
-        if int(qty or 0) <= 0:
+        if safe_int(qty or 0) <= 0:
             continue
         any_troop = True
         stats = TROOP_STATS.get(normalize_unit_key(key))
-        if not stats or int(stats.get("speed", 0)) < _CAV_SPEED_MIN:
+        if not stats or safe_int(stats.get("speed")) < _CAV_SPEED_MIN:
             return False
     return any_troop
 
@@ -444,7 +447,7 @@ def evaluate_hero_use(
     if not ready:
         return False, f"gate: {why}"
 
-    enemy_units = int(t.get("enemy_units") or 0)
+    enemy_units = safe_int(t.get("enemy_units") or 0)
     is_oasis = bool(t.get("is_oasis"))
 
     # Scenario A — pulizia oasi con belve: l'eroe assorbe i danni e fa XP.
@@ -453,9 +456,9 @@ def evaluate_hero_use(
 
     # Scenario C — target ad alto valore: difensori noti oppure bottino
     # stimato elevato / mura basse (villaggio inattivo maturo).
-    est_loot = float(t.get("estimated_loot") or 0)
+    est_loot = safe_float(t.get("estimated_loot") or 0)
     if est_loot <= 0:
-        est_loot = int(t.get("population") or 0) * 60
+        est_loot = safe_int(t.get("population") or 0) * 60
     if enemy_units > 0:
         return True, "Difensori rilevati: assorbimento danni"
     if not is_oasis and est_loot >= _HIGH_LOOT_MIN_EST:
@@ -509,15 +512,15 @@ class AIScoutBrain:
                         village_name=item.get("village_name", ""),
                         player_name=item.get("player_name", ""),
                         alliance=item.get("alliance", ""),
-                        population=int(item.get("population", 0)),
-                        distance=float(item.get("distance", 0.0)),
+                        population=safe_int(item.get("population")),
+                        distance=safe_float(item.get("distance")),
                         is_oasis=bool(item.get("is_oasis", False)),
-                        last_loot_ratio=float(item.get("last_loot_ratio", 1.0)),
-                        last_scout_ts=float(item.get("last_scout_ts", 0.0)),
-                        losses_recorded=int(item.get("losses_recorded", 0)),
-                        enemy_units=int(item.get("enemy_units", 0)),
+                        last_loot_ratio=safe_float(item.get("last_loot_ratio"), 1.0),
+                        last_scout_ts=safe_float(item.get("last_scout_ts")),
+                        losses_recorded=safe_int(item.get("losses_recorded")),
+                        enemy_units=safe_int(item.get("enemy_units")),
                         is_blacklisted=bool(item.get("is_blacklisted", False)),
-                        blacklist_until=float(item.get("blacklist_until", 0.0)),
+                        blacklist_until=safe_float(item.get("blacklist_until")),
                         notes=item.get("notes", ""),
                     )
                     self.targets[self._target_key(t.x, t.y)] = t
@@ -551,14 +554,19 @@ class AIScoutBrain:
         """Aggiorna il database dei target con i tile rilevati dal sensore mappa."""
         now = time.time()
         for tile in scanned_tiles:
-            x = int(tile.get("x", 0))
-            y = int(tile.get("y", 0))
+            # Coordinate obbligatorie: tile senza x/y numeriche si scarta
+            x = safe_int_opt(tile.get("x"))
+            y = safe_int_opt(tile.get("y"))
+            if x is None or y is None:
+                continue
             k = self._target_key(x, y)
             dist = calculate_distance(origin_x, origin_y, x, y)
 
             if k in self.targets:
                 existing = self.targets[k]
-                existing.population = int(tile.get("population", existing.population))
+                existing.population = safe_int(
+                    tile.get("population"), existing.population
+                )
                 existing.village_name = tile.get("village_name", existing.village_name)
                 existing.player_name = tile.get("player_name", existing.player_name)
                 existing.alliance = tile.get("alliance", existing.alliance)
@@ -571,7 +579,7 @@ class AIScoutBrain:
                     village_name=tile.get("village_name", f"Tile ({x}|{y})"),
                     player_name=tile.get("player_name", ""),
                     alliance=tile.get("alliance", ""),
-                    population=int(tile.get("population", 0)),
+                    population=safe_int(tile.get("population")),
                     distance=dist,
                     is_oasis=bool(tile.get("is_oasis", False)),
                     last_scout_ts=now,
@@ -588,15 +596,19 @@ class AIScoutBrain:
             y = r.get("y")
             if x is None or y is None:
                 continue
-            k = self._target_key(int(x), int(y))
+            xi = safe_int_opt(x)
+            yi = safe_int_opt(y)
+            if xi is None or yi is None:
+                continue
+            k = self._target_key(xi, yi)
             target = self.targets.get(k)
             if not target:
-                target = ScoutTarget(x=int(x), y=int(y), village_name=r.get("target_name", ""))
+                target = ScoutTarget(x=xi, y=yi, village_name=r.get("target_name", ""))
                 self.targets[k] = target
 
-            losses = int(r.get("losses", 0))
-            defenders = int(r.get("defenders", 0))
-            loot_ratio = float(r.get("loot_ratio", 1.0))
+            losses = safe_int(r.get("losses"))
+            defenders = safe_int(r.get("defenders"))
+            loot_ratio = safe_float(r.get("loot_ratio"), 1.0)
 
             target.last_loot_ratio = loot_ratio
             target.losses_recorded += losses
@@ -674,7 +686,7 @@ class AIScoutBrain:
         candidates = self.get_candidate_targets(
             origin_x=vx,
             origin_y=vy,
-            max_distance=float(cfg.scan_radius) * 2.0,
+            max_distance=safe_float(cfg.scan_radius) * 2.0,
             min_loot_ratio=cfg.min_loot_ratio,
         )
 

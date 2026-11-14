@@ -652,6 +652,13 @@ class ExpansionManager:
             )
             return
 
+        # Deficit coloni risolto (3/3 pronti): i feeder tornano liberi.
+        # Senza reset il founder continuerebbe a ricevere spedizioni
+        # anche mentre si cerca solo la casella libera sulla mappa.
+        if self.feed_target:
+            self.feed_target = ""
+            self._save()
+
         # 3. Scansione dei tile target (approved + configurati)
         target, tile_crop = await self._pick_target(observer, cfg, prefix, store)
         if target is None:

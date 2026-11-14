@@ -14,6 +14,47 @@ class ResourceType(str, Enum):
     CROP = "crop"
 
 
+# ---------------------------------------------------------------------------
+# Sanitizzazione centralizzata dei tipi — SOLO per il layer di parsing
+# (sensors / scout): converte output DOM/JS grezzi in numeri senza mai
+# lanciare eccezioni. I consumer decisionali NON devono usarli per
+# mascherare 'dato non letto': li' il None semantico va preservato.
+# ---------------------------------------------------------------------------
+
+
+def safe_int(value: object, default: int = 0) -> int:
+    """int() difensivo: default su None/NaN/stringhe non numeriche."""
+    try:
+        f = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if f != f:  # NaN
+        return default
+    return int(f)
+
+
+def safe_int_opt(value: object) -> int | None:
+    """Come ``safe_int`` ma ritorna None se il valore non e' numerico."""
+    try:
+        f = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if f != f:
+        return None
+    return int(f)
+
+
+def safe_float(value: object, default: float = 0.0) -> float:
+    """float() difensivo: default su None/NaN/stringhe non numeriche."""
+    try:
+        f = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if f != f:
+        return default
+    return f
+
+
 @dataclass
 class Resources:
     """Scorte attuali e capacita' dei magazzini (0 = dato non letto)."""
@@ -202,6 +243,9 @@ class GameState:
     settlers_home: int = 0           # coloni pronti nel villaggio
     # Modulo farming: truppe attualmente a casa (alias normalizzato -> qta)
     troops_home: dict[str, int] = field(default_factory=dict)
+    # Modulo espansione: villaggio founder in deficit coloni — il routing
+    # delle risorse (feeder + overflow magazzini) gli da' priorita'.
+    feed_target: str = ""
     timestamp: float = field(default_factory=time.time)
 
     def resource_fields(self) -> list[Field]:

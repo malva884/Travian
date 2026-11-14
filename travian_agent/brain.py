@@ -330,7 +330,13 @@ def _best_peer_for_surplus(state: GameState, surplus: dict[str, int]) -> str | N
 
     Punteggio = min(eccesso inviabile, spazio libero stimato del peer)
     calcolato sul tipo di storage pertinente (magazzino vs granaio).
+
+    Regola rigida (smistamento risorse per la fondazione): se il modulo
+    espansione ha un ``feed_target`` attivo (villaggio founder in deficit
+    coloni) e quel peer ha spazio libero, l'overflow va a lui prima di
+    qualunque altro villaggio (es. l'hammer).
     """
+    feed = (getattr(state, "feed_target", "") or "").strip().lower()
     best_name: str | None = None
     best_score = 0
     for name, res in state.peer_villages.items():
@@ -346,6 +352,12 @@ def _best_peer_for_surplus(state: GameState, surplus: dict[str, int]) -> str | N
                     res.warehouse_capacity - max(res.wood, res.clay, res.iron),
                 )
             score += min(amount, free)
+        # Founder in deficit coloni: priorita' assoluta se puo' assorbire
+        # almeno una parte del surplus.
+        if feed and name.strip().lower() == feed:
+            if score > 0:
+                return name
+            continue
         if score > best_score:
             best_score = score
             best_name = name

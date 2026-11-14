@@ -20,6 +20,8 @@ from .models import (
     Resources,
     ResourceType,
     Village,
+    safe_int,
+    safe_int_opt,
 )
 
 logger = logging.getLogger(__name__)
@@ -500,10 +502,10 @@ class TravianParser:
                 Village(
                     name=v["name"],
                     url=v["url"],
-                    village_id=int(v["village_id"]) if str(v.get("village_id", "")).isdigit() else 0,
+                    village_id=safe_int(v.get("village_id")),
                     is_active=bool(v.get("is_active", False)),
-                    x=int(v["x"]) if v.get("x") is not None else None,
-                    y=int(v["y"]) if v.get("y") is not None else None,
+                    x=safe_int_opt(v.get("x")),
+                    y=safe_int_opt(v.get("y")),
                 )
                 for v in (villages_data or [])
             ]
@@ -536,7 +538,7 @@ class TravianParser:
                 try:
                     # Estrae did da attributo
                     vid_attr = await entry.get_attribute("data-did")
-                    vid = int(vid_attr) if vid_attr and vid_attr.isdigit() else 0
+                    vid = safe_int(vid_attr)
 
                     # Cerca link
                     link_el = entry.locator("a[href*='newdid']").first
@@ -546,7 +548,7 @@ class TravianParser:
                         if not vid:
                             match = _NEWDID.search(href)
                             if match:
-                                vid = int(match.group(1))
+                                vid = safe_int(match.group(1))
 
                     name = await _text_of(entry, selectors.VILLAGE_ENTRY_NAME)
                     if not name:
@@ -619,12 +621,12 @@ class TravianParser:
         caps = res_data.get("capacity", {})
 
         resources = Resources(
-            wood=int(curr.get("wood", 0)),
-            clay=int(curr.get("clay", 0)),
-            iron=int(curr.get("iron", 0)),
-            crop=int(curr.get("crop", 0)),
-            warehouse_capacity=int(caps.get("warehouse", 0)),
-            granary_capacity=int(caps.get("granary", 0)),
+            wood=safe_int(curr.get("wood", 0)),
+            clay=safe_int(curr.get("clay", 0)),
+            iron=safe_int(curr.get("iron", 0)),
+            crop=safe_int(curr.get("crop", 0)),
+            warehouse_capacity=safe_int(caps.get("warehouse", 0)),
+            granary_capacity=safe_int(caps.get("granary", 0)),
         )
 
         incoming_attacks_count = await self._read_incoming_attacks()
@@ -642,7 +644,7 @@ class TravianParser:
     def _current_newdid(self) -> int:
         """newdid del villaggio attivo, estratto dall'URL corrente (0 = default)."""
         match = _NEWDID.search(self.page.url or "")
-        return int(match.group(1)) if match else 0
+        return safe_int(match.group(1)) if match else 0
 
     async def read_fields(self) -> list[Field]:
         """Slot 1-18 dal dorf1 (campi risorsa)."""
@@ -810,7 +812,7 @@ class TravianParser:
                         name=name,
                         level=parse_int(str(level)) if level is not None else 0,
                         resource_type=None,
-                        gid=int(item.get("gid", -1)) if item.get("gid") is not None else -1,
+                        gid=safe_int(item.get("gid"), -1),
                     )
                 )
             if fields:
@@ -893,11 +895,12 @@ class TravianParser:
             prod: dict[ResourceType, int] = {}
             for key, val in (data or {}).get("production", {}).items():
                 try:
-                    prod[ResourceType(key)] = int(val)
+                    prod[ResourceType(key)] = safe_int(val)
                 except (ValueError, TypeError):
                     continue
             raw_balance = (data or {}).get("crop_balance")
-            balance = int(raw_balance) if raw_balance is not None else None
+            # None semantico: bilancio non letto -> il consumer decide
+            balance = safe_int_opt(raw_balance)
             if not prod and balance is None:
                 return {}
             return {"production": prod, "crop_balance": balance}
@@ -1102,12 +1105,12 @@ class TravianParser:
         now = time.time()
         attacks: list[IncomingAttack] = []
         for item in raw or []:
-            secs = int(item.get("seconds") or 0)
+            secs = safe_int(item.get("seconds") or 0)
             attacks.append(
                 IncomingAttack(
                     movement_type=str(item.get("type") or "unknown"),
                     seconds_remaining=secs,
-                    troop_count=int(item.get("count") or 0),
+                    troop_count=safe_int(item.get("count") or 0),
                     arrival_ts=now + secs,
                     attacker=str(item.get("attacker") or ""),
                     label=str(item.get("label") or ""),
@@ -1206,9 +1209,9 @@ class TravianParser:
                 }
             """)
             return (
-                int((data or {}).get("have", 0)),
-                int((data or {}).get("need", 0)),
-                int((data or {}).get("daily", 0)),
+                safe_int((data or {}).get("have", 0)),
+                safe_int((data or {}).get("need", 0)),
+                safe_int((data or {}).get("daily", 0)),
             )
         except Exception:
             return (0, 0, 0)
@@ -1274,7 +1277,7 @@ class TravianParser:
                 }
             """)
             units = (data or {}).get("units") or {}
-            return {str(k): int(v) for k, v in units.items() if int(v) > 0}
+            return {str(k): safe_int(v) for k, v in units.items() if safe_int(v) > 0}
         except Exception:
             return {}
 
@@ -1331,7 +1334,7 @@ class TravianParser:
                     return out;
                 }
             """)
-            return {str(k): int(v) for k, v in (data or {}).items() if int(v) > 0}
+            return {str(k): safe_int(v) for k, v in (data or {}).items() if safe_int(v) > 0}
         except Exception:
             return {}
 
