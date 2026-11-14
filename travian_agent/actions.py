@@ -1966,8 +1966,6 @@ class ActionExecutor:
                         '#content button#btn_ok',
                         '#build button.green[type="submit"]',
                         '#content button.green[type="submit"]',
-                        '#build button.textButtonV1',
-                        '#content button.textButtonV1',
                         '#build button[name="s1"]',
                         '#build input[name="s1"]',
                         '#build button:has-text("Conferma")',
@@ -3054,11 +3052,13 @@ class ActionExecutor:
     async def _click_first(
         self, page, selectors_list: list[str], timeout_ms: int = 1500
     ) -> bool:
-        """Clicca il primo selettore presente e non disabilitato."""
+        """Clicca il primo selettore presente, visibile e non disabilitato."""
         for sel in selectors_list:
             locator = page.locator(sel).first
             try:
                 if await locator.count() == 0:
+                    continue
+                if not await locator.is_visible():
                     continue
                 disabled = await locator.get_attribute("disabled", timeout=timeout_ms)
                 css_class = (await locator.get_attribute("class", timeout=timeout_ms)) or ""
