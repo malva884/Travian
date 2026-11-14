@@ -471,11 +471,85 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
     return unique
 
 
+FOUNDER_MAIN_TARGET = 15
+FOUNDER_STORAGE_TARGET = 10
+FOUNDER_RESIDENCE_TARGET = 10
+
+
+def founder_intents(state: GameState, settings: Settings) -> list[Field]:
+    """Sequenza dedicata al villaggio fondatore fino a Reggia/Palazzo liv. 10.
+
+    1. Palazzo Pubblico (gid 15) -> liv. 10 (riduce tempi costruzione)
+       + Magazzino/Granaio -> liv. 10 (capienza per Reggia 8-10 e 3 coloni);
+    2. Reggia/Palazzo -> liv. 10 mantenendo il Palazzo Pubblico 2-3 livelli
+       avanti (fino a liv. 15) per velocizzare i livelli alti della Reggia.
+    """
+    interiors = state.interior_fields()
+
+    def _best(gid: int) -> int:
+        return max((f.level for f in interiors if f.gid == gid), default=0)
+
+    res_lvl = max(_best(GID_RESIDENCE), _best(GID_PALACE))
+    if res_lvl >= FOUNDER_RESIDENCE_TARGET:
+        return []
+
+    out: list[Field] = []
+
+    # Fase 1: Palazzo Pubblico -> 10 e Depositi (Magazzino/Granaio) -> 10
+    if _best(GID_MAIN_BUILDING) < 10:
+        out.extend(
+            f for f in _interior_intents(state, (GID_MAIN_BUILDING,))
+            if f.level < 10
+        )
+    if _best(GID_WAREHOUSE) < FOUNDER_STORAGE_TARGET:
+        wh = [
+            f for f in _interior_intents(state, (GID_WAREHOUSE,))
+            if f.level < FOUNDER_STORAGE_TARGET
+        ]
+        if not wh and _best(GID_WAREHOUSE) == 0:
+            wh = new_building_intents(state, (GID_WAREHOUSE,), {f.slot_id for f in out})
+        out.extend(wh)
+    if _best(GID_GRANARY) < FOUNDER_STORAGE_TARGET:
+        gr = [
+            f for f in _interior_intents(state, (GID_GRANARY,))
+            if f.level < FOUNDER_STORAGE_TARGET
+        ]
+        if not gr and _best(GID_GRANARY) == 0:
+            gr = new_building_intents(state, (GID_GRANARY,), {f.slot_id for f in out})
+        out.extend(gr)
+    if out:
+        return out
+
+    # Fase 2: Palazzo Pubblico (fino a 15, target = res_lvl + 3) + Reggia -> 10
+    desired_main = min(FOUNDER_MAIN_TARGET, res_lvl + 3)
+    if _best(GID_MAIN_BUILDING) < desired_main:
+        out.extend(
+            f for f in _interior_intents(state, (GID_MAIN_BUILDING,))
+            if f.level < desired_main
+        )
+
+    home_gid = GID_PALACE if _best(GID_PALACE) > _best(GID_RESIDENCE) else GID_RESIDENCE
+    home = [
+        f for f in _interior_intents(state, (home_gid,))
+        if f.level < FOUNDER_RESIDENCE_TARGET
+    ]
+    if not home and _best(home_gid) == 0:
+        home = new_building_intents(state, (home_gid,), {f.slot_id for f in out})
+    out.extend(home)
+
+    return out
+
+
 def role_intents(state: GameState, settings: Settings) -> list[Field]:
     """Infrastrutture coerenti col ruolo, bilanciate per livello.
 
     La capitale (auto-rilevata) aggiunge granaio/mulino/forno al profilo.
     """
+    if is_founder_village(state, settings):
+        f_intents = founder_intents(state, settings)
+        if f_intents:
+            return f_intents
+
     role = (settings.village_role_for(state.village_name, state.village_id)
             or "standard").lower()
     gids = _ROLE_INTERIORS.get(role, ())

@@ -158,7 +158,11 @@ def save_culture_points(
         logger.debug("save_culture_points fallito", exc_info=True)
 
 
-def feeder_surplus(state: GameState, keep_ratio: float = FEEDER_KEEP_RATIO) -> dict[str, int]:
+def feeder_surplus(
+    state: GameState,
+    keep_ratio: float = FEEDER_KEEP_RATIO,
+    crop_keep_ratio: float = 0.25,
+) -> dict[str, int]:
     """Surplus spedibile da un feeder: quantita' sopra keep_ratio di capienza.
 
     Ritorna {wood, clay, iron, crop} con solo voci positive, cappate a
@@ -174,8 +178,8 @@ def feeder_surplus(state: GameState, keep_ratio: float = FEEDER_KEEP_RATIO) -> d
         if excess > 0:
             out[name] = min(excess, FEED_CAP_PER_RESOURCE)
     cap = res.granary_capacity
-    if cap > 0:
-        excess = int(res.crop - cap * keep_ratio)
+    if cap > 0 and (res.crop_balance is None or res.crop_balance >= 0):
+        excess = int(res.crop - cap * crop_keep_ratio)
         if excess > 0:
             out["crop"] = min(excess, FEED_CAP_PER_RESOURCE)
     return out

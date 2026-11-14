@@ -594,10 +594,23 @@ def rule_role_buildings(state: GameState, settings: Settings) -> Action | None:
     if not _queue_free(state, settings, head.is_resource_field):
         return None
     role = settings.village_role_for(state.village_name, state.village_id)
+
+    # Fallback automatico: se gli edifici interni del ruolo non sono ancora
+    # pagabili (es. carenza di ferro/grano), l'esecutore ripiega sul campo
+    # risorsa piu' debole senza sprecare il ciclo.
+    seen_slots = {f.slot_id for f in intents}
+    fallback_fields = [
+        f for f in builder.economy_intents(state, settings)
+        if f.slot_id not in seen_slots
+    ]
+    all_candidates = [f.slot_id for f in intents] + [
+        f.slot_id for f in fallback_fields
+    ]
+
     return Action(
         type=ActionType.UPGRADE_FIELD,
         params={
-            "candidates": [f.slot_id for f in intents],
+            "candidates": all_candidates,
             "construct": builder.construct_gids(state, intents),
         },
         reason=(
