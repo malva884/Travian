@@ -724,10 +724,14 @@ class AIScoutBrain:
             logger.info("[%s] AI Scout: nessun target candidato valido nel raggio %d", origin_village.name, cfg.scan_radius)
             return []
 
+        hero_state = self._hero_state()
+        hero_ok, _ = is_hero_combat_ready(hero_state, settings.hero)
+
         account_status = {
             "origin_village": origin_village.name,
             "origin_coords": {"x": vx, "y": vy},
             "troops_home": troops_home,
+            "hero_available": hero_ok,
             "max_travel_time_minutes": cfg.max_travel_time_minutes,
             "max_targets_per_wave": cfg.max_targets_per_wave,
         }
@@ -738,6 +742,26 @@ class AIScoutBrain:
             api_key=cfg.gemini_api_key,
             model_name=cfg.gemini_model,
         )
+
+        # Valuta l'impiego dell'eroe (massimo 1 raid per ondata)
+        hero_assigned = False
+        targets_by_xy = {(t["x"], t["y"]): t for t in candidates}
+        for rec in recommendations:
+            if hero_assigned:
+                rec["include_hero"] = False
+                continue
+            xy = (safe_int(rec.get("x")), safe_int(rec.get("y")))
+            t_info = targets_by_xy.get(xy, rec)
+            use_hero, reason = evaluate_hero_use(
+                target_info=t_info,
+                troops=rec.get("troops") or {},
+                hero_state=hero_state,
+                hero_cfg=settings.hero,
+            )
+            rec["include_hero"] = bool(use_hero)
+            if use_hero:
+                rec["hero_reason"] = reason
+                hero_assigned = True
 
         self.last_ai_recommendations = recommendations
         self._save()
