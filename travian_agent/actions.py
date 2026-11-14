@@ -1722,6 +1722,10 @@ class ActionExecutor:
                         const setVal = (el, v) => {
                             el.value = String(v);
                             el.dispatchEvent(new Event('input', {bubbles: true}));
+                            // keyup: il validator JS di Travian abilita il
+                            // pulsante submit e ricalcola le truppe su
+                            // questo evento, non solo su input/change.
+                            el.dispatchEvent(new Event('keyup', {bubbles: true}));
                             el.dispatchEvent(new Event('change', {bubbles: true}));
                         };
 
@@ -1748,6 +1752,9 @@ class ActionExecutor:
                         ]);
                         if (raidRadio) {
                             raidRadio.checked = true;
+                            raidRadio.dispatchEvent(
+                                new MouseEvent('click', {bubbles: true})
+                            );
                             raidRadio.dispatchEvent(
                                 new Event('change', {bubbles: true})
                             );
@@ -1835,6 +1842,14 @@ class ActionExecutor:
                     )
                     continue
 
+                # Tracciamento diagnostico: quali input truppe hanno
+                # ricevuto un valore (correla col motivo di rifiuto
+                # quando il server lascia still_on_send_form).
+                logger.info(
+                    "Custom raid: form compilato (%s|%s): truppe=%s",
+                    tx, ty, (fill_res or {}).get("filled"),
+                )
+
                 await sleep_human(
                     self.settings.action_delay_min, self.settings.action_delay_max
                 )
@@ -1905,16 +1920,22 @@ class ActionExecutor:
                                 e => (e.innerText || '')
                                     .trim().replace(/\\s+/g, ' ').slice(0, 120)
                             ).join(' | '),
+                            hdr: ((document.querySelector(
+                                '#content h1, #content h4, h1, h4, ' +
+                                '.titleInHeader, .headerText'
+                            ) || {}).innerText || '').trim().slice(0, 80),
                         };
                     }
                     """
                 )
                 if (mid or {}).get("onForm"):
                     _merr = str((mid or {}).get("err") or "nessun messaggio")
+                    _mhdr = str((mid or {}).get("hdr") or "")
                     logger.error(
                         "Custom raid: primo submit rifiutato (%s|%s): "
-                        "form tt=2 ancora attivo, messaggio server: %s",
-                        tx, ty, _merr,
+                        "form tt=2 ancora attivo, messaggio server: %s "
+                        "(sezione: %s)",
+                        tx, ty, _merr, _mhdr,
                     )
                     await self._dump_raid_debug(page, f"reject_{tx}_{ty}")
                     errors.append(
@@ -1957,6 +1978,12 @@ class ActionExecutor:
                 # un box di errore: senza questo controllo il click sul
                 # pulsante veniva registrato come "raid inviato" pur
                 # senza alcun movimento truppe reale.
+                try:
+                    await page.wait_for_load_state(
+                        "domcontentloaded", timeout=8000
+                    )
+                except Exception:  # noqa: BLE001 — nessun reload (SPA)
+                    pass
                 await sleep_human(0.6, 1.2)
                 verify = await page.evaluate(
                     """
