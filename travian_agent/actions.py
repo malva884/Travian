@@ -402,6 +402,52 @@ class ActionExecutor:
 
             await self.browser.goto(build_url)
 
+            # Guard anti "edificio sbagliato": se lo slot e' occupato il
+            # server ignora ?a=<gid> e apre il contratto dell'edificio
+            # ESISTENTE — cliccando 'migliora' si upgrada quello (caso
+            # osservato: pianificata Ambasciata, partita Caserma lv7).
+            # Il contratto T4.x marca l'edificio con class 'gid<N>' su
+            # #build/#contract oppure 'g<N>' sull'immagine: se il gid
+            # mostrato non coincide con quello richiesto, salta il
+            # candidato. Marker assente = skin non riconosciuta -> si
+            # procede come prima.
+            if gid > 0:
+                try:
+                    page_gid = await page.evaluate(
+                        """
+                        () => {
+                            const grab = (el) => {
+                                if (!el) return null;
+                                const m = (el.className || '').match(
+                                    /\\bgid(\\d+)\\b|\\bg(\\d+)\\b/
+                                );
+                                return m ? parseInt(m[1] || m[2], 10) : null;
+                            };
+                            for (const el of [
+                                document.getElementById('build'),
+                                document.getElementById('contract'),
+                                document.querySelector('.contractLink'),
+                                document.querySelector(
+                                    '#content .building, #content .buildingImage'
+                                ),
+                            ]) {
+                                const g = grab(el);
+                                if (g !== null) return g;
+                            }
+                            return null;
+                        }
+                        """
+                    )
+                except Exception:  # noqa: BLE001
+                    page_gid = None
+                if page_gid is not None and page_gid != gid:
+                    logger.warning(
+                        "Contratto gid=%s ma la pagina mostra gid=%s "
+                        "(slot %s occupato? candidato saltato)",
+                        gid, page_gid, slot_id,
+                    )
+                    continue
+
             # Verifica preventiva: la pagina segnala livello massimo raggiunto?
             try:
                 is_max_level = await page.evaluate(
