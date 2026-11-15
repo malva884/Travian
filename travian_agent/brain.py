@@ -112,6 +112,13 @@ def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action |
     if builder.crop_safety_needed(state, settings):
         return None
 
+    # Freeze espansione (spec Corsa 15c): i campi risorsa non sono nella
+    # whitelist dei passi critici — se questa regola vincesse, il demote
+    # la trasformerebbe in WAIT scavalcando la Coda Prioritaria
+    # (deadlock osservato alle 21:49 su Hipponion).
+    if builder.expansion_freeze(state, settings):
+        return None
+
     if settings.allow_parallel_build:
         if (
             len(state.resource_queue()) >= settings.max_resource_queue
@@ -629,12 +636,16 @@ def rule_role_buildings(state: GameState, settings: Settings) -> Action | None:
 
     # Fallback automatico: se gli edifici interni del ruolo non sono ancora
     # pagabili (es. carenza di ferro/grano), l'esecutore ripiega sul campo
-    # risorsa piu' debole senza sprecare il ciclo.
+    # risorsa piu' debole senza sprecare il ciclo. Sotto freeze espansione
+    # il fallback sparirebbe comunque nel demote a WAIT: escluso a monte.
     seen_slots = {f.slot_id for f in intents}
-    fallback_fields = [
-        f for f in builder.economy_intents(state, settings)
-        if f.slot_id not in seen_slots
-    ]
+    if builder.expansion_freeze(state, settings):
+        fallback_fields = []
+    else:
+        fallback_fields = [
+            f for f in builder.economy_intents(state, settings)
+            if f.slot_id not in seen_slots
+        ]
     all_candidates = [f.slot_id for f in intents] + [
         f.slot_id for f in fallback_fields
     ]

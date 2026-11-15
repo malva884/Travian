@@ -18,6 +18,7 @@ from .browser import TravianBrowser
 from .builder import (
     bootstrap_complete,
     crop_threshold,
+    expansion_freeze,
     focus_intents,
     focus_skip_reasons,
     is_founder_village,
@@ -185,36 +186,6 @@ _EXPANSION_CRITICAL_GIDS = frozenset({
     GID_CRANNY,
     GID_MARKETPLACE,
 })
-
-
-def _expansion_freeze(state: GameState, settings: Settings) -> bool:
-    """True se sul founder vige il congelamento delle spese extra.
-
-    Attivo finche' mancano coloni (<3 a casa) e i Punti Cultura sono
-    pronti oppure la Residenza/Reggia e' gia' alta (>= 8): ogni risorsa
-    deve coprire i coloni e i soli passi critici dell'espansione.
-    """
-    try:
-        if not is_founder_village(state, settings):
-            return False
-        if int(getattr(state, "settlers_home", 0) or 0) >= 3:
-            return False
-        res_lvl = max(
-            (
-                f.level
-                for f in state.interior_fields()
-                if f.gid in (GID_RESIDENCE, GID_PALACE)
-            ),
-            default=0,
-        )
-        cp_ready = (
-            int(getattr(state, "culture_points_required", 0) or 0) > 0
-            and int(getattr(state, "culture_points", 0) or 0)
-            >= int(state.culture_points_required)
-        )
-        return bool(cp_ready or res_lvl >= 8)
-    except Exception:
-        return False
 
 
 def _freeze_demote(state: GameState, action: Action) -> "Action | None":
@@ -1826,7 +1797,7 @@ async def monitor_all_villages(
             # Pubblico possono consumare risorse; truppe e altri
             # edifici vengono declassati a WAIT.
             try:
-                if _expansion_freeze(state, settings):
+                if expansion_freeze(state, settings):
                     _frozen = _freeze_demote(state, action)
                     if _frozen is not None:
                         logger.debug(
@@ -2374,7 +2345,7 @@ async def monitor_all_villages(
                         # Freeze espansione (spec Corsa 15c): niente
                         # addestramento truppe sul founder finche' i 3
                         # coloni non sono completi.
-                        if _expansion_freeze(state, settings):
+                        if expansion_freeze(state, settings):
                             plan = {}
                         if plan and trainer_slots_rep:
                             rep_action = Action(

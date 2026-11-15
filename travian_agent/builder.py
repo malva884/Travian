@@ -565,6 +565,11 @@ def focus_skip_reasons(
             # mai costruibile (e viceversa).
             exclusive = False
             for group in _MUTUALLY_EXCLUSIVE_GIDS:
+                # Il check vale solo se lo step stesso fa parte del
+                # gruppo esclusivo: una Residenza presente non deve
+                # saltare Mercato/Accademia (fix falso positivo).
+                if not (set(gids) & set(group)):
+                    continue
                 others = [g for g in group if g not in gids]
                 hit = next(
                     (
@@ -914,6 +919,38 @@ def is_founder_village(state: GameState, settings: Settings) -> bool:
     """
     role = settings.village_role_for(state.village_name, state.village_id)
     return resolve_role(role) == FOUNDER_ROLE
+
+
+def expansion_freeze(state: GameState, settings: Settings) -> bool:
+    """True se sul founder vige il congelamento delle spese extra.
+
+    Attivo finche' mancano coloni (<3 a casa) e i Punti Cultura sono
+    pronti oppure la Residenza/Reggia e' gia' alta (>= 8): ogni risorsa
+    deve coprire i coloni e i soli passi critici dell'espansione.
+    Condiviso tra brain (salta le regole campi-risorse) e orchestrator
+    (declassa a WAIT le spese fuori whitelist).
+    """
+    try:
+        if not is_founder_village(state, settings):
+            return False
+        if int(getattr(state, "settlers_home", 0) or 0) >= 3:
+            return False
+        res_lvl = max(
+            (
+                f.level
+                for f in state.interior_fields()
+                if f.gid in (GID_RESIDENCE, GID_PALACE)
+            ),
+            default=0,
+        )
+        cp_ready = (
+            int(getattr(state, "culture_points_required", 0) or 0) > 0
+            and int(getattr(state, "culture_points", 0) or 0)
+            >= int(state.culture_points_required)
+        )
+        return bool(cp_ready or res_lvl >= 8)
+    except Exception:
+        return False
 
 
 def culture_boost_active(state: GameState, settings: Settings) -> bool:
