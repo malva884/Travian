@@ -409,6 +409,80 @@
         }, layer);
       }
 
+      // ---- Etichette: anti-collisione con leader line ----
+      // Nodi e rotte sono gia' disegnati; le label vengono raccolte e
+      // piazzate scegliendo la prima posizione libera attorno al nodo
+      // (no overlap con altre label e con i cerchi, dentro il viewBox).
+      const CHAR_W = 0.62;                 // JetBrains Mono ~0.6em
+      const HALO = {
+        'paint-order': 'stroke', stroke: 'rgba(9,14,28,0.92)',
+        'stroke-width': 3, 'stroke-linejoin': 'round'
+      };
+      const nodeCircles = [];              // {x,y,r} cerchi gia' disegnati
+      const labelBoxes = [];               // {x,y,w,h} label piazzate
+      const LBL = [];                      // {x,y,r,founder,lines[]}
+
+      const lblBox = (l, dx, dy) => {
+        const w = Math.max(
+          ...l.lines.map(t => t.text.length * t.size * CHAR_W)
+        ) + 6;
+        const h = l.lines.reduce((a, t) => a + t.size * 1.18, 0) + 4;
+        return { x: l.x + dx - w / 2, y: l.y + dy - h / 2, w, h };
+      };
+      const boxHit = (a, b, pad = 2) =>
+        a.x - pad < b.x + b.w && a.x + a.w + pad > b.x &&
+        a.y - pad < b.y + b.h && a.y + a.h + pad > b.y;
+      const circleHit = (b, c, pad = 2) => {
+        const nx = Math.max(b.x, Math.min(c.x, b.x + b.w));
+        const ny = Math.max(b.y, Math.min(c.y, b.y + b.h));
+        return (nx - c.x) ** 2 + (ny - c.y) ** 2 < (c.r + pad) ** 2;
+      };
+      const DIRS = [-90, 90, 0, 180, -45, -135, 45, 135, -115, -65, -25, -155];
+      const placeLabel = l => {
+        let best = null, bestScore = Infinity;
+        for (const d of [l.r + 10, l.r + 24, l.r + 38]) {
+          for (const a of DIRS) {
+            const dx = Math.cos(a * Math.PI / 180) * d;
+            const dy = Math.sin(a * Math.PI / 180) * d;
+            const b = lblBox(l, dx, dy);
+            let score =
+              labelBoxes.filter(o => boxHit(b, o)).length * 10 +
+              nodeCircles.filter(c => circleHit(b, c)).length * 6;
+            if (b.x < 8 || b.x + b.w > 412) score += 8;
+            if (b.y < 6 || b.y + b.h > 304) score += 8;
+            score += d * 0.02;                       // preferisce il vicino
+            if (score < bestScore) { bestScore = score; best = { dx, dy, box: b }; }
+            if (!bestScore) return best;             // posizione libera trovata
+          }
+        }
+        return best;
+      };
+      const drawLabel = l => {
+        const { dx, dy, box } = l._place;
+        const dist = Math.hypot(dx, dy);
+        if (dist > l.r + 14) {                       // leader line al nodo
+          const ux = dx / dist, uy = dy / dist;
+          svgEl('line', {
+            x1: l.x + ux * (l.r + 2), y1: l.y + uy * (l.r + 2),
+            x2: l.x + dx - ux * 3, y2: l.y + dy - uy * 3,
+            stroke: 'rgba(148,163,184,0.45)', 'stroke-width': 1,
+            'stroke-dasharray': '2 2'
+          }, layer);
+        }
+        const g = svgEl('g', {}, layer);
+        let cy = box.y + 3;
+        for (const t of l.lines) {
+          cy += t.size * 1.18;
+          const el = svgEl('text', {
+            x: l.x + dx, y: cy, 'text-anchor': 'middle',
+            fill: t.fill, 'font-size': t.size,
+            'font-family': 'JetBrains Mono',
+            'font-weight': t.bold ? 'bold' : 'normal', ...HALO
+          }, g);
+          el.textContent = t.text;
+        }
+      };
+
       // Nodi target espansione
       for (const t of targets.slice(0, 4)) {
         const [tx, ty] = P(t);
@@ -419,16 +493,14 @@
           'stroke-width': 1.5, 'stroke-dasharray': '3 2'
         }, g);
         svgEl('circle', { r: 4, fill: col }, g);
-        const l1 = svgEl('text', {
-          x: 0, y: -15, 'text-anchor': 'middle', fill: col,
-          'font-size': 10, 'font-family': 'JetBrains Mono', 'font-weight': 'bold'
-        }, g);
-        l1.textContent = 'TARGET ' + (t.type || '');
-        const l2 = svgEl('text', {
-          x: 0, y: 21, 'text-anchor': 'middle', fill: '#94a3b8',
-          'font-size': 9, 'font-family': 'JetBrains Mono'
-        }, g);
-        l2.textContent = `(${t.x}|${t.y})`;
+        nodeCircles.push({ x: tx, y: ty, r: 11 });
+        LBL.push({
+          x: tx, y: ty, r: 11, founder: false,
+          lines: [
+            { text: 'TARGET ' + (t.type || ''), fill: col, size: 9.5, bold: true },
+            { text: `(${t.x}|${t.y})`, fill: '#94a3b8', size: 8.5 }
+          ]
+        });
       }
 
       // Nodi villaggi
@@ -438,6 +510,7 @@
         const g = svgEl('g', { transform: `translate(${vx},${vy})` }, layer);
         const isFounder = v === feedV || v.name === founderName;
         const underAttack = (v.incoming_attacks || []).length > 0;
+        const nr = isFounder ? 15 : (underAttack ? 11 : 7);
         if (isFounder) {
           svgEl('circle', { r: 15, fill: 'rgba(245,158,11,0.22)' }, g);
           svgEl('circle', { r: 9, fill: '#f59e0b', stroke: '#fff', 'stroke-width': 1.5 }, g);
@@ -453,22 +526,33 @@
             }, g);
           }
         }
-        const name = svgEl('text', {
-          x: 0, y: isFounder ? -18 : -12, 'text-anchor': 'middle',
-          fill: isFounder ? '#ffffff' : '#e2e8f0', 'font-size': isFounder ? 11 : 10,
-          'font-family': 'JetBrains Mono',
-          'font-weight': isFounder ? 'bold' : 'normal'
-        }, g);
-        name.textContent = String(v.name || '').toUpperCase() + (isFounder ? ' (FOUNDER)' : '');
-        const role = svgEl('text', {
-          x: 0, y: isFounder ? 23 : 17, 'text-anchor': 'middle',
-          fill: isFounder ? '#fbbf24' : '#10b981', 'font-size': isFounder ? 9 : 8,
-          'font-family': 'JetBrains Mono'
-        }, g);
-        role.textContent = isFounder
-          ? `(${v.x}|${v.y})`
-          : String(v.role || 'standard').toUpperCase();
+        nodeCircles.push({ x: vx, y: vy, r: nr });
+        LBL.push({
+          x: vx, y: vy, r: nr, founder: isFounder,
+          lines: [
+            {
+              text: String(v.name || '').toUpperCase() + (isFounder ? ' (FOUNDER)' : ''),
+              fill: isFounder ? '#ffffff' : '#e2e8f0',
+              size: isFounder ? 10.5 : 9.5, bold: isFounder
+            },
+            {
+              text: isFounder
+                ? `(${v.x}|${v.y})`
+                : String(v.role || 'standard').toUpperCase(),
+              fill: isFounder ? '#fbbf24' : '#10b981',
+              size: isFounder ? 8.5 : 7.5
+            }
+          ]
+        });
       }
+
+      // Piazzamento: il founder ha priorita' sullo spazio libero
+      LBL.sort((a, b) => (b.founder ? 1 : 0) - (a.founder ? 1 : 0));
+      for (const l of LBL) {
+        l._place = placeLabel(l);
+        labelBoxes.push(l._place.box);
+      }
+      for (const l of LBL) drawLabel(l);
     }
 
     // ---------- RENDER ----------
