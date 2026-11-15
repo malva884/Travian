@@ -349,16 +349,19 @@ class ExpansionManager:
 
         Priorita' di selezione (ricerca dinamica, spec correzione
         villaggio sorgente):
+          0. `expansion.founder_village` esplicito (nome o newdid) —
+             scelta utente: vince su ruolo e fallback, bypassa anche
+             il filtro hammer/feeder; se il villaggio non esiste
+             nell'account si rinuncia (nessuna rotazione);
           1. villaggio con ruolo 'founder' (early_cropper_founder) —
              e' la base designata anche senza residenza rilevata;
-          2. `expansion.founder_village` esplicito (nome o newdid);
-          3. fallback strutturale: Residenza/Palazzo >= 10 (con slot
+          2. fallback strutturale: Residenza/Palazzo >= 10 (con slot
              di espansione liberi: il check finale resta lato gioco);
-          4. qualunque residenza >= 1 / slot designato.
+          3. qualunque residenza >= 1 / slot designato.
 
         Esclusione rigida: i villaggi con ruolo hammer o feeder non
-        sono MAI candidati, a prescindere dall'ordine nell'array o
-        dalla configurazione esplicita.
+        sono MAI candidati nella selezione AUTOMATICA — l'override
+        esplicito dell'utente (punto 0) resta sovrano.
 
         `exclude` contiene nomi villaggio gia' scartati dalla
         validazione pre-training (ricalcolo della base).
@@ -395,6 +398,23 @@ class ExpansionManager:
             and (v.name or "").strip().lower() not in excluded
         ]
 
+        # 0. Override esplicito da config: founder_village valorizzato
+        #    e' la scelta dell'utente — match su TUTTI i villaggi
+        #    dell'account (il ruolo hammer/feeder non lo filtra) e
+        #    short-circuit totale: niente fallback ne' rotazione.
+        if cfg_name:
+            for v in villages:
+                if (v.name or "").strip().lower() in excluded:
+                    continue
+                if v.name == cfg_name or str(v.village_id) == cfg_name:
+                    return v, _residence_for(v)
+            logger.warning(
+                "Espansione: founder_village '%s' non trovato tra i "
+                "villaggi dell'account — nessun fallback automatico.",
+                cfg_name,
+            )
+            return None, None
+
         # 1. Ricerca per ruolo: il founder designato vince sempre, anche
         #    senza residenza rilevata (feed_target lo finanzia comunque).
         for v in candidates:
@@ -404,18 +424,7 @@ class ExpansionManager:
             ):
                 return v, _residence_for(v)
 
-        # 2. Override esplicito da config (solo se eleggibile).
-        if cfg_name:
-            for v in candidates:
-                if v.name == cfg_name or str(v.village_id) == cfg_name:
-                    return v, _residence_for(v)
-            logger.warning(
-                "Espansione: founder_village '%s' non trovato tra i "
-                "villaggi eleggibili (hammer/feeder esclusi).",
-                cfg_name,
-            )
-
-        # 3-4. Fallback strutturale: residenza >= 10, poi >= 1,
+        # 2-3. Fallback strutturale: residenza >= 10, poi >= 1,
         #      infine qualunque residenza dallo slot designato.
         for min_level in (SETTLER_RESIDENCE_MIN_LEVEL, 1):
             for v in candidates:
@@ -694,14 +703,21 @@ class ExpansionManager:
         if 0 < residence.level < SETTLER_RESIDENCE_MIN_LEVEL:
             logger.error(
                 "%s Espansione: '%s' ha Residenza/Palazzo livello %d (<%d): "
-                "coloni non addestrabili. Ricalcolo base di fondazione...",
+                "coloni non addestrabili.%s",
                 prefix, founder.name, residence.level,
                 SETTLER_RESIDENCE_MIN_LEVEL,
+                (
+                    " founder_village fissato da config: nessuna rotazione."
+                    if (cfg.founder_village or "").strip()
+                    else " Ricalcolo base di fondazione..."
+                ),
             )
-            alt_founder, alt_residence = self._pick_founder(
-                cfg, villages, interior_map,
-                exclude={founder.name or str(founder.village_id)},
-            )
+            alt_founder = alt_residence = None
+            if not (cfg.founder_village or "").strip():
+                alt_founder, alt_residence = self._pick_founder(
+                    cfg, villages, interior_map,
+                    exclude={founder.name or str(founder.village_id)},
+                )
             if (
                 alt_founder is not None
                 and alt_residence is not None

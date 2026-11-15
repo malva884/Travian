@@ -20,6 +20,7 @@ from .builder import (
     crop_threshold,
     focus_intents,
     focus_skip_reasons,
+    is_founder_village,
     net_crop,
     plan_upgrades,
     save_build_plan,
@@ -33,7 +34,12 @@ from .config import (
     save_accounts,
 )
 from .defense import DefenseManager, PendingReinforce
-from .expansion import ExpansionManager, feeder_surplus, find_market
+from .expansion import (
+    ExpansionManager,
+    effective_expansion_config,
+    feeder_surplus,
+    find_market,
+)
 from .farm_store import farm_target_store
 from .farming import FarmingManager, find_rally_point
 from .hero import HeroManager
@@ -2244,8 +2250,16 @@ async def monitor_all_villages(
                 surplus = feeder_surplus(state)
                 if market_slot and surplus:
                     f_target = expansion_mgr.feed_target
+                    # Destinatario per nome o newdid: le coordinate del
+                    # payload si leggono SOLO dal suo record, mai dal
+                    # villaggio mittente.
+                    f_target_l = f_target.strip().lower()
                     founder_v = next(
-                        (v for v in villages if v.name == f_target),
+                        (
+                            v for v in villages
+                            if v.name == f_target
+                            or str(v.village_id) == f_target
+                        ),
                         None,
                     )
                     feed_params: dict = {
@@ -2257,49 +2271,67 @@ async def monitor_all_villages(
                     if founder_v is not None and founder_v.x is not None and founder_v.y is not None:
                         feed_params["target_x"] = founder_v.x
                         feed_params["target_y"] = founder_v.y
-                    elif f_target.strip().lower() in village_coords_map:
-                        feed_params["target_x"], feed_params["target_y"] = village_coords_map[f_target.strip().lower()]
+                    elif f_target_l in village_coords_map:
+                        feed_params["target_x"], feed_params["target_y"] = village_coords_map[f_target_l]
                     else:
                         t_cfg = settings.village_config_for(f_target)
                         if t_cfg and t_cfg.x is not None and t_cfg.y is not None:
                             feed_params["target_x"], feed_params["target_y"] = t_cfg.x, t_cfg.y
 
-                    feed_action = Action(
-                        type=ActionType.SEND_RESOURCES,
-                        params=feed_params,
-                        reason=(
-                            f"Espansione: feeder -> '{expansion_mgr.feed_target}' "
-                            f"invia surplus {surplus} per i coloni"
-                        ),
-                    )
-                    feed_res = await executor.execute(
-                        feed_action, village_id=target_vid
-                    )
-                    logger.info(
-                        "%s Espansione feeder: %s -> '%s' (%s)",
-                        vprefix, surplus, expansion_mgr.feed_target,
-                        feed_res.message,
-                    )
-                    _record_decision(
-                        settings,
-                        state=state, village=village,
-                        module="expansion",
-                        decision="FEEDER_SEND",
-                        outcome=(
-                            DECISION_OUTCOME_EXECUTED
-                            if feed_res.success
-                            else DECISION_OUTCOME_BLOCKED
-                        ),
-                        reason=(
-                            f"Surplus {surplus} spedito al founder "
-                            f"'{expansion_mgr.feed_target}': "
-                            f"{feed_res.message}"
-                        ),
-                        context={
-                            "resources": dict(surplus),
-                            "target": str(expansion_mgr.feed_target),
-                        },
-                    )
+                    if "target_x" not in feed_params:
+                        # Coordinate del destinatario non risolte: salto
+                        # l'invio invece di spedire verso un target
+                        # ambiguo (es. coordinate del mittente).
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="expansion",
+                            decision="FEEDER_SEND",
+                            outcome=DECISION_OUTCOME_SKIPPED,
+                            reason=(
+                                f"Invio surplus al founder '{f_target}' "
+                                "saltato: coordinate del destinatario "
+                                "non note."
+                            ),
+                            context={"target": str(f_target)},
+                        )
+                    else:
+                        feed_action = Action(
+                            type=ActionType.SEND_RESOURCES,
+                            params=feed_params,
+                            reason=(
+                                f"Espansione: feeder -> '{expansion_mgr.feed_target}' "
+                                f"invia surplus {surplus} per i coloni"
+                            ),
+                        )
+                        feed_res = await executor.execute(
+                            feed_action, village_id=target_vid
+                        )
+                        logger.info(
+                            "%s Espansione feeder: %s -> '%s' (%s)",
+                            vprefix, surplus, expansion_mgr.feed_target,
+                            feed_res.message,
+                        )
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="expansion",
+                            decision="FEEDER_SEND",
+                            outcome=(
+                                DECISION_OUTCOME_EXECUTED
+                                if feed_res.success
+                                else DECISION_OUTCOME_BLOCKED
+                            ),
+                            reason=(
+                                f"Surplus {surplus} spedito al founder "
+                                f"'{expansion_mgr.feed_target}': "
+                                f"{feed_res.message}"
+                            ),
+                            context={
+                                "resources": dict(surplus),
+                                "target": str(expansion_mgr.feed_target),
+                            },
+                        )
                 else:
                     _record_decision(
                         settings,

@@ -869,13 +869,26 @@ class TravianParser:
                     continue
                 name = str(item.get("name") or "").strip()
                 level = item.get("level")
+                gid = safe_int(item.get("gid"), -1)
+                # Coerenza nome<->gid per Residenza (25) e Palazzo (26):
+                # il titolo dell'edificio prevale sulla classe CSS 'gN'
+                # quando il markup varia tra skin/server — un Palazzo
+                # rilevato come g25 invertirebbe la mutua esclusione.
+                lname = name.lower()
+                if any(
+                    k in lname
+                    for k in ("palazz", "reggia", "palace", "palast", "palais")
+                ):
+                    gid = 26
+                elif "residen" in lname:
+                    gid = 25
                 fields.append(
                     Field(
                         slot_id=slot_id,
                         name=name,
                         level=parse_int(str(level)) if level is not None else 0,
                         resource_type=None,
-                        gid=safe_int(item.get("gid"), -1),
+                        gid=gid,
                     )
                 )
             if fields:

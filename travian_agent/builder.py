@@ -266,6 +266,15 @@ def new_building_intents(
     for gid in gids:
         if gid in existing or gid <= 0:
             continue
+        # Mutua esclusione amministrativa: niente Palazzo dove esiste
+        # gia' la Residenza (e viceversa) — il gioco rifiuterebbe la
+        # costruzione generando un loop di errori dell'esecutore.
+        if any(
+            gid in group
+            and any(o != gid and o in existing for o in group)
+            for group in _MUTUALLY_EXCLUSIVE_GIDS
+        ):
+            continue
         ok, _why = prereqs_met(state.fields, gid, is_capital(state))
         if not ok:
             logger.debug(
