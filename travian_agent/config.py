@@ -94,6 +94,11 @@ class VillageConfig:
     # Automazione Fucina (ruoli militari): {"enabled", "target_level",
     # "priority_units"} — priority_units come slot astratti o chiavi tN.
     smithy_auto_upgrade: dict = field(default_factory=dict)
+    # Anti-Raid (Depositi Segreti multipli): tetto massimo di
+    # Nascondigli (gid 23) costruibili quando il villaggio e' sotto
+    # pressione raid. 0 = auto (3 per villaggio singolo o ruolo
+    # early_cropper_founder, 2 per gli altri ruoli).
+    max_crannies: int = 0
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:

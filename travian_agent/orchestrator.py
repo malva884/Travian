@@ -674,6 +674,46 @@ async def _coordinate_inter_village_defense(
         break
 
 
+def _raid_pressure_on_village(
+    *,
+    village: Village,
+    state: GameState,
+    villages: list[Village],
+    defense_mgr: DefenseManager | None,
+) -> bool:
+    """True se il villaggio e' sotto pressione raid (spec Anti-Raid).
+
+    Trigger:
+    - attacco in corso sui movimenti della Piazza d'Armi;
+    - minaccia reale nel registro del DefenseManager;
+    - lock d'emergenza registrato nelle ultime 24h (il timestamp di
+      fine emergenza resta persistito e attesta un attacco subito);
+    - villaggio singolo con almeno un'emergenza passata qualsiasi:
+      non ha destinazioni di fuga per le risorse via mercato.
+    """
+    if int(state.incoming_attacks or 0) > 0:
+        return True
+    if defense_mgr is None:
+        return False
+    now = time.time()
+    vid = str(int(village.village_id or state.village_id or 0))
+    try:
+        if vid in defense_mgr.active_threats(now):
+            return True
+    except Exception:
+        pass
+    last_lock = float(defense_mgr.emergency_until.get(vid) or 0.0)
+    # Storico recente: l'emergenza conclusa entro 24h attesta una
+    # razzia subita di recente.
+    if last_lock > now - 86400.0:
+        return True
+    # Villaggio singolo isolato: basta un'emergenza passata — senza
+    # alleati propri non esiste fuga risorse via mercato.
+    if len(villages) <= 1 and last_lock > 0:
+        return True
+    return False
+
+
 def _append_history(
     account_id: str, state: GameState, action: Action, tribe: str = ""
 ) -> None:
@@ -1120,6 +1160,17 @@ async def monitor_all_villages(
             # da _best_peer_for_surplus in brain.rule_emergency_overflow).
             if expansion_mgr is not None:
                 state.feed_target = str(expansion_mgr.feed_target or "")
+
+            # Anti-Raid (Depositi Segreti multipli): pressione raid del
+            # villaggio corrente -> attiva la regola Nascondigli del
+            # builder (e la preview di plan_upgrades).
+            state.single_village = len(villages) <= 1
+            state.under_raid_pressure = _raid_pressure_on_village(
+                village=village,
+                state=state,
+                villages=villages,
+                defense_mgr=defense_mgr,
+            )
 
             action = brain.decide(state)
 

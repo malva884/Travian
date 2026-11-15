@@ -1138,8 +1138,8 @@ if page == "Villaggi":
                 "main_building": "🏛️ Edificio Principale (Velocità costruzioni)",
                 "main": "🏛️ Edificio Principale",  # alias retrocompatibile
                 "rally_point": "🚩 Punto di Raduno",
-                "residence": "🏠 Residenza (Espansione / Slot fondazione)",
-                "palace": "🏰 Palazzo (Capitale / Espansione)",
+                "residence": "🏠 Castello (Espansione / Slot fondazione)",
+                "palace": "🏰 Reggia (Capitale / Espansione)",
                 "residence_palace": "🏠/🏰 Residenza o Palazzo (auto: Residenza, Palazzo in capitale)",
                 "town_hall": "🎉 Municipio (Grandi Feste / Punti Cultura)",
                 "treasury": "💰 Tesoreria (Custodia Artefatti)",

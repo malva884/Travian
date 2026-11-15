@@ -246,6 +246,18 @@ class GameState:
     # Modulo espansione: villaggio founder in deficit coloni — il routing
     # delle risorse (feeder + overflow magazzini) gli da' priorita'.
     feed_target: str = ""
+    # Anti-Raid (Depositi Segreti multipli): pressione raid rilevata
+    # dall'orchestrator (attacchi attivi / storico recente nel registro
+    # difesa / villaggio singolo gia' colpito) — attiva la regola dei
+    # Nascondigli del builder.
+    under_raid_pressure: bool = False
+    # True se l'account ha un solo villaggio: alza il tetto auto dei
+    # Nascondigli (nessuna destinazione di fuga via mercato).
+    single_village: bool = False
+    # Attaccanti teutoni rilevati (forano il 20% del deposito ->
+    # capacita' effettiva x0.8). I report attuali non espongono la
+    # tribu' nemica: resta False finche' il sensore non la fornisce.
+    teuton_raiders: bool = False
     timestamp: float = field(default_factory=time.time)
 
     def resource_fields(self) -> list[Field]:

@@ -32,6 +32,7 @@ from .building_prereqs import (
     FIELD_GID_TYPES,
     GID_ACADEMY,
     GID_BAKERY,
+    GID_CRANNY,
     GID_EMBASSY,
     GID_GRAIN_MILL,
     GID_LABELS,
@@ -71,6 +72,20 @@ _BUILDING_MAX_LEVEL = 20
 _STORAGE_WARN_RATIO = 0.90
 # Profondita' default della preview piano (3-5 per spec).
 PLAN_DEPTH = 4
+
+# Anti-Raid (Depositi Segreti multipli): capacita' protetta per
+# livello del Nascondiglio (gid 23), tabella T4.x — raddoppiata per
+# i Galli; gli attaccanti teutoni forano il 20% del deposito ->
+# fattore prudenziale 0.8 sulla capacita' effettiva.
+_CRANNY_CAP_BY_LEVEL = (0, 100, 130, 170, 220, 280, 360, 460, 600, 770, 1000)
+_CRANNY_MAX_LEVEL = 10
+_CRANNY_TEUTON_LOOT_FACTOR = 0.8
+# Aree vuote minime da conservare dopo la fondazione (Magazzino,
+# Granaio, Mercato, Reggia e Accademia devono restare piazzabili).
+_CRANNY_MIN_FREE_SLOTS = 2
+# Soglie di protezione per singola risorsa sotto raid.
+_CRANNY_TARGET_FOUNDER = 3500   # early_cropper_founder (3-4 depositi)
+_CRANNY_TARGET_DEFAULT = 2000   # altri ruoli (2 depositi al 10)
 
 # New Village Bootstrap (v2.0, spec 2): requisiti minimi del villaggio
 # appena fondato prima di passare al ruolo assegnato.
@@ -845,6 +860,147 @@ def local_spend_intents(state: GameState) -> list[Field]:
 
 
 # ---------------------------------------------------------------------------
+# Anti-Raid: Depositi Segreti multipli sotto pressione raid
+# ---------------------------------------------------------------------------
+
+def _cranny_tribe(state: GameState, settings: Settings) -> str:
+    """Tribu' per il calcolo capacita': config esplicita, poi sensori."""
+    return (
+        (settings.tribe or "").strip().lower()
+        or _detect_tribe(state)
+    )
+
+
+def cranny_protected_capacity(
+    state: GameState, settings: Settings
+) -> int:
+    """Capacita' protetta per risorsa dei Nascondigli presenti.
+
+    Somma la tabella livelli T4.x (x2 per i Galli, x0.8 prudenziale
+    se gli attaccanti rilevati sono Teutoni).
+    """
+    mult = 2.0 if _cranny_tribe(state, settings) == "gauls" else 1.0
+    if getattr(state, "teuton_raiders", False):
+        mult *= _CRANNY_TEUTON_LOOT_FACTOR
+    cap = 0
+    for f in state.interior_fields():
+        if f.gid == GID_CRANNY:
+            lvl = max(0, min(_CRANNY_MAX_LEVEL, int(f.level)))
+            cap += int(_CRANNY_CAP_BY_LEVEL[lvl] * mult)
+    return cap
+
+
+def cranny_target_protection(
+    state: GameState, settings: Settings
+) -> int:
+    """Risorse da tenere al sicuro per risorsa.
+
+    Il piu' alto tra la soglia di ruolo e il picco di giacenza
+    corrente in magazzino (max di legno/argilla/ferro/grano).
+    """
+    role = settings.village_role_for(state.village_name, state.village_id)
+    floor = (
+        _CRANNY_TARGET_FOUNDER
+        if role == "early_cropper_founder"
+        else _CRANNY_TARGET_DEFAULT
+    )
+    res = state.resources
+    peak = max(res.wood, res.clay, res.iron, res.crop)
+    return max(floor, int(peak))
+
+
+def cranny_max_count(state: GameState, settings: Settings) -> int:
+    """Tetto Nascondigli: VillageConfig.max_crannies, poi auto."""
+    vcfg = settings.village_config_for(
+        state.village_name, state.village_id
+    )
+    cfg_max = int(getattr(vcfg, "max_crannies", 0) or 0)
+    if cfg_max > 0:
+        return cfg_max
+    role = settings.village_role_for(state.village_name, state.village_id)
+    if (
+        getattr(state, "single_village", False)
+        or role == "early_cropper_founder"
+    ):
+        return 3
+    return 2
+
+
+def anti_raid_intents(
+    state: GameState, settings: Settings
+) -> list[Field]:
+    """Depositi Segreti anti-raid: upgrade esistenti, poi fondazione.
+
+    Attiva solo con ``state.under_raid_pressure`` (alimentato
+    dall'orchestrator). Sequenza:
+    1. upgrade dei Nascondigli esistenti sotto il 10 (livello piu'
+       basso prima, non in coda);
+    2. fondazione su area vuota solo con TUTTI i depositi al 10
+       (requisito T4.6 per il secondo/terzo), sotto ``max_crannies``
+       e conservando almeno ``_CRANNY_MIN_FREE_SLOTS`` aree libere
+       (slot 19-38: il 39 e' riservato al Punto di Raduno, il 40
+       alle Mura).
+    """
+    if not getattr(state, "under_raid_pressure", False):
+        return []
+    protected = cranny_protected_capacity(state, settings)
+    target = cranny_target_protection(state, settings)
+    if protected >= target:
+        return []
+
+    queued = queued_slot_ids(state)
+    crannies = sorted(
+        (f for f in state.interior_fields() if f.gid == GID_CRANNY),
+        key=lambda f: (f.level, f.slot_id),
+    )
+
+    # 1. Potenziamento dell'esistente (slot non in coda)
+    upgrades = [
+        f for f in crannies
+        if f.level < _CRANNY_MAX_LEVEL and f.slot_id not in queued
+    ]
+    if upgrades:
+        return upgrades
+
+    # 2. Fondazione: nessun deposito sotto il 10 — neanche con
+    #    lavori in corso (requisito T4.6).
+    if any(f.level < _CRANNY_MAX_LEVEL for f in crannies):
+        return []
+    # Conta come deposito potenziale anche ogni nuova costruzione in
+    # coda su area vuota: lo slot potrebbe ospitare un Nascondiglio
+    # gia' avviato (il gid in coda non e' leggibile).
+    new_builds = {
+        f.slot_id for f in state.interior_fields()
+        if f.is_empty_site and f.slot_id in queued
+    }
+    if len(crannies) + len(new_builds) >= cranny_max_count(
+        state, settings
+    ):
+        return []
+    empties = [
+        f for f in empty_slots(state) if 19 <= f.slot_id <= 38
+    ]
+    if len(empties) < _CRANNY_MIN_FREE_SLOTS:
+        return []
+    slot = empties[0]
+    logger.info(
+        "[%s] Anti-Raid: protezione %d < target %d -> fondazione "
+        "Nascondiglio #%d (slot %d).",
+        state.village_name, protected, target,
+        len(crannies) + len(new_builds) + 1, slot.slot_id,
+    )
+    return [
+        Field(
+            slot_id=slot.slot_id,
+            name=GID_LABELS.get(GID_CRANNY, "Nascondiglio"),
+            level=0,
+            resource_type=None,
+            gid=GID_CRANNY,
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Selettore principale + piano
 # ---------------------------------------------------------------------------
 
@@ -922,6 +1078,18 @@ def select_upgrade(
         if it:
             return it
 
+    # 3.6 Anti-Raid: sotto pressione raid i Nascondigli (gid 23)
+    #     precedono il focus manuale e lo sviluppo ordinario —
+    #     protezione risorse + resource-dumping difensivo (upkeep 0:
+    #     nessun impatto sul bilancio grano, resta dietro alla Grain
+    #     Safety Net come tutti gli upgrade non-grano).
+    it = _mk(
+        "anti_raid", anti_raid_intents(state, settings),
+        "Anti-Raid: potenziamento Nascondigli (protezione risorse)",
+    )
+    if it:
+        return it
+
     # 4. building_queue_plan: override manuale utente
     it = _mk(
         "focus", focus_intents(state, settings),
@@ -971,6 +1139,9 @@ def plan_upgrades(
         build_queue=list(state.build_queue),
         village_name=state.village_name,
         village_id=state.village_id,
+        under_raid_pressure=state.under_raid_pressure,
+        single_village=state.single_village,
+        teuton_raiders=state.teuton_raiders,
     )
     plan: list[dict] = []
     chosen: set[int] = set()

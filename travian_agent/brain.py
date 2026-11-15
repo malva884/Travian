@@ -519,6 +519,43 @@ def rule_grain_safety(state: GameState, settings: Settings) -> Action | None:
     )
 
 
+def rule_anti_raid(state: GameState, settings: Settings) -> Action | None:
+    """Anti-Raid: Depositi Segreti multipli sotto pressione raid.
+
+    Attiva solo se l'orchestrator ha segnalato
+    ``state.under_raid_pressure`` (attacchi attivi, storico recente
+    nel registro difesa, o villaggio singolo gia' colpito senza via
+    di fuga via mercato). Potenzia i Nascondigli esistenti e ne
+    fonda di nuovi finche' la capacita' protetta non copre il target
+    di ruolo. L'upkeep del deposito e' 0: resta comunque dietro alla
+    Grain Safety Net come tutti gli upgrade non-grano.
+    """
+    if not getattr(state, "under_raid_pressure", False):
+        return None
+    if builder.crop_safety_needed(state, settings):
+        return None
+    intents = builder.anti_raid_intents(state, settings)
+    if not intents:
+        return None
+    head = intents[0]
+    if not _queue_free(state, settings, head.is_resource_field):
+        return None
+    protected = builder.cranny_protected_capacity(state, settings)
+    target = builder.cranny_target_protection(state, settings)
+    return Action(
+        type=ActionType.UPGRADE_FIELD,
+        params={
+            "candidates": [f.slot_id for f in intents],
+            "construct": builder.construct_gids(state, intents),
+        },
+        reason=(
+            f"Anti-Raid: protezione {protected} < target {target} — "
+            f"upgrade di '{head.name or 'slot ' + str(head.slot_id)}' "
+            f"(livello {head.level}, slot {head.slot_id})"
+        ),
+    )
+
+
 def rule_building_focus(state: GameState, settings: Settings) -> Action | None:
     """Override manuale: building_focus da dashboard batte la logica ruolo."""
     # Grain safety ha la precedenza anche sul focus manuale
@@ -648,6 +685,7 @@ class RuleBasedBrain:
         rule_upgrade_storage,
         rule_grain_safety,
         rule_emergency_overflow,
+        rule_anti_raid,
         rule_building_focus,
         rule_culture_boost,
         rule_role_buildings,
