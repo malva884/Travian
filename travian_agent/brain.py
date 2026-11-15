@@ -701,6 +701,12 @@ class RuleBasedBrain:
         for rule in self.rules:
             action = rule(state, self.settings)
             if action is not None:
+                # Decision Audit Log: la regola vincente viaggia nei
+                # params e viene registrata dall'orchestrator.
+                action.params = dict(action.params or {})
+                action.params["rule"] = getattr(
+                    rule, "__name__", str(rule)
+                )
                 return action
         return Action(type=ActionType.NOOP, reason="Nessuna regola ha prodotto azioni")
 

@@ -135,6 +135,9 @@ class FarmingManager:
     next_due: dict[str, float] = field(default_factory=dict)
     # Prossima scansione mappa di scoperta per villaggio (custom farm)
     next_scan: dict[str, float] = field(default_factory=dict)
+    # Buffer Decision Audit Log: eventi decisionali del ciclo in corso,
+    # svuotato dall'orchestrator via drain_audit() (non persistito).
+    _audit: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._kv_key: str | None = None
@@ -357,6 +360,11 @@ class FarmingManager:
             near_x=village.x, near_y=village.y
         )
         if not approved:
+            self._audit_event(
+                "RAID_TARGET",
+                "SKIPPED",
+                "Nessun Custom Farm Target approvato da razziare",
+            )
             return False
 
         # ------------------------------------------------------------------
@@ -418,6 +426,14 @@ class FarmingManager:
                 "o fuori cooldown per '%s'.",
                 prefix, village.name,
             )
+            self._audit_event(
+                "RAID_TARGET",
+                "SKIPPED",
+                f"{len(approved)} target valutati, 0 idonei: tutti "
+                "fuori competenza (nearest_village) o in cooldown "
+                "per-coordinata",
+                evaluated=len(approved),
+            )
             return False
         approved = eligible
 
@@ -430,6 +446,15 @@ class FarmingManager:
                 "%s FarmTargets: nessuna unita' da raid disponibile in "
                 "'%s' (lettura=%s, unit_pref='%s') — raid saltato.",
                 prefix, village.name, troops, unit_pref,
+            )
+            self._audit_event(
+                "RAID_SEND",
+                "SKIPPED",
+                f"Inventario a zero o sensore cieco: 0 truppe farm "
+                f"disponibili in '{village.name}' "
+                f"(lettura={troops}, unit_pref='{unit_pref}')",
+                troops_read=dict(troops or {}),
+                unit_pref=unit_pref,
             )
             return False
 
@@ -465,6 +490,21 @@ class FarmingManager:
             ),
         )
         result = await executor.execute(action, village_id=village.village_id)
+        self._audit_event(
+            "RAID_SEND",
+            "EXECUTED" if result.success else "BLOCKED",
+            f"{len(raid_targets)} raid mirati ({unit_key} x{qty}) da "
+            f"'{village.name}': {result.message}",
+            coords=[[t['x'], t['y']] for t in raid_targets],
+            unit=unit_key,
+            qty=qty,
+            expected_loot=int(
+                sum(
+                    int(getattr(t, 'estimated_loot', 0) or 0)
+                    for t in selected
+                )
+            ),
+        )
         # Anti-ghost (hotfix): last_raid_ts si aggiorna SOLO per i
         # target la cui uscita truppe e' stata confermata visivamente
         # dal browser (result.data['sent_coords']); il successo del
@@ -518,6 +558,26 @@ class FarmingManager:
         return False
 
     # ------------------------------------------------------------------
+    # Decision Audit Log: eventi consumati dall'orchestrator
+    # ------------------------------------------------------------------
+    def _audit_event(
+        self, decision: str, outcome: str, reason: str, **context
+    ) -> None:
+        self._audit.append(
+            {
+                "decision": decision,
+                "outcome": outcome,
+                "reason": reason,
+                "context": context,
+            }
+        )
+
+    def drain_audit(self) -> list[dict]:
+        """Svuota il buffer degli eventi decisionali del ciclo."""
+        events, self._audit = self._audit, []
+        return events
+
+    # ------------------------------------------------------------------
     # Ciclo principale per villaggio
     # ------------------------------------------------------------------
     async def run_for_village(
@@ -541,16 +601,35 @@ class FarmingManager:
         """
         cfg = settings.farming
         if not cfg.enabled:
+            self._audit_event(
+                "RAID_SEND", "SKIPPED", "Farming disabilitato in config"
+            )
             return False
         vcfg = settings.village_config_for(village.name, village.village_id)
         if vcfg is not None and not vcfg.farm_enabled:
+            self._audit_event(
+                "RAID_SEND",
+                "SKIPPED",
+                "Farming disabilitato per questo villaggio (farm_enabled)",
+            )
             return False
         if not rally_slot:
+            self._audit_event(
+                "RAID_SEND",
+                "SKIPPED",
+                "Nessun Punto di Raduno rilevato nel villaggio",
+            )
             return False
 
         vkey = f"{village.name or village.village_id}"
         now = now if now is not None else time.time()
         if not self.is_due(vkey, now):
+            self._audit_event(
+                "RAID_SEND",
+                "SKIPPED",
+                f"Prossimo ciclo raid pianificato tra "
+                f"{max(0, int(self.next_due.get(vkey, 0.0) - now))}s",
+            )
             return False
 
         # Verifica truppe a casa prima di lanciare il comando
@@ -561,6 +640,14 @@ class FarmingManager:
                 "%s Farming: nessuna truppa da saccheggio a casa in '%s' "
                 "(presenti: %s). Riprovo piu' tardi.",
                 prefix, village.name, troops,
+            )
+            self._audit_event(
+                "RAID_SEND",
+                "SKIPPED",
+                f"0 truppe farm disponibili in '{village.name}' "
+                f"(presenti: {troops})",
+                troops_read=dict(troops or {}),
+                unit_pref=unit_pref,
             )
             self._schedule_retry(vkey, now)
             return False

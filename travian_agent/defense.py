@@ -136,6 +136,9 @@ class DefenseManager:
     # Mentre attivo, replenishment.py viene congelato dall'orchestrator per
     # evitare conflitti sulla spesa delle risorse appena svuotate.
     emergency_until: dict[str, float] = field(default_factory=dict)
+    # Buffer Decision Audit Log: eventi decisionali del ciclo in corso,
+    # svuotato dall'orchestrator via drain_audit() (non persistito).
+    _audit: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._kv_key: str | None = None
@@ -339,6 +342,26 @@ class DefenseManager:
         ]
 
     # ------------------------------------------------------------------
+    # Decision Audit Log: eventi consumati dall'orchestrator
+    # ------------------------------------------------------------------
+    def _audit_event(
+        self, decision: str, outcome: str, reason: str, **context
+    ) -> None:
+        self._audit.append(
+            {
+                "decision": decision,
+                "outcome": outcome,
+                "reason": reason,
+                "context": context,
+            }
+        )
+
+    def drain_audit(self) -> list[dict]:
+        """Svuota il buffer degli eventi decisionali del ciclo."""
+        events, self._audit = self._audit, []
+        return events
+
+    # ------------------------------------------------------------------
     # Entry point: chiamato dall'orchestrator per ogni villaggio del ciclo
     # ------------------------------------------------------------------
     async def handle_village(
@@ -411,12 +434,30 @@ class DefenseManager:
             "%s ATTACCO in arrivo da '%s': impatto tra %ds (%s)",
             prefix, nearest.attacker or "ignoto", secs, nearest.label,
         )
+        self._audit_event(
+            "ATTACK_DETECTED",
+            "EXECUTED",
+            f"Attacco reale da '{nearest.attacker or 'ignoto'}': "
+            f"impatto tra {secs}s ({nearest.label})",
+            attacker=nearest.attacker or "",
+            seconds_to_impact=secs,
+            label=nearest.label or "",
+        )
 
         # D) Emergenza: sotto la soglia di panico -> drain + dodge
         if secs > cfg.panic_threshold_seconds:
             logger.info(
                 "%s Attacco a %ds (soglia %ds): monitorato, nessuna azione.",
                 prefix, secs, cfg.panic_threshold_seconds,
+            )
+            self._audit_event(
+                "ATTACK_MONITORED",
+                "SKIPPED",
+                f"Attacco a {secs}s sopra la soglia panico "
+                f"({cfg.panic_threshold_seconds}s): monitorato, "
+                "nessuna contromisura",
+                seconds_to_impact=secs,
+                panic_threshold_seconds=cfg.panic_threshold_seconds,
             )
             # Registra la fuga programmata se ancora assente
             if not pending:
@@ -441,6 +482,13 @@ class DefenseManager:
         self._lock_village(
             village.village_id,
             nearest.arrival_ts + cfg.recall_delay_seconds,
+        )
+        self._audit_event(
+            "EMERGENCY_LOCK",
+            "EXECUTED",
+            f"Attacco imminente ({secs}s): lock d'emergenza fino a "
+            "impatto + recall, replenishment congelato",
+            seconds_to_impact=secs,
         )
 
         # Fase 2: resource drain
@@ -499,8 +547,22 @@ class DefenseManager:
         total = res.wood + res.clay + res.iron + res.crop
         if total <= _DRAIN_KEEP * 4:
             logger.info("%s Drain: stock basso (%d), niente da svuotare.", prefix, total)
+            self._audit_event(
+                "RESOURCE_DRAIN",
+                "SKIPPED",
+                f"Drain non necessario: stock basso ({total} <= "
+                f"{_DRAIN_KEEP * 4})",
+                total_resources=total,
+            )
             return
         logger.warning("%s Resource Drain: stock %d da convertire in spese.", prefix, total)
+        self._audit_event(
+            "RESOURCE_DRAIN",
+            "EXECUTED",
+            f"Resource Drain avviato: stock {total} da convertire in "
+            "spese (addestramento + upgrade + mercato)",
+            total_resources=total,
+        )
 
         # 1) Addestramento massivo nei trainer del villaggio
         trainer_slots = [
@@ -636,6 +698,12 @@ class DefenseManager:
                 "crop": max(0, res.crop - _DRAIN_KEEP),
             }
             if sum(surplus.values()) <= 0:
+                self._audit_event(
+                    "MARKET_DRAIN",
+                    "SKIPPED",
+                    "Drain mercato non necessario: surplus nullo",
+                    target=target_name,
+                )
                 return
             t_cfg = settings.village_config_for(target_name)
             params: dict = {
@@ -655,6 +723,13 @@ class DefenseManager:
             )
             logger.warning(
                 "%s Drain mercato -> '%s': %s", prefix, target_name, result.message
+            )
+            self._audit_event(
+                "MARKET_DRAIN",
+                "EXECUTED" if result.success else "BLOCKED",
+                f"Drain mercato -> '{target_name}': {result.message}",
+                resources=surplus,
+                target=target_name,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("%s Drain mercato fallito: %s", prefix, exc)
@@ -725,6 +800,14 @@ class DefenseManager:
                 "%s Dodge: solo %d truppe a casa (< %d): nessuna fuga.",
                 prefix, sum(dodge_troops.values()), cfg.min_dodge_troops,
             )
+            self._audit_event(
+                "TROOP_DODGE",
+                "SKIPPED",
+                f"Fuga non avviata: {sum(dodge_troops.values())} truppe "
+                f"a casa sotto soglia minima ({cfg.min_dodge_troops})",
+                troops_home=int(sum(dodge_troops.values())),
+                min_dodge_troops=int(cfg.min_dodge_troops),
+            )
             return None
 
         x, y, host_id = self._resolve_dodge_destination(settings, village, villages)
@@ -732,6 +815,14 @@ class DefenseManager:
             logger.warning(
                 "%s Dodge: nessuna destinazione sicura con coordinate note.",
                 prefix,
+            )
+            self._audit_event(
+                "TROOP_DODGE",
+                "BLOCKED",
+                "Fuga bloccata: nessuna destinazione sicura con "
+                "coordinate note (dodge_target non configurato e "
+                "nessun altro villaggio dell'account)",
+                troops_home=int(sum(dodge_troops.values())),
             )
             return None
 
@@ -751,6 +842,18 @@ class DefenseManager:
         logger.info(
             "%s Dodge programmato: %d truppe -> (%d|%d) tra %ds.",
             prefix, sum(dodge_troops.values()), x, y, max(0, int(dodge_at - now)),
+        )
+        self._audit_event(
+            "DODGE_SCHEDULED",
+            "EXECUTED",
+            f"Fuga programmata: {sum(dodge_troops.values())} truppe "
+            f"-> ({x}|{y}) tra {max(0, int(dodge_at - now))}s "
+            f"(margine {cfg.dodge_margin_seconds}s prima dell'impatto)",
+            troops=dict(dodge_troops),
+            dest_x=x,
+            dest_y=y,
+            dodge_in_seconds=max(0, int(dodge_at - now)),
+            dodge_margin_seconds=int(cfg.dodge_margin_seconds),
         )
         return pending
 
@@ -780,6 +883,15 @@ class DefenseManager:
             ),
         )
         result = await executor.execute(action, village_id=village.village_id)
+        self._audit_event(
+            "TROOP_DODGE",
+            "EXECUTED" if result.success else "BLOCKED",
+            f"Evacuazione {sum(pending.troops.values())} truppe verso "
+            f"({pending.dest_x}|{pending.dest_y}): {result.message}",
+            troops=dict(pending.troops),
+            dest_x=pending.dest_x,
+            dest_y=pending.dest_y,
+        )
         if result.success:
             pending.sent = True
             cfg = settings.defense

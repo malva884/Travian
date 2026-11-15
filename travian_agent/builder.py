@@ -486,6 +486,129 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
     return unique
 
 
+# Coppie di edifici mutuamente esclusivi: la presenza di uno rende lo
+# step dell'altro irrealizzabile (Reggia e Castello, spec T4.6).
+_MUTUALLY_EXCLUSIVE_GIDS = ((GID_RESIDENCE, GID_PALACE),)
+
+
+def focus_skip_reasons(
+    state: GameState, settings: Settings
+) -> list[str]:
+    """Motivi per cui gli step in testa alla Coda Prioritaria non
+    producono candidati (Decision Audit Log).
+
+    Scorre la coda come focus_intents: gli step completati (target
+    gia' raggiunto) vengono saltati in silenzio; per ogni step
+    bloccato viene prodotta una ragione esplicita. La scansione si
+    ferma al primo step applicabile o al terzo motivo raccolto.
+    """
+    vcfg = settings.village_config_for(
+        state.village_name, state.village_id
+    )
+    plan = []
+    if vcfg is not None:
+        plan = list(
+            vcfg.building_queue_plan or vcfg.building_focus or []
+        )
+    if not plan:
+        return []
+    queued = queued_slot_ids(state)
+    reasons: list[str] = []
+    for gids, target in _focus_steps(plan):
+        if len(reasons) >= 3:
+            break
+        label = (
+            GID_LABELS.get(gids[0], str(gids[0])) if gids else "?"
+        )
+        if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
+            rtype = FIELD_GID_TYPES[gids[0]]
+            below = [
+                f for f in state.resource_fields()
+                if f.resource_type is rtype
+                and (target <= 0 or f.level < target)
+            ]
+            if not below:
+                continue  # step completato
+            if upgradeable_fields(state, below):
+                break  # step applicabile
+            reasons.append(
+                f"'{label}' liv. {target}: tutti i campi sotto "
+                "target sono in coda o al livello massimo"
+            )
+            continue
+        interiors = [
+            f for f in state.interior_fields()
+            if f.gid in gids and f.gid > 0
+        ]
+        if target > 0 and any(
+            f.level >= target for f in interiors
+        ):
+            continue  # step completato
+        if not interiors:
+            # Mutua esclusione: es. Castello presente -> Reggia
+            # mai costruibile (e viceversa).
+            exclusive = False
+            for group in _MUTUALLY_EXCLUSIVE_GIDS:
+                others = [g for g in group if g not in gids]
+                hit = next(
+                    (
+                        f for f in state.interior_fields()
+                        if f.gid in others
+                    ),
+                    None,
+                )
+                if hit is not None:
+                    reasons.append(
+                        f"'{label}' saltato: nel villaggio e' gia' "
+                        f"presente '{GID_LABELS.get(hit.gid, hit.gid)}' "
+                        "(mutuamente esclusivo)"
+                    )
+                    exclusive = True
+                    break
+            if exclusive:
+                continue
+            why = ""
+            for gid in gids:
+                ok, why = prereqs_met(
+                    state.fields, gid, is_capital(state)
+                )
+                if ok:
+                    why = ""
+                    break
+            if why:
+                reasons.append(
+                    f"'{label}' rinviato: prerequisiti mancanti ({why})"
+                )
+                continue
+            if not empty_slots(state):
+                reasons.append(
+                    f"'{label}' rinviato: nessuna area vuota nel dorf2"
+                )
+                continue
+            break  # costruibile: step applicabile
+        below_t = [
+            f for f in interiors
+            if target <= 0 or f.level < target
+        ]
+        if not below_t:
+            continue  # step completato
+        if [
+            f for f in below_t
+            if f.slot_id not in queued
+            and f.level < field_max_level(state, f)
+        ]:
+            break  # step applicabile
+        if all(f.slot_id in queued for f in below_t):
+            reasons.append(
+                f"'{label}' rinviato: edificio gia' in coda costruzioni"
+            )
+        else:
+            reasons.append(
+                f"'{label}' al livello massimo consentito"
+            )
+    return reasons
+
+
 FOUNDER_MAIN_TARGET = 15
 FOUNDER_STORAGE_TARGET = 10
 FOUNDER_RESIDENCE_TARGET = 10

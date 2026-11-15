@@ -18,6 +18,8 @@ from .browser import TravianBrowser
 from .builder import (
     bootstrap_complete,
     crop_threshold,
+    focus_intents,
+    focus_skip_reasons,
     net_crop,
     plan_upgrades,
     save_build_plan,
@@ -519,12 +521,45 @@ async def _coordinate_inter_village_defense(
     # Sicurezza del donatore: niente minacce reali su di se', niente
     # lock d'emergenza, niente congelamento da assedio.
     if str(my_id) in threats or int(state.incoming_attacks or 0) > 0:
+        _record_decision(
+            settings,
+            state=state, village=village,
+            module="defense",
+            decision="REINFORCE_SEND",
+            outcome=DECISION_OUTCOME_SKIPPED,
+            reason=(
+                "Nessun rinforzo inviato: il donatore stesso e' sotto "
+                "minaccia o rileva attacchi in arrivo"
+            ),
+        )
         return
     if defense_mgr.is_emergency_locked(my_id, now):
+        _record_decision(
+            settings,
+            state=state, village=village,
+            module="defense",
+            decision="REINFORCE_SEND",
+            outcome=DECISION_OUTCOME_BLOCKED,
+            reason=(
+                "Rinforzi sospesi: emergency_locked attivo "
+                "(emergenza difesa in corso)"
+            ),
+        )
         return
     if replenish_mgr is not None and replenish_mgr.is_village_frozen(
         village.name or ""
     ):
+        _record_decision(
+            settings,
+            state=state, village=village,
+            module="defense",
+            decision="REINFORCE_SEND",
+            outcome=DECISION_OUTCOME_BLOCKED,
+            reason=(
+                "Rinforzi sospesi: villaggio congelato per assedio "
+                "(siege_waves)"
+            ),
+        )
         return
     if village.x is None or village.y is None or not rally_slot:
         return
@@ -588,6 +623,24 @@ async def _coordinate_inter_village_defense(
                 prefix, tname, int(travel),
                 int(secs_left - cfg.reinforce_margin_seconds),
             )
+            _record_decision(
+                settings,
+                state=state, village=village,
+                module="defense",
+                decision="REINFORCE_SEND",
+                outcome=DECISION_OUTCOME_SKIPPED,
+                reason=(
+                    f"Rinforzo verso '{tname}' non inviato: tempo di "
+                    "marcia superiore alla finestra disponibile"
+                ),
+                context={
+                    "target": tname,
+                    "march_seconds": int(travel),
+                    "window_seconds": int(
+                        secs_left - cfg.reinforce_margin_seconds
+                    ),
+                },
+            )
             continue
         if defense_mgr.reinforce_sent(target_id, my_id, arrival):
             continue
@@ -613,8 +666,37 @@ async def _coordinate_inter_village_defense(
                 "%s Rinforzo verso '%s' fallito: %s",
                 prefix, tname, result.message,
             )
+            _record_decision(
+                settings,
+                state=state, village=village,
+                module="defense",
+                decision="REINFORCE_SEND",
+                outcome=DECISION_OUTCOME_BLOCKED,
+                reason=(
+                    f"Muro di rinforzo verso '{tname}' fallito: "
+                    f"{result.message}"
+                ),
+                context={"target": tname, "troops": dict(send)},
+            )
             continue
 
+        _record_decision(
+            settings,
+            state=state, village=village,
+            module="defense",
+            decision="REINFORCE_SEND",
+            outcome=DECISION_OUTCOME_EXECUTED,
+            reason=(
+                f"Muro di rinforzo inviato: {sum(send.values())} difese "
+                f"verso '{tname}' ({tx}|{ty}), impatto nemico tra "
+                f"{int(secs_left)}s"
+            ),
+            context={
+                "target": tname,
+                "troops": dict(send),
+                "seconds_to_impact": int(secs_left),
+            },
+        )
         defense_mgr.register_reinforce(
             PendingReinforce(
                 donor_village_id=my_id,
@@ -761,6 +843,232 @@ def _append_history(
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         logger.debug("Scrittura storico fallita", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Decision Audit Log (spec): eventi strutturati per modulo/decisione/esito
+# ---------------------------------------------------------------------------
+
+DECISION_OUTCOME_EXECUTED = "EXECUTED"
+DECISION_OUTCOME_SKIPPED = "SKIPPED"
+DECISION_OUTCOME_BLOCKED = "BLOCKED"
+
+# Anti-spam: SKIPPED/BLOCKED identici (stessa chiave villaggio+modulo+
+# decisione+motivo normalizzato) non vengono riscritti entro il throttle.
+_AUDIT_SKIP_THROTTLE_SECONDS = 1800.0  # 30 min come da spec (15-30)
+_audit_last_write: dict[tuple, float] = {}
+# Compattazione JSONL dello storico: al massimo una volta l'ora/account.
+_audit_jsonl_compacted: dict[str, float] = {}
+_AUDIT_JSONL_COMPACT_EVERY = 3600.0
+
+
+def _audit_entry(
+    settings: Settings,
+    state: GameState | None,
+    village: Village | None,
+    *,
+    module: str,
+    decision: str,
+    outcome: str,
+    reason: str,
+    context: dict | None = None,
+) -> dict:
+    """Evento audit uniforme con metadati di villaggio/ruolo/risorse."""
+    vname = ""
+    vid = 0
+    if state is not None:
+        vname = state.village_name or ""
+        vid = int(state.village_id or 0)
+    if village is not None:
+        vname = vname or (village.name or "")
+        vid = vid or int(village.village_id or 0)
+    role = ""
+    try:
+        vcfg = settings.village_config_for(vname, vid)
+        role = str(getattr(vcfg, "role", "") or "")
+    except Exception:
+        role = ""
+    entry = {
+        "ts": time.time(),
+        "account_id": settings.account_id,
+        "village_id": vid,
+        "village_name": vname,
+        "village_role": role,
+        "module": module,
+        "decision": decision,
+        "outcome": outcome,
+        "reason": reason,
+        "context": dict(context or {}),
+    }
+    if state is not None:
+        res = state.resources
+        entry["context"].setdefault(
+            "resources",
+            {
+                "wood": res.wood,
+                "clay": res.clay,
+                "iron": res.iron,
+                "crop": res.crop,
+            },
+        )
+        entry["context"].setdefault("queue_used", len(state.build_queue))
+        entry["context"].setdefault("queue_max", settings.max_build_queue)
+    return entry
+
+
+def _audit_reason_key(reason: str) -> str:
+    """Normalizza la motivazione per la dedup: le cifre (tempi,
+    quantita') non devono rendere 'nuovo' un evento identico."""
+    return "".join("#" if c.isdigit() else c for c in reason)
+
+
+def _record_decision(
+    settings: Settings,
+    *,
+    state: GameState | None = None,
+    village: Village | None = None,
+    module: str,
+    decision: str,
+    outcome: str,
+    reason: str,
+    context: dict | None = None,
+) -> None:
+    """Registra un evento del Decision Audit Log (DB + JSONL).
+
+    Deduplica gli stati stabili: SKIPPED/BLOCKED identici sullo stesso
+    villaggio/modulo/decisione non vengono riscritti prima di
+    ``_AUDIT_SKIP_THROTTLE_SECONDS`` (solo le transizioni di stato e
+    gli eventi significativi entrano nel log).
+    """
+    try:
+        entry = _audit_entry(
+            settings,
+            state,
+            village,
+            module=module,
+            decision=decision,
+            outcome=outcome,
+            reason=reason,
+            context=context,
+        )
+        if outcome in (
+            DECISION_OUTCOME_SKIPPED,
+            DECISION_OUTCOME_BLOCKED,
+        ):
+            key = (
+                settings.account_id,
+                entry["village_id"],
+                module,
+                decision,
+                _audit_reason_key(reason),
+            )
+            now = entry["ts"]
+            if (
+                now - _audit_last_write.get(key, 0.0)
+                < _AUDIT_SKIP_THROTTLE_SECONDS
+            ):
+                return
+            _audit_last_write[key] = now
+
+        safe_id = "".join(
+            c if c.isalnum() or c in "._-" else "_"
+            for c in settings.account_id
+        )
+        db.decision_insert(safe_id, entry)
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        path: Path = HISTORY_DIR / f"history_{safe_id}.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _compact_audit_jsonl(safe_id, path)
+    except Exception:
+        logger.debug("Decision audit non registrato", exc_info=True)
+
+
+def _compact_audit_jsonl(safe_id: str, path: Path) -> None:
+    """Rotazione del JSONL storico: ultimi 7 giorni / 5000 righe,
+    al massimo una compattazione l'ora per account."""
+    try:
+        now = time.time()
+        if (
+            now - _audit_jsonl_compacted.get(safe_id, 0.0)
+            < _AUDIT_JSONL_COMPACT_EVERY
+        ):
+            return
+        _audit_jsonl_compacted[safe_id] = now
+        lines = path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        cutoff = now - db.DECISION_LOG_MAX_AGE_SECONDS
+        scan = lines[-(db.DECISION_LOG_MAX_ROWS * 3):]
+        kept: list[str] = []
+        for line in scan:
+            try:
+                ts = float(json.loads(line).get("ts") or 0.0)
+            except (ValueError, AttributeError):
+                ts = 0.0
+            if ts >= cutoff:
+                kept.append(line)
+        kept = kept[-db.DECISION_LOG_MAX_ROWS:]
+        if len(kept) != len(lines):
+            path.write_text(
+                "".join(line + "\n" for line in kept),
+                encoding="utf-8",
+            )
+    except Exception:
+        logger.debug("Compattazione audit JSONL fallita", exc_info=True)
+
+
+def _flush_module_audits(
+    settings: Settings,
+    *,
+    module: str,
+    state: GameState | None = None,
+    village: Village | None = None,
+    managers: tuple = (),
+) -> None:
+    """Svuota i buffer ``drain_audit()`` dei manager di modulo nel
+    Decision Audit Log (eventi decision/outcome/reason/context)."""
+    for mgr in managers:
+        if mgr is None:
+            continue
+        try:
+            events = mgr.drain_audit()
+        except Exception:
+            events = []
+        for ev in events:
+            _record_decision(
+                settings,
+                state=state,
+                village=village,
+                module=module,
+                decision=str(ev.get("decision") or "MODULE_EVENT"),
+                outcome=str(
+                    ev.get("outcome") or DECISION_OUTCOME_EXECUTED
+                ),
+                reason=str(ev.get("reason") or ""),
+                context=(
+                    ev.get("context")
+                    if isinstance(ev.get("context"), dict)
+                    else None
+                ),
+            )
+
+
+# Modulo audit per tipo azione del brain: le azioni di building
+# restano sotto 'builder', le altre rientrano nel dominio del modulo
+# che le emette tipicamente (espansione, rimpiazzo, raid, fucina).
+_ACTION_MODULE_MAP = {
+    ActionType.TRAIN_SETTLERS: "expansion",
+    ActionType.SEND_RESOURCES: "expansion",
+    ActionType.TRAIN_TROOPS: "replenishment",
+    ActionType.SEND_CUSTOM_RAID: "farming",
+    ActionType.UPGRADE_UNITS: "smithy",
+}
+
+
+def _action_module(action: Action) -> str:
+    return _ACTION_MODULE_MAP.get(action.type, "builder")
+
 
 INITIAL_BACKOFF = 10.0
 MAX_BACKOFF = 300.0
@@ -1086,6 +1394,13 @@ async def monitor_all_villages(
                         "%s Errore modulo difesa (non bloccante): %s",
                         vprefix, d_exc,
                     )
+                _flush_module_audits(
+                    settings,
+                    module="defense",
+                    state=state,
+                    village=village,
+                    managers=(defense_mgr,),
+                )
 
             # 3.55 Smart Reinforce Coordinator: il villaggio corrente,
             #     se non minacciato, valuta il registro attacchi e manda
@@ -1186,6 +1501,45 @@ async def monitor_all_villages(
                     "%s Build plan non salvato: %s", vprefix, plan_exc
                 )
 
+            # Decision Audit — Coda Prioritaria: motivi degli step
+            # bloccati in testa (mutua esclusione, prerequisiti, coda
+            # piena) e scavalcamento da regole di emergenza.
+            try:
+                for why in focus_skip_reasons(state, settings):
+                    _record_decision(
+                        settings,
+                        state=state,
+                        village=village,
+                        module="builder",
+                        decision="PRIORITY_QUEUE_STEP",
+                        outcome=DECISION_OUTCOME_SKIPPED,
+                        reason=why,
+                    )
+                winning_rule = str(
+                    (action.params or {}).get("rule") or ""
+                )
+                if winning_rule not in ("", "rule_building_focus"):
+                    if focus_intents(state, settings):
+                        _record_decision(
+                            settings,
+                            state=state,
+                            village=village,
+                            module="builder",
+                            decision="PRIORITY_QUEUE_STEP",
+                            outcome=DECISION_OUTCOME_SKIPPED,
+                            reason=(
+                                "Step Coda Prioritaria applicabile ma "
+                                f"scavalcato dalla regola '{winning_rule}'"
+                            ),
+                            context={"rule": winning_rule},
+                        )
+            except Exception:
+                logger.debug(
+                    "%s Audit coda prioritaria fallito",
+                    vprefix,
+                    exc_info=True,
+                )
+
             # Arricchimento coordinate target per invio risorse al mercato
             if action.type == ActionType.SEND_RESOURCES:
                 act_params = action.params or {}
@@ -1201,8 +1555,29 @@ async def monitor_all_villages(
                             action.params["target_x"], action.params["target_y"] = t_cfg.x, t_cfg.y
 
             target_vid = state.village_id or village.village_id
+            # La regola vincente serve all'audit, non all'executor.
+            rule_name = str(
+                (action.params or {}).pop("rule", "") or ""
+            )
             result = await executor.execute(action, village_id=target_vid)
             _append_history(settings.account_id, state, action)
+            _record_decision(
+                settings,
+                state=state,
+                village=village,
+                module=_action_module(action),
+                decision=action.type.value.upper(),
+                outcome=(
+                    DECISION_OUTCOME_EXECUTED
+                    if result.success
+                    else DECISION_OUTCOME_BLOCKED
+                ),
+                reason=action.reason or result.message or "",
+                context={
+                    "rule": rule_name,
+                    "executor_message": result.message,
+                },
+            )
             if not result.success:
                 logger.warning(
                     "%s Azione non eseguita: %s", vprefix, result.message
@@ -1230,6 +1605,22 @@ async def monitor_all_villages(
                             browser, village_id=target_vid, prefix=vprefix
                         )
                         if gained:
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="hero",
+                                decision="EMERGENCY_UNPACK",
+                                outcome=DECISION_OUTCOME_EXECUTED,
+                                reason=(
+                                    "Unpack baule eroe per coprire il "
+                                    "deficit risorse della spesa "
+                                    "prioritaria"
+                                ),
+                                context={
+                                    "gained": gained,
+                                    "action": action.type.value,
+                                },
+                            )
                             result = await executor.execute(
                                 action, village_id=target_vid
                             )
@@ -1251,6 +1642,19 @@ async def monitor_all_villages(
             #   (nearest_village) e che non siano stati gia' attaccati di recente.
             # ------------------------------------------------------------------
             is_raiding_role = village.role not in ("early_cropper_founder", "feeder")
+            if not is_raiding_role:
+                _record_decision(
+                    settings,
+                    state=state, village=village,
+                    module="farming",
+                    decision="RAID_SEND",
+                    outcome=DECISION_OUTCOME_SKIPPED,
+                    reason=(
+                        f"Villaggio escluso dal ciclo raid: ruolo "
+                        f"'{village.role}' non offensivo"
+                    ),
+                    context={"role": village.role},
+                )
 
             # 4.1 Modulo farming: raid sui Custom Farm Targets approvati
             # (fallback: farm list nativa del Punto di Raduno), se scaduto
@@ -1269,6 +1673,13 @@ async def monitor_all_villages(
                     )
                 except Exception as f_exc:
                     logger.warning("%s Errore modulo farming: %s", vprefix, f_exc)
+                _flush_module_audits(
+                    settings,
+                    module="farming",
+                    state=state,
+                    village=village,
+                    managers=(farming_mgr,),
+                )
 
             # Report di combattimento letti dallo scout brain; valorizzati una
             # sola volta per villaggio e riusati dal modulo replenish.
@@ -1358,6 +1769,18 @@ async def monitor_all_villages(
                                 "%s AI Scout: nessun target approvato di competenza o fuori cooldown.",
                                 vprefix,
                             )
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="scout",
+                                decision="TARGET_FILTER",
+                                outcome=DECISION_OUTCOME_SKIPPED,
+                                reason=(
+                                    "AI Scout: nessun target approvato "
+                                    "di competenza o fuori cooldown "
+                                    "per-coordinata"
+                                ),
+                            )
                         else:
                             plan = await scout_brain.decide_raid_plan(
                                 village, state.troops_home, settings
@@ -1378,8 +1801,40 @@ async def monitor_all_villages(
                                         "%s AI Scout: %d target saltati: %s",
                                         vprefix, len(skipped), "; ".join(skipped),
                                     )
+                                    _record_decision(
+                                        settings,
+                                        state=state, village=village,
+                                        module="scout",
+                                        decision="TARGET_FILTER",
+                                        outcome=DECISION_OUTCOME_SKIPPED,
+                                        reason=(
+                                            f"AI Scout: {len(skipped)} "
+                                            "target scartati "
+                                            "(fuori competenza "
+                                            "nearest_village o in "
+                                            "cooldown)"
+                                        ),
+                                        context={
+                                            "skipped": skipped,
+                                            "approved": len(gated),
+                                        },
+                                    )
                                 plan = gated
 
+                            if not plan:
+                                _record_decision(
+                                    settings,
+                                    state=state, village=village,
+                                    module="scout",
+                                    decision="RAID_SEND",
+                                    outcome=DECISION_OUTCOME_SKIPPED,
+                                    reason=(
+                                        "AI Scout: nessun raid "
+                                        "pianificato dopo i filtri "
+                                        "(target coperti, in blacklist "
+                                        "o senza truppe)"
+                                    ),
+                                )
                             if plan:
                                 scout_act = Action(
                                     type=ActionType.SEND_CUSTOM_RAID,
@@ -1395,6 +1850,32 @@ async def monitor_all_villages(
                                         scout_res.message,
                                     )
                                 logger.info("%s AI Scout: %s", vprefix, scout_res.message)
+                                _record_decision(
+                                    settings,
+                                    state=state, village=village,
+                                    module="scout",
+                                    decision="RAID_SEND",
+                                    outcome=(
+                                        DECISION_OUTCOME_EXECUTED
+                                        if scout_res.success
+                                        else DECISION_OUTCOME_BLOCKED
+                                    ),
+                                    reason=(
+                                        f"AI Scout: {len(plan)} raid "
+                                        "dinamici mirati — "
+                                        f"{scout_res.message}"
+                                    ),
+                                    context={
+                                        "coords": [
+                                            [t.get("x"), t.get("y")]
+                                            for t in plan
+                                        ],
+                                        "units": [
+                                            t.get("troops")
+                                            for t in plan
+                                        ],
+                                    },
+                                )
                     except Exception as s_exc:
                         logger.warning("%s Errore modulo AI Scout Brain: %s", vprefix, s_exc)
 
@@ -1427,6 +1908,17 @@ async def monitor_all_villages(
                 logger.info(
                     "%s Replenishment congelato: emergenza difesa attiva.",
                     vprefix,
+                )
+                _record_decision(
+                    settings,
+                    state=state, village=village,
+                    module="replenishment",
+                    decision="TROOP_TRAINING",
+                    outcome=DECISION_OUTCOME_BLOCKED,
+                    reason=(
+                        "Addestramento congelato: emergency_locked "
+                        "(emergenza difesa attiva)"
+                    ),
                 )
             if (
                 replenish_mgr is not None
@@ -1552,6 +2044,46 @@ async def monitor_all_villages(
                                 "%s Replenishment: %s",
                                 vprefix, rep_res.message,
                             )
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="replenishment",
+                                decision="TROOP_TRAINING",
+                                outcome=(
+                                    DECISION_OUTCOME_EXECUTED
+                                    if rep_res.success
+                                    else DECISION_OUTCOME_BLOCKED
+                                ),
+                                reason=(
+                                    "Addestramento deficit "
+                                    f"{plan}: {rep_res.message}"
+                                ),
+                                context={
+                                    "deficit": dict(deficit),
+                                    "reserve_settlers": reserve_settlers,
+                                },
+                            )
+                        elif deficit:
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="replenishment",
+                                decision="TROOP_TRAINING",
+                                outcome=DECISION_OUTCOME_SKIPPED,
+                                reason=(
+                                    "Deficit truppe presente ma "
+                                    "addestramento non avviabile "
+                                    "(trainer assenti, riserva coloni "
+                                    "o risorse insufficienti)"
+                                ),
+                                context={
+                                    "deficit": dict(deficit),
+                                    "reserve_settlers": reserve_settlers,
+                                    "trainer_slots": len(
+                                        trainer_slots_rep
+                                    ),
+                                },
+                            )
                 except Exception as rep_exc:
                     logger.warning(
                         "%s Errore modulo replenishment: %s",
@@ -1579,10 +2111,29 @@ async def monitor_all_villages(
                 if (
                     smithy_cfg.get("enabled")
                     and smithy is not None
+                    and emergency_locked
+                    and (time.time() - last_try) >= SMITHY_RETRY_SECONDS
+                ):
+                    _last_smithy_try[vname] = time.time()
+                    _record_decision(
+                        settings,
+                        state=state, village=village,
+                        module="smithy",
+                        decision="UNIT_UPGRADE",
+                        outcome=DECISION_OUTCOME_BLOCKED,
+                        reason=(
+                            "Upgrade Fucina sospeso: emergency_locked "
+                            "(emergenza difesa attiva)"
+                        ),
+                    )
+                if (
+                    smithy_cfg.get("enabled")
+                    and smithy is not None
                     and not emergency_locked
                     and (time.time() - last_try) >= SMITHY_RETRY_SECONDS
                 ):
                     _last_smithy_try[vname] = time.time()
+
                     # Grain Safety Net: upgrade metallurgici solo con
                     # margine grano sopra soglia. net_crop() torna None
                     # quando il bilancio non e' stato letto (production.php
@@ -1595,10 +2146,36 @@ async def monitor_all_villages(
                             "(net_crop=None) — tentativo rinviato.",
                             vprefix,
                         )
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="smithy",
+                            decision="UNIT_UPGRADE",
+                            outcome=DECISION_OUTCOME_SKIPPED,
+                            reason=(
+                                "Upgrade Fucina rinviato: bilancio "
+                                "grano non letto (net_crop=None)"
+                            ),
+                        )
                     elif thr > 0 and float(net) < thr:
                         logger.info(
                             "%s Fucina: upgrade sospeso (net crop %s < %s)",
                             vprefix, net, thr,
+                        )
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="smithy",
+                            decision="UNIT_UPGRADE",
+                            outcome=DECISION_OUTCOME_SKIPPED,
+                            reason=(
+                                "Upgrade Fucina sospeso: bilancio "
+                                "grano sotto soglia"
+                            ),
+                            context={
+                                "net_crop": float(net),
+                                "threshold": float(thr),
+                            },
                         )
                     else:
                         sm_res = await executor.execute(
@@ -1622,6 +2199,29 @@ async def monitor_all_villages(
                             village_id=target_vid,
                         )
                         logger.info("%s Fucina: %s", vprefix, sm_res.message)
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="smithy",
+                            decision="UNIT_UPGRADE",
+                            outcome=(
+                                DECISION_OUTCOME_EXECUTED
+                                if sm_res.success
+                                else DECISION_OUTCOME_BLOCKED
+                            ),
+                            reason=(
+                                f"Potenziamento unita' in Fucina "
+                                f"(liv. {smithy_cfg.get('target_level') or 20}): "
+                                f"{sm_res.message}"
+                            ),
+                            context={
+                                "units": list(
+                                    smithy_cfg.get("priority_units")
+                                    or []
+                                ),
+                                "smithy_level": int(smithy.level),
+                            },
+                        )
             except Exception as sm_exc:
                 logger.warning(
                     "%s Errore automazione Fucina: %s", vprefix, sm_exc,
@@ -1679,6 +2279,46 @@ async def monitor_all_villages(
                         "%s Espansione feeder: %s -> '%s' (%s)",
                         vprefix, surplus, expansion_mgr.feed_target,
                         feed_res.message,
+                    )
+                    _record_decision(
+                        settings,
+                        state=state, village=village,
+                        module="expansion",
+                        decision="FEEDER_SEND",
+                        outcome=(
+                            DECISION_OUTCOME_EXECUTED
+                            if feed_res.success
+                            else DECISION_OUTCOME_BLOCKED
+                        ),
+                        reason=(
+                            f"Surplus {surplus} spedito al founder "
+                            f"'{expansion_mgr.feed_target}': "
+                            f"{feed_res.message}"
+                        ),
+                        context={
+                            "resources": dict(surplus),
+                            "target": str(expansion_mgr.feed_target),
+                        },
+                    )
+                else:
+                    _record_decision(
+                        settings,
+                        state=state, village=village,
+                        module="expansion",
+                        decision="FEEDER_SEND",
+                        outcome=DECISION_OUTCOME_SKIPPED,
+                        reason=(
+                            "Invio surplus al founder non partito: "
+                            "mercato assente"
+                            if not market_slot
+                            else "Invio surplus al founder non "
+                                 "partito: nessun surplus disponibile"
+                        ),
+                        context={
+                            "feed_target": str(
+                                expansion_mgr.feed_target
+                            )
+                        },
                     )
 
             # 4.3 Auto-Feeder Bridge (spec 2): finche' bootstrap_target
@@ -1777,6 +2417,26 @@ async def monitor_all_villages(
                                 "%s Bootstrap feeder: %s -> '%s' (%s)",
                                 vprefix, b_surplus, b_name,
                                 b_res_exec.message,
+                            )
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="expansion",
+                                decision="BOOTSTRAP_BRIDGE",
+                                outcome=(
+                                    DECISION_OUTCOME_EXECUTED
+                                    if b_res_exec.success
+                                    else DECISION_OUTCOME_BLOCKED
+                                ),
+                                reason=(
+                                    f"Bootstrap bridge: {b_surplus} -> "
+                                    f"'{b_name}' (cappato allo spazio "
+                                    f"libero): {b_res_exec.message}"
+                                ),
+                                context={
+                                    "resources": dict(b_surplus),
+                                    "target": b_name,
+                                },
                             )
 
             # 5. Pausa umana tra un villaggio e l'altro

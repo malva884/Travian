@@ -126,6 +126,28 @@ def _ensure_farm_columns(conn: sqlite3.Connection) -> None:
             )
 
 
+# Colonne village_snapshots aggiunte per il Decision Audit Log: righe
+# "evento" (module/decision/outcome valorizzati) convivono con le righe
+# "snapshot" prodotte da _append_history (colonne vuote). ALTER
+# idempotente per i DB creati prima dell'introduzione dell'audit.
+_SNAP_LATE_COLS = (
+    ("module", "TEXT DEFAULT ''"),
+    ("decision", "TEXT DEFAULT ''"),
+    ("outcome", "TEXT DEFAULT ''"),
+)
+
+
+def _ensure_snapshot_columns(conn: sqlite3.Connection) -> None:
+    cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(village_snapshots)")
+    }
+    for name, ddl in _SNAP_LATE_COLS:
+        if name not in cols:
+            conn.execute(
+                f"ALTER TABLE village_snapshots ADD COLUMN {name} {ddl}"
+            )
+
+
 def _ensure_ready(conn: sqlite3.Connection) -> None:
     """Schema + WAL + migrazione legacy, una sola volta per processo."""
     global _initialized
@@ -135,6 +157,7 @@ def _ensure_ready(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(_SCHEMA)
     _ensure_farm_columns(conn)
+    _ensure_snapshot_columns(conn)
     _migrate_legacy(conn)
     conn.commit()
     _initialized = True
@@ -403,10 +426,12 @@ def history_latest(account_id: str) -> dict[str, dict]:
             rows = conn.execute(
                 "SELECT vs.data FROM village_snapshots vs"
                 " JOIN (SELECT village_name, MAX(ts) AS mts"
-                "       FROM village_snapshots WHERE account_id = ?"
+                "       FROM village_snapshots"
+                "       WHERE account_id = ? AND (module IS NULL OR module = '')"
                 "       GROUP BY village_name) m"
                 " ON vs.village_name = m.village_name AND vs.ts = m.mts"
-                " WHERE vs.account_id = ?",
+                " WHERE vs.account_id = ?"
+                "   AND (vs.module IS NULL OR vs.module = '')",
                 (account_id, account_id),
             ).fetchall()
         out: dict[str, dict] = {}
@@ -421,6 +446,116 @@ def history_latest(account_id: str) -> dict[str, dict]:
     except Exception:
         logger.debug("history_latest(%s) fallito", account_id, exc_info=True)
         return {}
+
+
+# ----------------------------------------------------------------------
+# Decision Audit Log: eventi decisionali strutturati (spec audit)
+# ----------------------------------------------------------------------
+
+# Rotazione automatica: finestra di 7 giorni e massimo 5000 record per
+# account (vale per l'intera tabella, snapshot inclusi).
+DECISION_LOG_MAX_AGE_SECONDS = 7 * 86400
+DECISION_LOG_MAX_ROWS = 5000
+
+
+def _rotate_village_snapshots(
+    conn: sqlite3.Connection, account_id: str, now: float
+) -> None:
+    """Finestra scorrevole sullo storico: eta' massima + tetto righe."""
+    conn.execute(
+        "DELETE FROM village_snapshots WHERE account_id = ? AND ts < ?",
+        (account_id, now - DECISION_LOG_MAX_AGE_SECONDS),
+    )
+    conn.execute(
+        "DELETE FROM village_snapshots WHERE account_id = ?"
+        " AND rowid NOT IN ("
+        "   SELECT rowid FROM village_snapshots WHERE account_id = ?"
+        "   ORDER BY rowid DESC LIMIT ?"
+        " )",
+        (account_id, account_id, DECISION_LOG_MAX_ROWS),
+    )
+
+
+def decision_insert(account_id: str, entry: dict) -> None:
+    """Accoda un evento del Decision Audit Log.
+
+    Stessa tabella/JSONL dello storico ma con module, decision e
+    outcome (EXECUTED / SKIPPED / BLOCKED) valorizzati e indicizzati
+    per i filtri della dashboard. Applica la rotazione automatica.
+    """
+    try:
+        now = float(entry.get("ts") or time.time())
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO village_snapshots"
+                " (account_id, village_name, ts, data,"
+                "  module, decision, outcome)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    account_id,
+                    str(entry.get("village_name") or ""),
+                    now,
+                    json.dumps(entry, ensure_ascii=False),
+                    str(entry.get("module") or ""),
+                    str(entry.get("decision") or ""),
+                    str(entry.get("outcome") or ""),
+                ),
+            )
+            _rotate_village_snapshots(conn, account_id, now)
+    except Exception:
+        logger.debug(
+            "decision_insert(%s) fallito", account_id, exc_info=True
+        )
+
+
+def decision_query(
+    account_id: str,
+    *,
+    village_name: str | None = None,
+    module: str | None = None,
+    outcome: str | None = None,
+    limit: int = 300,
+) -> list[dict]:
+    """Eventi audit dell'account, dal piu' recente, con filtri opzionali."""
+    sql = (
+        "SELECT rowid, village_name, module, decision, outcome, ts, data"
+        " FROM village_snapshots"
+        " WHERE account_id = ? AND module IS NOT NULL AND module != ''"
+    )
+    params: list = [account_id]
+    if village_name:
+        sql += " AND village_name = ?"
+        params.append(village_name)
+    if module:
+        sql += " AND module = ?"
+        params.append(module)
+    if outcome:
+        sql += " AND outcome = ?"
+        params.append(outcome)
+    sql += " ORDER BY rowid DESC LIMIT ?"
+    params.append(max(1, int(limit)))
+    try:
+        with _db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception:
+        logger.debug(
+            "decision_query(%s) fallito", account_id, exc_info=True
+        )
+        return []
+    out: list[dict] = []
+    for rowid, vname, mod, dec, oc, ts, raw in rows:
+        try:
+            entry = json.loads(raw)
+        except (TypeError, ValueError):
+            entry = {}
+        entry.setdefault("village_name", vname)
+        entry.setdefault("module", mod)
+        entry.setdefault("decision", dec)
+        entry.setdefault("outcome", oc)
+        entry.setdefault("ts", ts)
+        entry["_rowid"] = rowid
+        out.append(entry)
+    return out
 
 
 # ----------------------------------------------------------------------

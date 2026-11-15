@@ -464,6 +464,56 @@ def get_latest_village_snapshots(account_id: str) -> dict[str, dict]:
     return snapshots
 
 
+def get_decision_log(
+    account_id: str,
+    *,
+    village_name: str | None = None,
+    module: str | None = None,
+    outcome: str | None = None,
+    limit: int = 300,
+) -> list[dict]:
+    """Eventi del Decision Audit Log per l'account (dal piu' recente).
+
+    Chiave DB = `safe_id` (stessa sanitizzazione di `_record_decision`).
+    Fallback sul JSONL storico se la tabella e' vuota.
+    """
+    safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
+    events = db.decision_query(
+        safe_id,
+        village_name=village_name,
+        module=module,
+        outcome=outcome,
+        limit=limit,
+    )
+    if events:
+        return events
+
+    history_file = STATE_DIR / "history" / f"history_{safe_id}.jsonl"
+    if not history_file.exists():
+        return []
+    out: list[dict] = []
+    try:
+        with history_file.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if not data.get("module"):
+                    continue
+                if village_name and data.get("village_name") != village_name:
+                    continue
+                if module and data.get("module") != module:
+                    continue
+                if outcome and data.get("outcome") != outcome:
+                    continue
+                out.append(data)
+    except Exception:
+        return []
+    out.reverse()
+    return out[:limit]
+
+
 def get_scout_brain_data(account_id: str) -> dict:
     """Dati intelligence AI Scout (kv DB, fallback file legacy)."""
     safe_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in account_id)
@@ -3333,6 +3383,119 @@ if page == "Audits":
         "Audits",
         "Esplora gli eventi di esecuzione generati dagli agenti (un file di log per account).",
     )
+
+    # ------------- LOG DECISIONI & LOGICA (Decision Audit Log) -------------
+    ui.section("Log Decisioni & Logica")
+    st.caption(
+        "Audit centralizzato delle decisioni dei moduli dell'agente: "
+        "esito, motivazione e contesto di ogni scelta operativa "
+        "(rotazione automatica: 7 giorni / 5.000 record)."
+    )
+    _audit_acc_id = str(st.session_state.get("sel_account_id") or "")
+    _audit_acc = next(
+        (a for a in accounts if a.account_id == _audit_acc_id), None
+    )
+    if not _audit_acc_id:
+        st.caption("Seleziona un account attivo per vedere il log decisioni.")
+    else:
+        _audit_vnames = list((_audit_acc.villages or {}).keys()) if _audit_acc else []
+        _audit_vnames += sorted(
+            {
+                str(e.get("village_name") or "")
+                for e in get_decision_log(_audit_acc_id, limit=300)
+            }
+            - set(_audit_vnames)
+            - {""}
+        )
+        _audit_v_opts = ["(tutti)"] + _audit_vnames
+        _audit_m_opts = [
+            "(tutti)", "builder", "defense", "farming", "scout",
+            "expansion", "replenishment", "smithy", "hero",
+        ]
+        _audit_o_opts = ["(tutti)", "EXECUTED", "SKIPPED", "BLOCKED"]
+        ac1, ac2, ac3 = st.columns(3)
+        with ac1:
+            _audit_v = st.selectbox(
+                "Villaggio", _audit_v_opts, key="audit_village"
+            )
+        with ac2:
+            _audit_m = st.selectbox(
+                "Modulo", _audit_m_opts, key="audit_module"
+            )
+        with ac3:
+            _audit_o = st.selectbox(
+                "Esito", _audit_o_opts, key="audit_outcome"
+            )
+
+        _audit_events = get_decision_log(
+            _audit_acc_id,
+            village_name=None if _audit_v == "(tutti)" else _audit_v,
+            module=None if _audit_m == "(tutti)" else _audit_m,
+            outcome=None if _audit_o == "(tutti)" else _audit_o,
+            limit=300,
+        )
+        if not _audit_events:
+            st.caption(
+                "Nessun evento audit per i filtri scelti: il log si "
+                "popola dal primo ciclo dell'agente."
+            )
+        else:
+            _oc_tone = {
+                "EXECUTED": "success",
+                "SKIPPED": "warning",
+                "BLOCKED": "danger",
+            }
+            _dec_rows: list[list[str]] = []
+            for ev in _audit_events:
+                _ts = datetime.datetime.fromtimestamp(
+                    float(ev.get("ts") or 0)
+                ).strftime("%d/%m %H:%M:%S")
+                _dec_rows.append(
+                    [
+                        f"<span class='mono dim'>{ui.esc(_ts)}</span>",
+                        ui.esc(str(ev.get("village_name") or "-")),
+                        f"<span class='dim'>{ui.esc(str(ev.get('module') or '-'))}</span>",
+                        ui.esc(str(ev.get("decision") or "-")),
+                        ui.pill(
+                            str(ev.get("outcome") or "LOG"),
+                            _oc_tone.get(str(ev.get("outcome")), "neutral"),
+                        ),
+                        ui.esc(str(ev.get("reason") or "")),
+                    ]
+                )
+            ui.render_table(
+                ["Ora", "Villaggio", "Modulo", "Decisione", "Esito", "Motivazione"],
+                _dec_rows,
+            )
+            st.caption(
+                f"{len(_audit_events)} eventi mostrati (max 300, dal piu' recente)."
+            )
+            with st.expander("🔍 Ispeziona contesto grezzo di un evento"):
+                _ev_labels = [
+                    f"#{i + 1} {ev.get('village_name') or '-'} · "
+                    f"{ev.get('module')}/{ev.get('decision')} · "
+                    + datetime.datetime.fromtimestamp(
+                        float(ev.get("ts") or 0)
+                    ).strftime("%H:%M:%S")
+                    + f" · {(ev.get('reason') or '')[:60]}"
+                    for i, ev in enumerate(_audit_events[:50])
+                ]
+                _ev_idx = st.selectbox(
+                    "Evento",
+                    range(len(_ev_labels)),
+                    format_func=lambda i: _ev_labels[i],
+                    key="audit_ctx_event",
+                )
+                if _ev_labels:
+                    _sel = _audit_events[_ev_idx]
+                    st.json(
+                        {
+                            "reason": _sel.get("reason"),
+                            "context": _sel.get("context") or {},
+                        }
+                    )
+    st.divider()
+
     # Ogni agente scrive su agent_<id>.log; agent.log resta per i log legacy.
     log_files = sorted(STATE_DIR.glob("agent*.log"))
     auto_refresh = False
