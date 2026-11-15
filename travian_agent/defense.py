@@ -499,6 +499,7 @@ class DefenseManager:
             settings=settings,
             village=village,
             state=state,
+            villages=villages,
             market_slot=market_slot,
             rally_slot=rally_slot,
             prefix=prefix,
@@ -539,6 +540,7 @@ class DefenseManager:
         settings: Settings,
         village: "Village",
         state: "GameState",
+        villages: list["Village"],
         market_slot: int,
         rally_slot: int,
         prefix: str,
@@ -577,16 +579,20 @@ class DefenseManager:
         # 2) Upgrade piu' costoso accodabile
         await self._emergency_upgrade(browser, village, prefix)
 
-        # 3) Surplus residuo via mercato (opzionale, se configurato)
+        # 3) Evasione risorse via mercato (spec anti-razzia): se il
+        #    surplus supera la capacita' protetta dai Depositi Segreti
+        #    spedisce automaticamente il residuo a un altro villaggio
+        #    dell'account (o alla destinazione drain_target_village).
         cfg = settings.defense
-        if cfg.drain_via_market and market_slot and cfg.drain_target_village:
+        if market_slot:
             await self._drain_via_market(
                 executor=executor,
                 observer=observer,
                 settings=settings,
                 village=village,
+                state=state,
+                villages=villages,
                 market_slot=market_slot,
-                target_name=cfg.drain_target_village,
                 prefix=prefix,
             )
 
@@ -634,12 +640,32 @@ class DefenseManager:
     async def _emergency_upgrade(
         self, browser: "TravianBrowser", village: "Village", prefix: str
     ) -> bool:
-        """Accoda l'upgrade piu' costoso disponibile nel dorf2."""
+        """Accoda l'upgrade piu' costoso disponibile (dorf2, poi dorf1).
+
+        Spec anti-razzia 2: in pre-impatto la priorita' e' spendere —
+        se nessun edificio e' migliorabile si ripiega su un campo
+        risorsa, che comunque converte risorse in struttura.
+        """
         page = browser.page
         if page is None:
             return False
+        for path in (selectors.PATH_DORF2, selectors.PATH_DORF1):
+            if await self._try_click_best_upgrade(
+                page, browser, village, path, prefix
+            ):
+                return True
+        return False
+
+    async def _try_click_best_upgrade(
+        self,
+        page,
+        browser: "TravianBrowser",
+        village: "Village",
+        path: str,
+        prefix: str,
+    ) -> bool:
         try:
-            url = selectors.PATH_DORF2
+            url = path
             if village.village_id:
                 url += f"?newdid={village.village_id}"
             await browser.goto(url)
@@ -684,35 +710,85 @@ class DefenseManager:
         observer: "GameObserver",
         settings: Settings,
         village: "Village",
+        state: "GameState",
+        villages: list["Village"],
         market_slot: int,
-        target_name: str,
         prefix: str,
     ) -> None:
-        """Spedisce il surplus residuo al villaggio sicuro via mercato."""
+        """Spec anti-razzia 3: evasione automatica del surplus non
+        protetto dai Depositi Segreti.
+
+        Solo le risorse che eccedono ``cranny_protected_capacity`` (o il
+        floor minimo ``_DRAIN_KEEP``) vengono spedite — il resto resta
+        al sicuro. Destinazione: ``defense.drain_target_village`` se
+        configurato, altrimenti il villaggio dell'account piu' vicino
+        (alleato fidato). Se non ci sono mercanti liberi l'esecutore
+        rifiuta con BLOCKED, senza danni.
+        """
+        cfg = settings.defense
         try:
-            res = (await observer.read_state()).resources
+            st = await observer.read_state()
+            res = st.resources
+            try:
+                from .builder import cranny_protected_capacity
+
+                protected = cranny_protected_capacity(st, settings)
+            except Exception:  # noqa: BLE001
+                protected = 0
+            floor = max(_DRAIN_KEEP, protected)
             surplus = {
-                "wood": max(0, res.wood - _DRAIN_KEEP),
-                "clay": max(0, res.clay - _DRAIN_KEEP),
-                "iron": max(0, res.iron - _DRAIN_KEEP),
-                "crop": max(0, res.crop - _DRAIN_KEEP),
+                "wood": max(0, res.wood - floor),
+                "clay": max(0, res.clay - floor),
+                "iron": max(0, res.iron - floor),
+                "crop": max(0, res.crop - floor),
             }
             if sum(surplus.values()) <= 0:
                 self._audit_event(
                     "MARKET_DRAIN",
                     "SKIPPED",
-                    "Drain mercato non necessario: surplus nullo",
-                    target=target_name,
+                    f"Surplus coperto dai Depositi Segreti "
+                    f"(protetto {protected}): niente da spedire",
+                    protected_capacity=protected,
                 )
                 return
-            t_cfg = settings.village_config_for(target_name)
+
+            # Destinazione: config esplicita oppure villaggio proprio
+            # piu' vicino con coordinate note.
+            target_name = (cfg.drain_target_village or "").strip()
+            tx = ty = None
+            if target_name:
+                t_cfg = settings.village_config_for(target_name)
+                if t_cfg is not None:
+                    tx, ty = t_cfg.x, t_cfg.y
+            if not target_name or tx is None or ty is None:
+                x, y, host_id = self._resolve_dodge_destination(
+                    settings, village, villages
+                )
+                if x is None or y is None:
+                    self._audit_event(
+                        "MARKET_DRAIN",
+                        "BLOCKED",
+                        "Nessuna destinazione sicura con coordinate "
+                        "note per il drain mercato",
+                        surplus=surplus,
+                    )
+                    return
+                tx, ty = x, y
+                if not target_name:
+                    host = next(
+                        (v for v in villages
+                         if host_id and v.village_id == host_id),
+                        None,
+                    )
+                    target_name = host.name if host else f"{tx}|{ty}"
+
             params: dict = {
                 "market_slot": market_slot,
                 "target_village": target_name,
                 "resources": surplus,
+                "target_x": tx,
+                "target_y": ty,
             }
-            if t_cfg and t_cfg.x is not None and t_cfg.y is not None:
-                params["target_x"], params["target_y"] = t_cfg.x, t_cfg.y
             result = await executor.execute(
                 Action(
                     type=ActionType.SEND_RESOURCES,

@@ -45,16 +45,11 @@ class DecisionMaker(Protocol):
 # Regole deterministiche (ordine = priorita')
 # --------------------------------------------------------------------------
 
-def rule_alert_under_attack(state: GameState, settings: Settings) -> Action | None:
-    """Attacchi in arrivo: per ora notifica soltanto (evasione manuale)."""
-    if state.incoming_attacks > 0:
-        return Action(
-            type=ActionType.ALERT,
-            params={"attacks": state.incoming_attacks},
-            reason=f"{state.incoming_attacks} attacchi in arrivo: verifica manualmente",
-        )
-    return None
-
+# NOTA anti-razzia (spec): nessuna regola 'alert under attack' nel
+# decision tree — un ALERT qui congela il builder su QUALSIASI ondata
+# in arrivo. Sotto attacco il builder deve invece continuare a spendere
+# (la risposta anti-raid e' delegata a defense.py: panic <180s ->
+# resource drain forzato su code/addestramento + drain mercato).
 
 # Livelli massimi noti degli edifici Travian nel dorf2 (default prudente: 20).
 _BUILDING_MAX_LEVEL: dict[int, int] = {
@@ -681,7 +676,6 @@ class RuleBasedBrain:
     """Albero di decisione: prima regola non-None vince."""
 
     DEFAULT_RULES: tuple[Rule, ...] = (
-        rule_alert_under_attack,
         rule_upgrade_storage,
         rule_grain_safety,
         rule_emergency_overflow,

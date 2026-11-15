@@ -495,9 +495,16 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
     return unique
 
 
-# Coppie di edifici mutuamente esclusivi: la presenza di uno rende lo
-# step dell'altro irrealizzabile (Reggia e Castello, spec T4.6).
-_MUTUALLY_EXCLUSIVE_GIDS = ((GID_RESIDENCE, GID_PALACE),)
+# Gruppi di edifici mutuamente esclusivi: la presenza di uno rende lo
+# step degli altri irrealizzabile (spec T4.6):
+# - Residenza (25) <-> Palazzo (26): il gioco rifiuta la costruzione;
+# - Mura (31/32/33): un solo tipo per villaggio, dipende dalla tribu'.
+# NIENTE esclusioni verso Mercato (17) / Accademia (22): sono edifici
+# indipendenti dalla Residenza.
+_MUTUALLY_EXCLUSIVE_GIDS = (
+    (GID_RESIDENCE, GID_PALACE),
+    WALL_GIDS,
+)
 
 
 def focus_skip_reasons(
