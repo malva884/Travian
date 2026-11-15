@@ -25,7 +25,11 @@ from .builder import (
     plan_upgrades,
     save_build_plan,
 )
-from .building_prereqs import GID_SMITHY
+from .building_prereqs import (
+    GID_MAIN_BUILDING,
+    GID_SMITHY,
+    GID_TOWN_HALL,
+)
 from .config import (
     BASE_DIR,
     Settings,
@@ -36,6 +40,7 @@ from .config import (
 from .defense import DefenseManager, PendingReinforce
 from .expansion import (
     ExpansionManager,
+    cropper_store,
     effective_expansion_config,
     feeder_surplus,
     find_market,
@@ -49,7 +54,11 @@ from .models import (
     Field,
     GameState,
     GID_BARRACKS,
+    GID_GRANARY,
+    GID_PALACE,
+    GID_RESIDENCE,
     GID_STABLE,
+    GID_WAREHOUSE,
     GID_WORKSHOP,
     Resources,
     Village,
@@ -57,10 +66,12 @@ from .models import (
 from .presets import (
     detect_tribe_from_keys,
     detect_tribe_from_labels,
+    resolve_role,
     resolve_troop_preset,
 )
 from .replenishment import TroopReplenishmentManager
 from .sensors import GameObserver
+from . import telemetry
 from .war import (
     MAX_WAVES_PER_DISPATCH,
     STATUS_RECLAIMED,
@@ -159,6 +170,188 @@ def _persist_village_coords(
         logger.debug("Persistenza coordinate villaggi fallita", exc_info=True)
 
 
+# Corsa al 15c (spec): gid degli step critici del founder durante il
+# freeze — Palazzo/Residenza (coloni), Magazzino e Granaio (riserve),
+# Palazzo Pubblico (velocizza i lavori).
+_EXPANSION_CRITICAL_GIDS = frozenset({
+    GID_MAIN_BUILDING,
+    GID_WAREHOUSE,
+    GID_GRANARY,
+    GID_RESIDENCE,
+    GID_PALACE,
+})
+
+
+def _expansion_freeze(state: GameState, settings: Settings) -> bool:
+    """True se sul founder vige il congelamento delle spese extra.
+
+    Attivo finche' mancano coloni (<3 a casa) e i Punti Cultura sono
+    pronti oppure la Residenza/Reggia e' gia' alta (>= 8): ogni risorsa
+    deve coprire i coloni e i soli passi critici dell'espansione.
+    """
+    try:
+        if not is_founder_village(state, settings):
+            return False
+        if int(getattr(state, "settlers_home", 0) or 0) >= 3:
+            return False
+        res_lvl = max(
+            (
+                f.level
+                for f in state.interior_fields()
+                if f.gid in (GID_RESIDENCE, GID_PALACE)
+            ),
+            default=0,
+        )
+        cp_ready = (
+            int(getattr(state, "culture_points_required", 0) or 0) > 0
+            and int(getattr(state, "culture_points", 0) or 0)
+            >= int(state.culture_points_required)
+        )
+        return bool(cp_ready or res_lvl >= 8)
+    except Exception:
+        return False
+
+
+def _freeze_demote(state: GameState, action: Action) -> "Action | None":
+    """Declassa a WAIT le spese non critiche durante il freeze.
+
+    Ritorna l'azione sostitutiva oppure None se l'azione e' consentita.
+    Copre: addestramento truppe e upgrade di edifici fuori dagli step
+    critici (Residenza/Palazzo, Magazzino, Granaio, Palazzo Pubblico).
+    """
+    if action.type == ActionType.TRAIN_TROOPS:
+        return Action(
+            type=ActionType.WAIT,
+            params=dict(action.params or {}),
+            reason=(
+                "Freeze espansione: addestramento truppe sospeso "
+                "finche' i 3 coloni non sono pronti"
+            ),
+        )
+    if action.type == ActionType.UPGRADE_FIELD:
+        params = action.params or {}
+        slot_gid = {f.slot_id: f.gid for f in state.fields}
+        gids: set[int] = set()
+        for _slot, _gid in dict(params.get("construct") or {}).items():
+            try:
+                gids.add(int(_gid))
+            except (TypeError, ValueError):
+                continue
+        for _slot in params.get("candidates") or []:
+            try:
+                g = slot_gid.get(int(_slot))
+            except (TypeError, ValueError):
+                g = None
+            if g:
+                gids.add(int(g))
+        if gids and not (gids & _EXPANSION_CRITICAL_GIDS):
+            return Action(
+                type=ActionType.WAIT,
+                params=dict(params),
+                reason=(
+                    "Freeze espansione: solo passi critici "
+                    "(Residenza/Palazzo, Magazzino, Granaio, "
+                    "Palazzo Pubblico)"
+                ),
+            )
+    return None
+
+
+async def _run_manual_commands(
+    settings: Settings,
+    *,
+    executor: ActionExecutor,
+    villages: list[Village],
+    interior_map: dict[str, list[Field]],
+    prefix: str,
+) -> None:
+    """Esegue i comandi rapidi accodati dal Command Center live.
+
+    La coda e' il file ``state/manual_commands_<acc>.json`` scritto da
+    ``POST /api/command``; ogni esecuzione e' tracciata nel Decision
+    Audit Log come ``MANUAL_<AZIONE>``.
+    """
+    try:
+        commands = telemetry.drain_commands(settings.account_id)
+    except Exception:
+        commands = []
+    if not commands:
+        return
+    by_name = {
+        str(v.name or ""): v for v in villages if v.name
+    }
+    by_id = {
+        str(v.village_id): v for v in villages if v.village_id
+    }
+    for cmd in commands:
+        action_name = str(cmd.get("action") or "").upper()
+        vname = str(cmd.get("village_name") or "")
+        params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
+        village = by_name.get(vname) or by_id.get(vname)
+        outcome = DECISION_OUTCOME_SKIPPED
+        reason = ""
+        try:
+            if action_name == "START_CELEBRATION":
+                if village is None:
+                    reason = f"villaggio '{vname}' non trovato"
+                else:
+                    interiors = interior_map.get(village.name or "", [])
+                    town_hall = next(
+                        (f for f in interiors
+                         if f.gid == GID_TOWN_HALL and f.level >= 1),
+                        None,
+                    )
+                    if town_hall is None:
+                        reason = "nessun Municipio (GID 24) nel villaggio"
+                    else:
+                        result = await executor.execute(
+                            Action(
+                                type=ActionType.START_CELEBRATION,
+                                params={
+                                    "town_hall_slot": town_hall.slot_id,
+                                    "kind": str(params.get("kind") or "small"),
+                                },
+                                reason=(
+                                    "Comando manuale Command Center: "
+                                    f"festa in '{village.name}'"
+                                ),
+                            ),
+                            village_id=village.village_id,
+                        )
+                        outcome = (
+                            DECISION_OUTCOME_EXECUTED
+                            if result.success
+                            else DECISION_OUTCOME_BLOCKED
+                        )
+                        reason = result.message or "festa avviata"
+            elif action_name == "FORCE_TICK":
+                outcome = DECISION_OUTCOME_EXECUTED
+                reason = "ciclo forzato dalla dashboard"
+            elif action_name in ("MOVE_HERO", "TRIGGER_DODGE"):
+                reason = (
+                    f"comando '{action_name}' accodato ma non ancora "
+                    "mappato su un'azione esecutiva"
+                )
+            else:
+                reason = f"azione '{action_name}' sconosciuta"
+        except Exception as cmd_exc:
+            outcome = DECISION_OUTCOME_BLOCKED
+            reason = f"esecuzione comando fallita: {cmd_exc}"
+        _record_decision(
+            settings,
+            village=village,
+            module="command_center",
+            decision=f"MANUAL_{action_name}",
+            outcome=outcome,
+            reason=reason or "comando processato",
+            context={"village_name": vname, "params": params},
+        )
+        logger.info(
+            "%s Comando Command Center %s -> %s (%s)",
+            prefix, action_name, outcome, reason,
+        )
+
+
 def _register_founded_villages(
     settings: Settings,
     expansion_mgr: ExpansionManager | None,
@@ -187,7 +380,32 @@ def _register_founded_villages(
         if match is None or not match.village_id:
             continue
         crop_type = str(tile.get("crop_type") or "")
-        is_cropper = crop_type in ("9c", "15c")
+        # Regola 1 (biforcazione bootstrap): crop_fields del tile
+        # fondato — snapshot salvato alla fondazione, poi crop_type,
+        # poi il CropperStore per target scelti a mano.
+        crop_n = 0
+        try:
+            crop_n = int(tile.get("crop_fields") or 0)
+        except (TypeError, ValueError):
+            crop_n = 0
+        if not crop_n:
+            try:
+                crop_n = int(crop_type.rstrip("c") or 0)
+            except (TypeError, ValueError):
+                crop_n = 0
+        if not crop_n:
+            try:
+                for _cand in cropper_store(
+                    settings.account_id
+                ).list_candidates(settings.account_id):
+                    if _cand.x == tx and _cand.y == ty:
+                        crop_n = int(
+                            str(_cand.type or "").rstrip("c") or 0
+                        )
+                        break
+            except Exception:
+                crop_n = 0
+        is_cropper = crop_n >= 9 or crop_type in ("9c", "15c")
         role = "croplog" if is_cropper else "feeder"
         try:
             accounts = load_accounts()
@@ -212,17 +430,82 @@ def _register_founded_villages(
             # solo se il villaggio e' nuovo o ancora 'standard'.
             if cfg.role in ("", "standard"):
                 cfg.role = role
+            # Corsa al 15c (spec): il nuovo cropper diventa la base
+            # d'espansione — ruolo founder + coda prioritaria iniziale
+            # (Main -> Granaio -> Magazzino -> Campi grano -> Mercato).
+            if is_cropper and cfg.role in ("", "standard", "croplog"):
+                cfg.role = "early_cropper_founder"
+            if is_cropper and not cfg.building_queue_plan:
+                cfg.building_queue_plan = [
+                    {"key": "main_building", "target_level": 5, "priority": 1},
+                    {"key": "granary", "target_level": 10, "priority": 2},
+                    {"key": "warehouse", "target_level": 10, "priority": 3},
+                    {"key": "cropland", "target_level": 5, "priority": 4},
+                    {"key": "marketplace", "target_level": 5, "priority": 5},
+                ]
+            # Caso B (biforcazione): villaggio standard — preset edifici
+            # con campi risorsa bilanciati a 5 + Mercato. Il ruolo
+            # resta 'feeder' e founder_village NON viene toccato.
+            if not is_cropper and not cfg.building_queue_plan:
+                cfg.building_queue_plan = [
+                    {"key": "woodcutter", "target_level": 5, "priority": 1},
+                    {"key": "clay_pit", "target_level": 5, "priority": 2},
+                    {"key": "iron_mine", "target_level": 5, "priority": 3},
+                    {"key": "cropland", "target_level": 5, "priority": 4},
+                    {"key": "marketplace", "target_level": 5, "priority": 5},
+                ]
             if match.x is not None:
                 cfg.x = match.x
             if match.y is not None:
                 cfg.y = match.y
+            # Rete feeder (spec): i mercanti vanno subito al nuovo
+            # insediamento; il vecchio founder viene retrocesso a
+            # feeder e, se il founder_village configurato puntava a
+            # lui, la designazione passa al nuovo cropper.
+            founder_cfg_name = str(
+                getattr(acc.expansion, "founder_village", "") or ""
+            ).strip()
+            demoted: list[tuple[str, "VillageConfig"]] = []
+            founder_cfg_hit = False
+            if is_cropper:
+                for _k2, _c2 in acc.villages.items():
+                    if _c2 is cfg:
+                        continue
+                    _hit = bool(
+                        founder_cfg_name
+                        and (
+                            (_c2.name or "") == founder_cfg_name
+                            or str(_k2) == founder_cfg_name
+                        )
+                    )
+                    if _hit:
+                        founder_cfg_hit = True
+                    if (
+                        resolve_role(_c2.role or "")
+                        == "early_cropper_founder"
+                        or _hit
+                    ):
+                        if _c2.role != "feeder":
+                            _c2.role = "feeder"
+                        demoted.append((_k2, _c2))
+                if not founder_cfg_name or founder_cfg_hit:
+                    acc.expansion.founder_village = cfg.name
+                    settings.expansion.founder_village = cfg.name
+                expansion_mgr.feed_target = cfg.name
             save_accounts(accounts)
             # Riflette la registrazione anche nelle settings live: il
             # ciclo corrente usa gia' il profilo bootstrap.
             settings.villages[key_id] = VillageConfig(
                 name=cfg.name, role=cfg.role, is_bootstrap=True,
                 x=cfg.x, y=cfg.y,
+                building_queue_plan=list(cfg.building_queue_plan or []),
             )
+            for _k3, _c3 in demoted:
+                _live_c = settings.villages.get(_k3) or (
+                    settings.villages.get(_c3.name) if _c3.name else None
+                )
+                if _live_c is not None:
+                    _live_c.role = "feeder"
             tile["registered"] = True
             tile["village_id"] = match.village_id
             changed_mgr = True
@@ -230,6 +513,25 @@ def _register_founded_villages(
             if bt and bt.get("x") == tx and bt.get("y") == ty:
                 bt["village_id"] = match.village_id
                 bt["name"] = match.name or cfg.name
+            if is_cropper:
+                _record_decision(
+                    settings,
+                    village=match,
+                    module="expansion",
+                    decision="NEW_VILLAGE_BOOTSTRAP",
+                    outcome=DECISION_OUTCOME_EXECUTED,
+                    reason=(
+                        f"Nuovo {crop_type} rilevato a ({tx}|{ty}): "
+                        "rete feeder reindirizzata sul nuovo villaggio"
+                    ),
+                    context={
+                        "x": tx, "y": ty,
+                        "village": cfg.name,
+                        "role": cfg.role,
+                        "demoted": [c.name or k for k, c in demoted],
+                        "feed_target": cfg.name,
+                    },
+                )
             logger.info(
                 "[%s] Bootstrap: nuovo villaggio '%s' (newdid=%d, %s) "
                 "registrato con ruolo '%s' e is_bootstrap=True.",
@@ -276,7 +578,25 @@ def _complete_bootstrap(
                     and bt.get("y") == village.y)
             ):
                 expansion_mgr.bootstrap_target = {}
-                expansion_mgr._save()
+            # Biforcazione bootstrap (regola 3): concluso l'avvio del
+            # villaggio, il feed_target torna sul founder designato
+            # (il 15c) se era ancora puntato sul villaggio appena
+            # completato.
+            founder_set = str(
+                settings.expansion.founder_village or ""
+            ).strip()
+            if expansion_mgr.feed_target and expansion_mgr.feed_target in {
+                str(village.name or ""),
+                str(village.village_id or ""),
+            }:
+                expansion_mgr.feed_target = founder_set
+                logger.info(
+                    "[%s] Bootstrap chiuso: feed_target ripristinato "
+                    "su '%s'.",
+                    settings.account_id,
+                    founder_set or "(vuoto)",
+                )
+            expansion_mgr._save()
         logger.info(
             "[%s] Bootstrap completato per '%s': passaggio al ruolo assegnato.",
             settings.account_id, village.name or village.village_id,
@@ -1495,6 +1815,22 @@ async def monitor_all_villages(
 
             action = brain.decide(state)
 
+            # Corsa al 15c — Congelamento spese non-espansione (spec):
+            # sul founder con coloni < 3 e CP pronti (o Reggia >= 8)
+            # solo Palazzo/Residenza, Magazzino, Granaio e Palazzo
+            # Pubblico possono consumare risorse; truppe e altri
+            # edifici vengono declassati a WAIT.
+            try:
+                if _expansion_freeze(state, settings):
+                    _frozen = _freeze_demote(state, action)
+                    if _frozen is not None:
+                        logger.debug(
+                            "%s %s", vprefix, _frozen.reason
+                        )
+                        action = _frozen
+            except Exception:
+                logger.debug("%s Freeze espansione ignorato", vprefix)
+
             # Smart Building planner: persiste i prossimi upgrade stimati
             # per la preview in dashboard (state/build_plan_<account>.json).
             try:
@@ -2030,6 +2366,11 @@ async def monitor_all_villages(
                             deficit, state, settings, village_name=vname,
                             reserve_settlers=reserve_settlers,
                         )
+                        # Freeze espansione (spec Corsa 15c): niente
+                        # addestramento truppe sul founder finche' i 3
+                        # coloni non sono completi.
+                        if _expansion_freeze(state, settings):
+                            plan = {}
                         if plan and trainer_slots_rep:
                             rep_action = Action(
                                 type=ActionType.TRAIN_TROOPS,
@@ -2483,6 +2824,21 @@ async def monitor_all_villages(
             )
             continue
 
+    # 2.9 Comandi rapidi del Command Center live: eseguiti dopo il giro
+    # dei villaggi, quando interior_map e' completa per tutti i villaggi.
+    try:
+        await _run_manual_commands(
+            settings,
+            executor=executor,
+            villages=villages,
+            interior_map=interior_map,
+            prefix=prefix,
+        )
+    except Exception as cmd_exc:
+        logger.debug(
+            "%s Comandi Command Center ignorati: %s", prefix, cmd_exc
+        )
+
     # 3. Step espansione account-level: coloni/CP/target dopo il giro
     if expansion_mgr is not None:
         try:
@@ -2498,6 +2854,11 @@ async def monitor_all_villages(
             )
         except Exception as e_exc:
             logger.warning("%s Errore modulo espansione: %s", prefix, e_exc)
+        _flush_module_audits(
+            settings,
+            module="expansion",
+            managers=(expansion_mgr,),
+        )
 
     # 3.1 Modulo eroe: cura, avventure, attributi (account-level, con cooldown)
     if hero_mgr is not None and settings.hero.enabled:
@@ -2518,6 +2879,22 @@ async def monitor_all_villages(
             )
         except Exception as p_exc:
             logger.debug("%s Errore Global Power Assessment: %s", prefix, p_exc)
+
+    # 5. Telemetria Command Center: snapshot JSON del ciclo appena
+    # concluso (letto da GET /api/dashboard-state).
+    try:
+        telemetry.export_dashboard_state(
+            settings,
+            villages=villages,
+            states_by_village=states_by_village,
+            expansion_mgr=expansion_mgr,
+            hero_mgr=hero_mgr,
+        )
+    except Exception as tele_exc:
+        logger.warning(
+            "%s Snapshot telemetria non scritto: %s", prefix, tele_exc,
+            exc_info=True,
+        )
 
     logger.debug("%s Tutti i %d villaggi processati.", prefix, len(villages))
 
@@ -2678,7 +3055,21 @@ async def run_single_account_loop(
                     settings.loop_interval_min, settings.loop_interval_max
                 )
                 logger.info("%s Prossimo ciclo tra %.0fs", prefix, interval)
-                await asyncio.sleep(interval)
+                # Attesa a chunk: il flag FORCE_TICK (POST /api/command dal
+                # Command Center) interrompe l'attesa e forza il ciclo.
+                _tick_flag = telemetry.force_tick_path(settings.account_id)
+                _waited = 0.0
+                while _waited < interval:
+                    if _tick_flag.exists():
+                        _tick_flag.unlink(missing_ok=True)
+                        logger.info(
+                            "%s FORCE_TICK: ciclo anticipato dalla dashboard.",
+                            prefix,
+                        )
+                        break
+                    _step = min(5.0, interval - _waited)
+                    await asyncio.sleep(_step)
+                    _waited += _step
 
             except asyncio.CancelledError:
                 logger.info("%s Ciclo interrotto (cancellazione ricevuta).", prefix)

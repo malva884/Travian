@@ -151,6 +151,15 @@ async def main() -> int:
     # DB centrale: schema + migrazione una-tantum dei JSON legacy in state/
     db.init_db()
 
+    # Command Center live: GET /api/dashboard-state + POST /api/command.
+    # Se la dashboard Streamlit ha gia' avviato il server il bind fallisce
+    # e viene ignorato: vale il primo processo che si e' assicurato la porta.
+    try:
+        from travian_agent.command_server import start_command_server
+        start_command_server()
+    except Exception:
+        logger.debug("Command Center server non avviato", exc_info=True)
+
     accounts = load_accounts()
     if not accounts:
         try:

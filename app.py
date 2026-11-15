@@ -68,6 +68,15 @@ st.set_page_config(
 
 ui.inject_theme()
 
+# Command Center live: mini server HTTP con telemetria e comandi rapidi
+# (GET /api/dashboard-state, POST /api/command, /command-center/).
+# Idempotente: rerun Streamlit e processi multipli non duplicano il bind.
+try:
+    from travian_agent.command_server import start_command_server
+    start_command_server()
+except Exception:
+    pass
+
 STATE_DIR = BASE_DIR / "state"
 DEBUG_DIR = BASE_DIR / "debug"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -649,6 +658,12 @@ with st.sidebar:
 
     # Navigazione a gruppi (layout console)
     page = _sidebar_nav()
+
+    st.link_button(
+        "🎯 Command Center (Live)",
+        "http://localhost:8610/command-center/",
+        use_container_width=True,
+    )
 
     st.divider()
     ui.section("Account")

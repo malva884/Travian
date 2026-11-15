@@ -91,7 +91,7 @@ _CRANNY_TARGET_DEFAULT = 2000   # altri ruoli (2 depositi al 10)
 # appena fondato prima di passare al ruolo assegnato.
 BOOTSTRAP_STORAGE_LEVEL = 5   # magazzino + granaio >= 5
 BOOTSTRAP_MAIN_LEVEL = 5      # Edificio Principale >= 5
-BOOTSTRAP_FIELD_LEVEL = 3     # tutti i campi risorsa >= 3
+BOOTSTRAP_FIELD_LEVEL = 5     # tutti i campi risorsa >= 5 (spec biforcazione)
 
 # Ruolo -> gid interni sviluppati in modo bilanciato (livello minimo prima).
 _ROLE_INTERIORS: dict[str, tuple[int, ...]] = {

@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Travian Command Center // Live Tactical HUD</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #060913;
+      --bg-panel: rgba(13, 20, 38, 0.86);
+      --border-glow: rgba(56, 189, 248, 0.24);
+      --gold: #f59e0b;
+      --cyan: #38bdf8;
+      --emerald: #10b981;
+      --crimson: #ef4444;
+    }
+    body {
+      background-color: var(--bg-base);
+      background-image:
+        radial-gradient(circle at 15% 15%, rgba(56, 189, 248, 0.08), transparent 35%),
+        radial-gradient(circle at 85% 80%, rgba(245, 158, 11, 0.07), transparent 40%),
+        linear-gradient(rgba(30, 41, 59, 0.25) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(30, 41, 59, 0.25) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 36px 36px, 36px 36px;
+      color: #e2e8f0;
+      font-family: 'Inter', sans-serif;
+    }
+    .font-display { font-family: 'Cinzel', serif; }
+    .font-mono-tech { font-family: 'JetBrains Mono', monospace; }
+    .hud-panel {
+      background: var(--bg-panel);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-glow);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+      border-radius: 12px;
+    }
+    .hud-panel-gold {
+      border-color: rgba(245, 158, 11, 0.35);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 20px rgba(245, 158, 11, 0.08);
+    }
+    .hud-panel-alert {
+      border-color: rgba(239, 68, 68, 0.65);
+      box-shadow: 0 0 25px rgba(239, 68, 68, 0.25);
+      animation: alertPulse 1.8s infinite;
+    }
+    @keyframes alertPulse {
+      0%, 100% { border-color: rgba(239, 68, 68, 0.8); }
+      50% { border-color: rgba(239, 68, 68, 0.25); }
+    }
+    @keyframes dashFlow {
+      to { stroke-dashoffset: -36; }
+    }
+    .route-merchant {
+      stroke-dasharray: 6 6;
+      animation: dashFlow 1.4s linear infinite;
+    }
+    .route-target {
+      stroke-dasharray: 4 6;
+      animation: dashFlow 2.6s linear infinite;
+    }
+    @keyframes radarSweep {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .radar-sweep {
+      transform-origin: 210px 155px;
+      animation: radarSweep 9s linear infinite;
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #090e1c; }
+    ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #38bdf8; }
+  </style>
+</head>
+<body class="min-h-screen p-4 lg:p-6">
+
+  <!-- TOP COMMAND BAR -->
+  <header class="hud-panel px-5 py-3.5 mb-5 flex flex-wrap items-center justify-between gap-4">
+    <div class="flex items-center gap-3.5">
+      <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-amber-500/20 to-sky-500/20 border border-amber-400/40 flex items-center justify-center text-amber-400 font-bold text-lg shadow-lg">
+        ⚔️
+      </div>
+      <div>
+        <div class="flex items-center gap-2.5">
+          <h1 class="font-display text-lg md:text-xl font-bold tracking-wider text-white">TRAVIAN COMMAND CENTER</h1>
+          <span id="connBadge" class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-mono-tech font-semibold bg-slate-700/40 text-slate-300 border border-slate-600">
+            <span id="connDot" class="w-2 h-2 rounded-full bg-slate-400"></span>
+            OFFLINE
+          </span>
+        </div>
+        <p class="text-xs text-slate-400 font-mono-tech mt-0.5">
+          Server: <span id="accountName" class="text-slate-200 font-semibold">—</span> ·
+          Ultimo sync: <span id="lastSyncTime" class="text-sky-400">--:--:--</span>
+        </p>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-3">
+      <button onclick="sendCommand('FORCE_TICK', '')" class="px-4 py-2 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 text-xs font-mono-tech font-semibold transition flex items-center gap-2 shadow-md">
+        <span>⚡</span> Forza Ciclo Ora
+      </button>
+    </div>
+  </header>
+
+  <!-- ROW 1: ACCOUNT & CP | HERO STATUS | EXPANSION TARGETS -->
+  <section class="grid grid-cols-1 lg:grid-cols-12 gap-5 mb-5">
+
+    <!-- ACCOUNT & CULTURE POINTS -->
+    <div class="hud-panel p-5 lg:col-span-4 flex flex-col justify-between">
+      <div>
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-xs font-mono-tech uppercase tracking-widest text-sky-400 font-semibold">Account & Espansione</span>
+          <span id="raceBadge" class="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[11px] font-mono-tech">CORSA 15c</span>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-4">
+          <div class="bg-slate-900/70 border border-slate-800 rounded-lg p-3">
+            <div class="text-[11px] text-slate-400 uppercase font-mono-tech">Villaggio Founder</div>
+            <div id="founderName" class="text-base font-bold text-amber-400 mt-0.5">—</div>
+            <div id="founderCoords" class="text-xs font-mono-tech text-slate-400">(—|—)</div>
+          </div>
+          <div class="bg-slate-900/70 border border-slate-800 rounded-lg p-3">
+            <div class="text-[11px] text-slate-400 uppercase font-mono-tech">Rete Feeder Attiva</div>
+            <div id="feedTargetName" class="text-base font-bold text-emerald-400 mt-0.5">→ —</div>
+            <div id="activeFeedersCount" class="text-xs font-mono-tech text-slate-400">— villaggi feeder</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CULTURE POINTS BAR -->
+      <div class="bg-slate-900/80 border border-slate-800 rounded-lg p-3.5">
+        <div class="flex items-center justify-between text-xs font-mono-tech mb-1.5">
+          <span class="text-slate-300 font-semibold">Punti Cultura</span>
+          <span id="cpValues" class="text-amber-300 font-bold">0 / 0 (+0/g)</span>
+        </div>
+        <div class="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
+          <div id="cpBar" class="h-full bg-gradient-to-r from-amber-500 to-emerald-400 transition-all duration-500" style="width: 0%"></div>
+        </div>
+        <div class="flex justify-between items-center mt-2 text-[11px] text-slate-400 font-mono-tech">
+          <span id="cpEta">In attesa telemetria CP...</span>
+          <button id="cpPartyBtn" onclick="sendCommand('START_CELEBRATION', state.account.founder_village || '')" class="text-sky-400 hover:text-sky-300 underline">
+            + Festa Municipio
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- HERO STATUS -->
+    <div class="hud-panel p-5 lg:col-span-4 flex flex-col justify-between">
+      <div>
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-xs font-mono-tech uppercase tracking-widest text-sky-400 font-semibold">Stato Eroe</span>
+          <span id="heroStatusBadge" class="px-2 py-0.5 rounded bg-slate-800 text-slate-300 text-[11px] font-mono-tech">UNKNOWN</span>
+        </div>
+
+        <div class="flex items-center gap-4 mb-4">
+          <div class="w-16 h-16 rounded-xl bg-gradient-to-b from-slate-800 to-slate-950 border border-amber-500/40 flex flex-col items-center justify-center shrink-0">
+            <span id="heroLevel" class="text-2xl font-bold text-amber-400 font-mono-tech">0</span>
+            <span class="text-[9px] font-mono-tech tracking-widest text-slate-400">LIVELLO</span>
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="flex justify-between items-center">
+              <h3 id="heroName" class="font-bold text-white truncate">Eroe</h3>
+              <span id="heroHealthText" class="text-xs font-mono-tech text-emerald-400 font-bold">0% HP</span>
+            </div>
+            <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden mt-1.5 mb-2">
+              <div id="heroHealthBar" class="h-full bg-emerald-500 transition-all duration-500" style="width: 0%"></div>
+            </div>
+            <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs font-mono-tech text-slate-300">
+              <span>📍 Villaggio: <strong id="heroVillage" class="text-sky-300">—</strong></span>
+              <span>🗺️ Avventure: <strong id="heroAdventures" class="text-amber-300">0</strong></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="bg-slate-900/80 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-xs font-mono-tech">
+        <div>
+          <span class="text-slate-400">Bonus Risorse Eroe:</span>
+          <span id="heroBonus" class="text-emerald-400 font-semibold ml-1">+0/h</span>
+        </div>
+        <button onclick="sendCommand('MOVE_HERO', state.account.founder_village || '')" class="px-2.5 py-1 rounded bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-500/30 transition">
+          Richiama su Founder
+        </button>
+      </div>
+    </div>
+
+    <!-- EXPANSION TARGETS -->
+    <div class="hud-panel p-5 lg:col-span-4 flex flex-col justify-between">
+      <div>
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-xs font-mono-tech uppercase tracking-widest text-sky-400 font-semibold">Target Espansione (Priorità)</span>
+          <span id="targetWarningBadge" class="hidden px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] font-mono-tech">
+            ⚠️ 6c prima del 9c
+          </span>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="w-full text-left font-mono-tech text-xs">
+            <thead>
+              <tr class="text-slate-400 border-b border-slate-800 text-[11px]">
+                <th class="pb-2">#</th>
+                <th class="pb-2">COORD</th>
+                <th class="pb-2">TIPO</th>
+                <th class="pb-2">BONUS</th>
+                <th class="pb-2 text-right">STATO</th>
+              </tr>
+            </thead>
+            <tbody id="targetsTableBody" class="divide-y divide-slate-800/60">
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="mt-3 pt-2 border-t border-slate-800/80 flex justify-between items-center text-[11px] font-mono-tech text-slate-400">
+        <span>Fallback automatico attivo</span>
+        <span id="primaryTargetDist" class="text-amber-400">Target #1: —</span>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ROW 2: TACTICAL RADAR MAP + VILLAGES LIVE GRID -->
+  <section class="grid grid-cols-1 xl:grid-cols-12 gap-5 mb-5">
+
+    <!-- RADAR SVG LOGISTICO -->
+    <div class="hud-panel p-5 xl:col-span-4 flex flex-col justify-between">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs font-mono-tech uppercase tracking-widest text-sky-400 font-semibold">Radar Logistico & Rotte</span>
+        <span id="radarSector" class="text-[11px] font-mono-tech text-slate-400">Settore (—|—)</span>
+      </div>
+
+      <div class="relative w-full bg-slate-950/90 border border-slate-800/90 rounded-xl overflow-hidden flex items-center justify-center my-1">
+        <svg id="radarSvg" viewBox="0 0 420 310" class="w-full h-auto">
+          <defs>
+            <linearGradient id="radarGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.6" />
+              <stop offset="100%" stop-color="#38bdf8" stop-opacity="0" />
+            </linearGradient>
+          </defs>
+          <!-- Cerchi + assi -->
+          <circle cx="210" cy="155" r="45" fill="none" stroke="rgba(56,189,248,0.12)" />
+          <circle cx="210" cy="155" r="90" fill="none" stroke="rgba(56,189,248,0.12)" />
+          <circle cx="210" cy="155" r="135" fill="none" stroke="rgba(56,189,248,0.12)" />
+          <line x1="210" y1="10" x2="210" y2="300" stroke="rgba(56,189,248,0.08)" />
+          <line x1="20" y1="155" x2="400" y2="155" stroke="rgba(56,189,248,0.08)" />
+          <!-- Raggio scanner -->
+          <g class="radar-sweep">
+            <path d="M210,155 L210,20 A135,135 0 0,1 325,85 Z" fill="url(#radarGrad)" opacity="0.25" />
+          </g>
+          <!-- Layer dinamico: rotte + nodi -->
+          <g id="radarDynamic"></g>
+        </svg>
+      </div>
+
+      <div class="flex items-center justify-between text-[11px] font-mono-tech text-slate-400 mt-1">
+        <span class="flex items-center gap-1.5"><span class="w-2.5 h-0.5 bg-emerald-400 inline-block"></span> Flusso Mercanti</span>
+        <span class="flex items-center gap-1.5"><span class="w-2.5 h-0.5 bg-amber-400 inline-block"></span> Rotta Coloni</span>
+      </div>
+    </div>
+
+    <!-- GRIGLIA SCHEDE VILLAGGI LIVE -->
+    <div id="villagesGrid" class="xl:col-span-8 grid grid-cols-1 md:grid-cols-2 gap-4">
+    </div>
+
+  </section>
+
+  <!-- ROW 3: DECISION AUDIT LOG -->
+  <section class="hud-panel p-5">
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+      <div class="flex items-center gap-2.5">
+        <span class="text-xs font-mono-tech uppercase tracking-widest text-sky-400 font-semibold">Decision Audit Log</span>
+        <span id="logCountBadge" class="px-2 py-0.5 rounded bg-slate-800 text-slate-300 text-[11px] font-mono-tech">0 eventi</span>
+      </div>
+
+      <div class="flex items-center gap-2 text-xs font-mono-tech">
+        <select id="logFilterVillage" onchange="renderLogs()" class="bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-slate-200">
+          <option value="ALL">Tutti i villaggi</option>
+        </select>
+        <select id="logFilterModule" onchange="renderLogs()" class="bg-slate-900 border border-slate-700 rounded px-2.5 py-1 text-slate-200">
+          <option value="ALL">Tutti i moduli</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="auditLogContainer" class="max-h-72 overflow-y-auto divide-y divide-slate-800/70 font-mono-tech text-xs">
+    </div>
+  </section>
+
+  <script>
+    // Fallback minimo: sovrascritto dal primo fetch su /api/dashboard-state.
+    // connBadge resta OFFLINE finche' non arriva un payload reale.
+    let state = {
+      account: {
+        name: "",
+        founder_village: "",
+        feed_target: "",
+        cp_current: 0,
+        cp_required: 0,
+        cp_daily_production: 0,
+        expansion_targets: []
+      },
+      hero: {
+        name: "Eroe", level: 0, health: 0, status: "UNKNOWN",
+        current_village: "—", adventures: 0, resource_bonus_per_hour: 0
+      },
+      villages: [],
+      audit_logs: []
+    };
+    let accountId = "";
+    const POLL_MS = 4000;
+
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"]/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    }
+    function formatTime(sec) {
+      if (!sec || sec <= 0) return "Pronto";
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      return `${h > 0 ? h + 'h ' : ''}${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+    }
+    function fmtNum(n) { return Math.floor(n || 0).toLocaleString('it-IT'); }
+
+    function setConn(mode) {
+      const b = document.getElementById('connBadge');
+      const d = document.getElementById('connDot');
+      if (mode === 'live') {
+        b.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-mono-tech font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30';
+        d.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-ping';
+        b.childNodes[2].textContent = ' LIVE SYNC';
+      } else if (mode === 'wait') {
+        b.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-mono-tech font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30';
+        d.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
+        b.childNodes[2].textContent = ' WAITING CYCLE';
+      } else {
+        b.className = 'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-mono-tech font-semibold bg-rose-500/15 text-rose-400 border border-rose-500/30';
+        d.className = 'w-2 h-2 rounded-full bg-rose-400';
+        b.childNodes[2].textContent = ' OFFLINE';
+      }
+    }
+
+    // ---------- RADAR DINAMICO ----------
+    const NS = 'http://www.w3.org/2000/svg';
+    const RC = { x: 210, y: 155 };           // centro radar nel viewBox
+    const R_MAX = 118;                        // raggio max nodi
+
+    function svgEl(tag, attrs, parent) {
+      const el = document.createElementNS(NS, tag);
+      for (const k in attrs) el.setAttribute(k, attrs[k]);
+      if (parent) parent.appendChild(el);
+      return el;
+    }
+
+    function renderRadar() {
+      const layer = document.getElementById('radarDynamic');
+      layer.innerHTML = '';
+
+      const villages = (state.villages || []).filter(v => v.x !== null && v.x !== undefined);
+      const targets = (state.account?.expansion_targets || [])
+        .filter(t => t.x !== null && t.x !== undefined);
+      if (!villages.length && !targets.length) {
+        const t = svgEl('text', {
+          x: RC.x, y: RC.y, fill: '#64748b', 'font-size': 11,
+          'font-family': 'JetBrains Mono', 'text-anchor': 'middle'
+        }, layer);
+        t.textContent = 'coordinate non disponibili';
+        return;
+      }
+
+      // Bounding box villaggi + target → scala in raggio R_MAX
+      const pts = villages.concat(targets);
+      const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+      const minX = Math.min(...xs) - 2, maxX = Math.max(...xs) + 2;
+      const minY = Math.min(...ys) - 2, maxY = Math.max(...ys) + 2;
+      const scale = (2 * R_MAX) / Math.max(maxX - minX, maxY - minY, 6);
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+      const P = p => [RC.x + (p.x - cx) * scale, RC.y - (p.y - cy) * scale];
+
+      const feedName = state.account?.feed_target || state.account?.founder_village;
+      const feedV = villages.find(v => v.name === feedName) || villages[0];
+      const [fx, fy] = feedV ? P(feedV) : [RC.x, RC.y];
+
+      // Rotte mercanti: ogni villaggio -> feed target
+      for (const v of villages) {
+        if (v === feedV) continue;
+        const [vx, vy] = P(v);
+        svgEl('line', {
+          x1: vx, y1: vy, x2: fx, y2: fy,
+          stroke: '#10b981', 'stroke-width': 2, class: 'route-merchant'
+        }, layer);
+      }
+
+      // Rotta coloni: feed target -> target primario (lista gia' ordinata)
+      const primary = targets[0];
+      if (feedV && primary) {
+        const [tx, ty] = P(primary);
+        svgEl('line', {
+          x1: fx, y1: fy, x2: tx, y2: ty,
+          stroke: '#f59e0b', 'stroke-width': 2, class: 'route-target'
+        }, layer);
+      }
+
+      // Nodi target espansione
+      for (const t of targets.slice(0, 4)) {
+        const [tx, ty] = P(t);
+        const g = svgEl('g', { transform: `translate(${tx},${ty})` }, layer);
+        const col = t.below_min ? '#ef4444' : '#f59e0b';
+        svgEl('circle', {
+          r: 11, fill: 'rgba(245,158,11,0.18)', stroke: col,
+          'stroke-width': 1.5, 'stroke-dasharray': '3 2'
+        }, g);
+        svgEl('circle', { r: 4, fill: col }, g);
+        const l1 = svgEl('text', {
+          x: 0, y: -15, 'text-anchor': 'middle', fill: col,
+          'font-size': 10, 'font-family': 'JetBrains Mono', 'font-weight': 'bold'
+        }, g);
+        l1.textContent = 'TARGET ' + (t.type || '');
+        const l2 = svgEl('text', {
+          x: 0, y: 21, 'text-anchor': 'middle', fill: '#94a3b8',
+          'font-size': 9, 'font-family': 'JetBrains Mono'
+        }, g);
+        l2.textContent = `(${t.x}|${t.y})`;
+      }
+
+      // Nodi villaggi
+      const founderName = state.account?.founder_village;
+      for (const v of villages) {
+        const [vx, vy] = P(v);
+        const g = svgEl('g', { transform: `translate(${vx},${vy})` }, layer);
+        const isFounder = v === feedV || v.name === founderName;
+        const underAttack = (v.incoming_attacks || []).length > 0;
+        if (isFounder) {
+          svgEl('circle', { r: 15, fill: 'rgba(245,158,11,0.22)' }, g);
+          svgEl('circle', { r: 9, fill: '#f59e0b', stroke: '#fff', 'stroke-width': 1.5 }, g);
+        } else {
+          svgEl('circle', {
+            r: 7, fill: '#0f172a', stroke: underAttack ? '#ef4444' : '#38bdf8',
+            'stroke-width': 2
+          }, g);
+          if (underAttack) {
+            svgEl('circle', {
+              r: 11, fill: 'none', stroke: '#ef4444',
+              'stroke-width': 1, 'stroke-dasharray': '2 2'
+            }, g);
+          }
+        }
+        const name = svgEl('text', {
+          x: 0, y: isFounder ? -18 : -12, 'text-anchor': 'middle',
+          fill: isFounder ? '#ffffff' : '#e2e8f0', 'font-size': isFounder ? 11 : 10,
+          'font-family': 'JetBrains Mono',
+          'font-weight': isFounder ? 'bold' : 'normal'
+        }, g);
+        name.textContent = String(v.name || '').toUpperCase() + (isFounder ? ' (FOUNDER)' : '');
+        const role = svgEl('text', {
+          x: 0, y: isFounder ? 23 : 17, 'text-anchor': 'middle',
+          fill: isFounder ? '#fbbf24' : '#10b981', 'font-size': isFounder ? 9 : 8,
+          'font-family': 'JetBrains Mono'
+        }, g);
+        role.textContent = isFounder
+          ? `(${v.x}|${v.y})`
+          : String(v.role || 'standard').toUpperCase();
+      }
+    }
+
+    // ---------- RENDER ----------
+    function renderAccountAndHero() {
+      const acc = state.account || {};
+      document.getElementById('accountName').textContent =
+        accountId || acc.name || "—";
+
+      const founderV = (state.villages || [])
+        .find(v => v.name === acc.founder_village);
+      document.getElementById('founderName').textContent =
+        acc.founder_village || "—";
+      document.getElementById('founderCoords').textContent = founderV
+        ? `(${founderV.x}|${founderV.y})` : "(—|—)";
+      document.getElementById('feedTargetName').textContent =
+        `→ ${acc.feed_target || acc.founder_village || "—"}`;
+
+      const feeders = (state.villages || [])
+        .filter(v => /feed/i.test(String(v.role || ''))).length;
+      document.getElementById('activeFeedersCount').textContent =
+        `${feeders} villaggi feeder`;
+
+      const sector = document.getElementById('radarSector');
+      sector.textContent = founderV
+        ? `Settore (${founderV.x}|${founderV.y})` : 'Settore (—|—)';
+
+      const cpCur = acc.cp_current || 0;
+      const cpReq = acc.cp_required || 0;
+      const cpProd = acc.cp_daily_production || 0;
+      const cpPct = cpReq > 0 ? Math.min(100, Math.round((cpCur / cpReq) * 100)) : 0;
+
+      document.getElementById('cpValues').textContent =
+        `${fmtNum(cpCur)} / ${fmtNum(cpReq)} (+${fmtNum(cpProd)}/g)`;
+      document.getElementById('cpBar').style.width = `${cpPct}%`;
+      if (cpReq > 0 && cpCur < cpReq && cpProd > 0) {
+        const hoursLeft = Math.ceil(((cpReq - cpCur) / cpProd) * 24);
+        document.getElementById('cpEta').textContent =
+          `Mancano ${fmtNum(cpReq - cpCur)} CP (~${hoursLeft}h)`;
+      } else if (cpReq > 0 && cpCur >= cpReq) {
+        document.getElementById('cpEta').textContent =
+          "✅ Slot Punti Cultura sbloccato!";
+      } else {
+        document.getElementById('cpEta').textContent =
+          "In attesa dati CP da sensors.py";
+      }
+
+      // Hero (adventures / adventures_available)
+      const hero = state.hero || {};
+      const adv = hero.adventures_available ?? hero.adventures ?? 0;
+      document.getElementById('heroLevel').textContent = hero.level ?? 0;
+      document.getElementById('heroName').textContent = hero.name || "Eroe";
+      document.getElementById('heroStatusBadge').textContent =
+        hero.status || "UNKNOWN";
+      document.getElementById('heroHealthText').textContent =
+        `${hero.health ?? 0}% HP`;
+      document.getElementById('heroHealthBar').style.width =
+        `${hero.health ?? 0}%`;
+      document.getElementById('heroVillage').textContent =
+        hero.current_village || "—";
+      document.getElementById('heroAdventures').textContent = adv;
+      document.getElementById('heroBonus').textContent =
+        `+${fmtNum(hero.resource_bonus_per_hour || 0)}/h`;
+
+      // Targets (gia' ordinati crop desc dal backend; warning se 6c prima di 9c+)
+      const targets = acc.expansion_targets || [];
+      const tbody = document.getElementById('targetsTableBody');
+      let saw6cBefore9c = false, saw6c = false;
+
+      tbody.innerHTML = targets.map((t, idx) => {
+        if (t.type === "6c") saw6c = true;
+        if ((t.type === "9c" || t.type === "15c") && saw6c) saw6cBefore9c = true;
+        const badgeColor = t.below_min
+          ? "bg-rose-500/15 text-rose-400 border-rose-500/40"
+          : t.type === "15c"
+            ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
+            : t.type === "9c"
+              ? "bg-sky-500/20 text-sky-300 border-sky-500/40"
+              : "bg-slate-800 text-slate-400 border-slate-700";
+        return `
+          <tr class="hover:bg-slate-800/40">
+            <td class="py-1.5 text-slate-500">${idx + 1}</td>
+            <td class="py-1.5 font-semibold text-slate-200">(${t.x}|${t.y})</td>
+            <td class="py-1.5"><span class="px-1.5 py-0.5 rounded border text-[10px] ${badgeColor}">${esc(t.type)}</span></td>
+            <td class="py-1.5 text-slate-400">${esc(t.bonus || "—")}</td>
+            <td class="py-1.5 text-right text-emerald-400 font-semibold">${esc(t.status || "FREE")}</td>
+          </tr>`;
+      }).join('');
+
+      document.getElementById('targetWarningBadge')
+        .classList.toggle('hidden', !saw6cBefore9c);
+      document.getElementById('primaryTargetDist').textContent = targets.length
+        ? `Target #1: (${targets[0].x}|${targets[0].y}) [${targets[0].type}]`
+        : 'Target #1: —';
+    }
+
+    function renderVillages() {
+      const grid = document.getElementById('villagesGrid');
+      const villages = state.villages || [];
+      if (!villages.length) {
+        grid.innerHTML = `<div class="hud-panel p-6 md:col-span-2 text-center text-slate-500 font-mono-tech text-xs">
+          in attesa del primo snapshot dell'agente…</div>`;
+        return;
+      }
+      grid.innerHTML = villages.map(v => {
+        const isFounder = v.name === state.account.founder_village
+          || /founder|cropper/i.test(String(v.role || ''));
+        const hasAttack = (v.incoming_attacks || []).length > 0;
+        const cardClass = hasAttack
+          ? "hud-panel hud-panel-alert"
+          : isFounder ? "hud-panel hud-panel-gold" : "hud-panel";
+        const r = v.resources || {};
+        const wCap = r.warehouse_cap || 0;
+        const gCap = r.granary_cap || 0;
+
+        const bQueue = (v.building_queue && v.building_queue[0])
+          ? `${esc(v.building_queue[0].name)} (Liv. ${v.building_queue[0].target_level}) · <span class="text-sky-300">${formatTime(v.building_queue[0].seconds_remaining)}</span>`
+          : `<span class="text-slate-500">Coda libera</span>`;
+
+        const st = v.settlers || {};
+        const settlersInfo = isFounder
+          ? `<div class="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] font-mono-tech">
+               <span class="text-amber-300">👥 Coloni: <strong>${st.trained || 0}/3</strong> ${st.in_queue ? `(+${st.in_queue} in coda)` : ''}</span>
+               <span class="text-slate-400">${st.seconds_remaining ? formatTime(st.seconds_remaining) : 'In accumulo'}</span>
+             </div>`
+          : '';
+
+        return `
+          <div class="${cardClass} p-4 flex flex-col justify-between">
+            <div>
+              <div class="flex items-center justify-between gap-2 mb-3">
+                <div>
+                  <div class="flex items-center gap-2">
+                    <h3 class="font-bold text-white text-base">${esc(v.name)}</h3>
+                    <span class="text-xs font-mono-tech text-slate-400">(${v.x ?? '—'}|${v.y ?? '—'})</span>
+                  </div>
+                  <span class="text-[10px] font-mono-tech uppercase tracking-wider ${isFounder ? 'text-amber-400' : 'text-emerald-400'}">
+                    ${isFounder ? '👑 FOUNDER' : esc(v.role || 'standard')}${v.is_capital ? ' · ★ capitale' : ''}
+                  </span>
+                </div>
+                <div class="text-right font-mono-tech text-[11px]">
+                  <div class="text-slate-300">Mercanti: <strong class="${(v.merchants?.available || 0) > 0 ? 'text-emerald-400' : 'text-amber-400'}">${v.merchants?.available ?? 0}/${v.merchants?.total ?? 0}</strong></div>
+                  <div class="text-slate-400">${v.raids?.enabled ? `Raid tra ${formatTime(v.raids.next_cycle_seconds)}` : 'Raid disabilitati'}${hasAttack ? ` · <span class="text-rose-400">⚔ ${v.incoming_attacks.length}</span>` : ''}</div>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-4 gap-1.5 mb-3 font-mono-tech text-[11px]">
+                <div class="bg-slate-900/80 border border-slate-800 rounded p-1.5">
+                  <div class="text-amber-500/90 text-[10px]">🪵 Legno</div>
+                  <div class="font-bold text-slate-100">${fmtNum(r.wood)}</div>
+                  <div class="text-[9px] text-slate-400">+${r.prod_wood || 0}/h</div>
+                </div>
+                <div class="bg-slate-900/80 border border-slate-800 rounded p-1.5">
+                  <div class="text-orange-400 text-[10px]">🧱 Argilla</div>
+                  <div class="font-bold text-slate-100">${fmtNum(r.clay)}</div>
+                  <div class="text-[9px] text-slate-400">+${r.prod_clay || 0}/h</div>
+                </div>
+                <div class="bg-slate-900/80 border border-slate-800 rounded p-1.5">
+                  <div class="text-slate-300 text-[10px]">⛓️ Ferro</div>
+                  <div class="font-bold text-slate-100">${fmtNum(r.iron)}</div>
+                  <div class="text-[9px] text-slate-400">+${r.prod_iron || 0}/h</div>
+                </div>
+                <div class="bg-slate-900/80 border border-slate-800 rounded p-1.5">
+                  <div class="text-emerald-400 text-[10px]">🌾 Grano</div>
+                  <div class="font-bold text-slate-100">${fmtNum(r.crop)}</div>
+                  <div class="text-[9px] text-emerald-400">+${r.net_crop || 0}/h</div>
+                </div>
+              </div>
+
+              <div class="space-y-1 text-[11px] font-mono-tech bg-slate-950/60 border border-slate-800/80 rounded-lg p-2.5">
+                <div class="flex justify-between">
+                  <span class="text-slate-400">🏗️ Costruzione:</span>
+                  <span class="text-slate-200 text-right">${bQueue}</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-slate-400">📦 Capacità:</span>
+                  <span class="text-slate-300">Mag ${fmtNum(wCap)} · Gra ${fmtNum(gCap)}</span>
+                </div>
+                ${v.smithy_queue ? `
+                <div class="flex justify-between">
+                  <span class="text-slate-400">⚒️ Fucina:</span>
+                  <span class="text-sky-300">${esc(v.smithy_queue.unit)} Liv.${v.smithy_queue.target_level} (${formatTime(v.smithy_queue.seconds_remaining)})</span>
+                </div>` : ''}
+                <div class="flex justify-between">
+                  <span class="text-slate-400">🏛️ Municipio:</span>
+                  <span class="text-slate-300">liv ${v.town_hall?.level || 0}${v.town_hall?.celebration_active ? ' · 🎉' : ''}</span>
+                </div>
+              </div>
+
+              <div class="flex gap-1.5 mt-3">
+                <button onclick="sendCommand('START_CELEBRATION','${esc(v.name)}')" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-mono-tech text-slate-300 transition">🎉 Festa</button>
+                <button onclick="sendCommand('MOVE_HERO','${esc(v.name)}')" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-mono-tech text-slate-300 transition">🦸 Eroe</button>
+                <button onclick="sendCommand('TRIGGER_DODGE','${esc(v.name)}')" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] font-mono-tech text-slate-300 transition">🛡️ Dodge</button>
+              </div>
+            </div>
+            ${settlersInfo}
+          </div>`;
+      }).join('');
+    }
+
+    function renderLogs() {
+      const fVil = document.getElementById('logFilterVillage').value;
+      const fMod = document.getElementById('logFilterModule').value;
+      const container = document.getElementById('auditLogContainer');
+
+      const filtered = (state.audit_logs || []).slice().reverse().filter(l => {
+        if (fVil !== "ALL" && l.village !== fVil) return false;
+        if (fMod !== "ALL" && l.module !== fMod) return false;
+        return true;
+      });
+
+      document.getElementById('logCountBadge').textContent =
+        `${filtered.length} eventi`;
+
+      container.innerHTML = filtered.map(l => {
+        const badgeStyle = l.outcome === "EXECUTED"
+          ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30"
+          : l.outcome === "BLOCKED"
+            ? "bg-rose-500/15 text-rose-400 border-rose-500/30"
+            : "bg-amber-500/15 text-amber-300 border-amber-500/30";
+        return `
+          <div class="py-2.5 px-2 hover:bg-slate-800/30 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="text-slate-500">${esc(l.time)}</span>
+              <span class="text-sky-300 font-bold">${esc(l.village || '—')}</span>
+              <span class="text-slate-400">· ${esc(l.module)}</span>
+              <span class="text-slate-200 font-semibold">${esc(l.decision)}</span>
+              <span class="px-1.5 py-0.5 rounded border text-[10px] ${badgeStyle}">${esc(l.outcome)}</span>
+            </div>
+            <div class="text-slate-300 text-[11px]">${esc(l.reason)}</div>
+          </div>`;
+      }).join('') || `<div class="py-4 text-center text-slate-500">nessun evento</div>`;
+    }
+
+    // Filtri log popolati dai dati reali (niente opzioni hardcoded)
+    function refreshLogFilters() {
+      const selV = document.getElementById('logFilterVillage');
+      const cur = selV.value;
+      const names = [...new Set((state.villages || []).map(v => v.name))];
+      selV.innerHTML = '<option value="ALL">Tutti i villaggi</option>' +
+        names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+      if (names.includes(cur)) selV.value = cur;
+      const selM = document.getElementById('logFilterModule');
+      const curM = selM.value;
+      const mods = [...new Set((state.audit_logs || []).map(l => l.module))].sort();
+      selM.innerHTML = '<option value="ALL">Tutti i moduli</option>' +
+        mods.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+      if (mods.includes(curM)) selM.value = curM;
+    }
+
+    // Tick locale (1s): interpola risorse e decrementa i countdown
+    setInterval(() => {
+      (state.villages || []).forEach(v => {
+        const r = v.resources;
+        if (r) {
+          r.wood = Math.min(r.warehouse_cap || 999999,
+            (r.wood || 0) + (r.prod_wood || 0) / 3600);
+          r.clay = Math.min(r.warehouse_cap || 999999,
+            (r.clay || 0) + (r.prod_clay || 0) / 3600);
+          r.iron = Math.min(r.warehouse_cap || 999999,
+            (r.iron || 0) + (r.prod_iron || 0) / 3600);
+          r.crop = Math.min(r.granary_cap || 999999,
+            Math.max(0, (r.crop || 0) + (r.net_crop || 0) / 3600));
+        }
+        (v.building_queue || []).forEach(q => {
+          if (q.seconds_remaining > 0) q.seconds_remaining--;
+        });
+        if (v.raids && v.raids.next_cycle_seconds > 0)
+          v.raids.next_cycle_seconds--;
+      });
+      if ((state.villages || []).length) renderVillages();
+    }, 1000);
+
+    // ---------- Sync ----------
+    async function syncLiveTelemetry() {
+      try {
+        const url = '/api/dashboard-state' +
+          (accountId ? '?account=' + encodeURIComponent(accountId) : '');
+        const res = await fetch(url);
+        if (!res.ok) { setConn(res.status === 503 ? 'wait' : 'off'); return; }
+        const liveData = await res.json();
+        if (!liveData || liveData.status === 'waiting') {
+          setConn('wait'); return;
+        }
+        accountId = liveData.account_id || accountId;
+        if (liveData.account)
+          state.account = { ...state.account, ...liveData.account };
+        if (liveData.hero)
+          state.hero = { ...state.hero, ...liveData.hero };
+        if (liveData.villages && liveData.villages.length > 0)
+          state.villages = liveData.villages;
+        if (liveData.audit_logs)
+          state.audit_logs = liveData.audit_logs;
+
+        document.getElementById('lastSyncTime').textContent =
+          new Date().toLocaleTimeString('it-IT');
+        setConn('live');
+        refreshLogFilters();
+        renderAccountAndHero();
+        renderVillages();
+        renderRadar();
+        renderLogs();
+      } catch (e) {
+        setConn('off');
+      }
+    }
+
+    async function sendCommand(action, villageName) {
+      try {
+        const res = await fetch('/api/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action,
+            village_name: villageName || '',
+            account_id: accountId,
+            params: {}
+          })
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          console.warn('comando rifiutato:', body.reason || res.status);
+        }
+        setTimeout(syncLiveTelemetry, 600);
+      } catch (e) {
+        console.warn('Comando non inviato (offline):', action);
+      }
+    }
+
+    renderAccountAndHero();
+    renderVillages();
+    renderLogs();
+    setInterval(syncLiveTelemetry, POLL_MS);
+    syncLiveTelemetry();
+  </script>
+</body>
+</html>

@@ -274,6 +274,9 @@ class ExpansionManager:
     cp_required: int = 0
     cp_daily: int = 0
     next_celebration_attempt: float = 0.0
+    # Buffer Decision Audit Log: eventi decisionali del ciclo in corso,
+    # svuotato dall'orchestrator via drain_audit() (non persistito).
+    _audit: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._kv_key: str | None = None
@@ -281,7 +284,32 @@ class ExpansionManager:
             safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in self.account_id)
             self._kv_key = f"expansion_{safe}.json"
             self.state_path = STATE_DIR / self._kv_key
+        # Firma dell'ultimo TARGET_SWITCHED loggato: evita duplicati
+        # identici a ogni ciclo finche' il tile resta occupato.
+        self._last_switch_sig = ""
         self._load()
+
+    # ------------------------------------------------------------------
+    # Decision Audit Log: eventi consumati dall'orchestrator
+    # ------------------------------------------------------------------
+    def _audit_event(
+        self, decision: str, outcome: str, reason: str, **context
+    ) -> None:
+        self._audit.append(
+            {
+                "decision": decision,
+                "outcome": outcome,
+                "reason": reason,
+                "context": {
+                    k: v for k, v in context.items() if v is not None
+                },
+            }
+        )
+
+    def drain_audit(self) -> list[dict]:
+        """Svuota il buffer degli eventi decisionali del ciclo."""
+        events, self._audit = self._audit, []
+        return events
 
     # ------------------------------------------------------------------
     # Persistenza
@@ -461,19 +489,23 @@ class ExpansionManager:
             for c in store.approved_targets(self.account_id)
             if getattr(c, "manual", False)
         }
-        # I cropper approved dalla dashboard hanno priorita' sui target manuali
+        # Coda ordinata dei candidati (spec Corsa al 15c): prima il
+        # target principale e le righe extra configurate (x,y != 0|0),
+        # poi i risultati del Cropper Finder approvati dalla dashboard.
+        approved = store.approved_targets(self.account_id)
         ordered: list[ExpansionTarget] = [
+            t for t in cfg.target_slots if (t.x, t.y) != (0, 0)
+        ]
+        ordered += [
             ExpansionTarget(
                 x=c.x, y=c.y,
                 note=f"{c.type} +{c.bonus_crop_percent - 100}% oasi "
                      f"({c.distance_hours}h da {c.nearest_village or '?'}) [approved]",
             )
-            for c in store.approved_targets(self.account_id)
+            for c in approved
+            if (c.x, c.y) not in {(t.x, t.y) for t in ordered}
         ]
-        ordered += [
-            t for t in cfg.target_slots
-            if (t.x, t.y) not in {(c.x, c.y) for c in store.approved_targets(self.account_id)}
-        ]
+        occupied: list[ExpansionTarget] = []
         for target in ordered:
             if (target.x, target.y) in done:
                 continue
@@ -487,6 +519,7 @@ class ExpansionManager:
                 continue
             info = await observer.read_map_tile(target.x, target.y)
             if info.get("occupied"):
+                occupied.append(target)
                 logger.info(
                     "%s Espansione: tile (%d, %d) occupato, salto. %s",
                     prefix, target.x, target.y, target.note,
@@ -509,7 +542,33 @@ class ExpansionManager:
                     prefix, target.x, target.y,
                 )
                 continue
+            if occupied:
+                # Ripiego riuscito: il target principale era occupato —
+                # evento TARGET_SWITCHED nel Decision Audit Log.
+                sig = f"{occupied[0].x},{occupied[0].y}->{target.x},{target.y}"
+                if sig != self._last_switch_sig:
+                    self._last_switch_sig = sig
+                    self._audit_event(
+                        "TARGET_SWITCHED",
+                        "EXECUTED",
+                        f"Tile principale ({occupied[0].x}|{occupied[0].y}) "
+                        f"occupato: ripiego su candidato "
+                        f"({target.x}|{target.y})",
+                        skipped=[{"x": t.x, "y": t.y} for t in occupied],
+                        new_target={"x": target.x, "y": target.y},
+                    )
             return target, crop
+        if occupied:
+            sig = "none:" + ",".join(f"{t.x}|{t.y}" for t in occupied)
+            if sig != self._last_switch_sig:
+                self._last_switch_sig = sig
+                self._audit_event(
+                    "TARGET_SWITCHED",
+                    "SKIPPED",
+                    f"Tutti i {len(occupied)} candidati espansione "
+                    "verificati sono occupati: nessun ripiego disponibile",
+                    skipped=[{"x": t.x, "y": t.y} for t in occupied],
+                )
         return None, 0
 
     async def _try_celebration(
@@ -803,6 +862,7 @@ class ExpansionManager:
             self.founded_tiles.append({
                 "x": target.x, "y": target.y, "ts": now,
                 "crop_type": f"{tile_crop}c" if tile_crop else "",
+                "crop_fields": int(tile_crop or 0),
                 "settled_at": now,
             })
             self.feed_target = ""
