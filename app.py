@@ -15,9 +15,10 @@ import uuid
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import ui_theme as ui
-from travian_agent import db
+from travian_agent import db, telemetry
 from travian_agent.builder import load_build_plans
 from travian_agent.config import (
     BASE_DIR,
@@ -615,7 +616,7 @@ def _sidebar_nav() -> str:
     """
     cur = st.session_state.get("nav_page", "Overview")
     groups = [
-        ("Agent", ["Overview", "Controllo", "Villaggi", "War Room"]),
+        ("Agent", ["Overview", "Controllo", "Command Center", "Villaggi", "War Room"]),
         ("Automazioni", ["Farming & Eroe", "Espansione"]),
         ("Ops", ["Account", "Audits", "Debug"]),
     ]
@@ -658,12 +659,6 @@ with st.sidebar:
 
     # Navigazione a gruppi (layout console)
     page = _sidebar_nav()
-
-    st.link_button(
-        "🎯 Command Center (Live)",
-        "http://localhost:8610/command-center/",
-        use_container_width=True,
-    )
 
     st.divider()
     ui.section("Account")
@@ -998,6 +993,52 @@ if page == "Controllo":
                 st.toast(f"Arrestato ({n} processo/i).", icon="⏹️")
                 time.sleep(0.5)
                 st.rerun()
+
+
+# 1.5 PAGINA COMMAND CENTER (Tactical HUD embedded)
+if page == "Command Center":
+    ui.page_header(
+        "Command Center",
+        "Tactical HUD live: radar logistico, villaggi, eroe e audit — "
+        "telemetria letta dallo snapshot dell'agente.",
+    )
+    _sel_cc = _selected_account()
+    _snap_path = (
+        telemetry.telemetry_path(_sel_cc.account_id)
+        if _sel_cc is not None
+        else telemetry.latest_telemetry_path()
+    )
+    _snap: dict = {}
+    if _snap_path is not None and Path(_snap_path).exists():
+        try:
+            _snap = json.loads(Path(_snap_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _snap = {}
+
+    _cc_html_path = BASE_DIR / "web" / "command_center" / "index.html"
+    if not _cc_html_path.exists():
+        st.error("web/command_center/index.html non trovato.")
+    else:
+        if not _snap:
+            st.caption(
+                "Nessuno snapshot dell'agente ancora disponibile — "
+                "l'HUD si popola dopo il primo ciclo completato."
+            )
+        _doc = _cc_html_path.read_text(encoding="utf-8")
+        _inject = (
+            "<script>window.__EMBEDDED__=true;window.__EMBEDDED_STATE__="
+            + json.dumps(_snap or None, ensure_ascii=False).replace("</", "<\\/")
+            + ";</script>"
+        )
+        _doc = _doc.replace("<script>", _inject + "\n<script>", 1)
+        components.html(_doc, height=1650, scrolling=True)
+
+    _cc_auto = st.checkbox(
+        "Auto-refresh telemetria (8s)", value=True, key="cc_auto_refresh"
+    )
+    if _cc_auto:
+        time.sleep(8)
+        st.rerun()
 
 
 # 2. PAGINA VILLAGGI & STRATEGIA

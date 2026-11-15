@@ -311,6 +311,11 @@
     };
     let accountId = "";
     const POLL_MS = 4000;
+    // Embedded: iniettato lato server nella pagina Streamlit — niente
+    // fetch verso /api (l'HTTP :8610 e' solo locale, in hosting remoto
+    // lo stato arriva serializzato qui dentro).
+    const EMBEDDED = !!window.__EMBEDDED__;
+    const EMBEDDED_STATE = window.__EMBEDDED_STATE__ || null;
 
     function esc(s) {
       return String(s ?? '').replace(/[&<>"]/g,
@@ -737,8 +742,36 @@
     }, 1000);
 
     // ---------- Sync ----------
+    function applyLiveData(liveData) {
+      accountId = liveData.account_id || accountId;
+      if (liveData.account)
+        state.account = { ...state.account, ...liveData.account };
+      if (liveData.hero)
+        state.hero = { ...state.hero, ...liveData.hero };
+      if (liveData.villages && liveData.villages.length > 0)
+        state.villages = liveData.villages;
+      if (liveData.audit_logs)
+        state.audit_logs = liveData.audit_logs;
+
+      document.getElementById('lastSyncTime').textContent =
+        new Date().toLocaleTimeString('it-IT');
+      setConn('live');
+      refreshLogFilters();
+      renderAccountAndHero();
+      renderVillages();
+      renderRadar();
+      renderLogs();
+    }
+
     async function syncLiveTelemetry() {
       try {
+        if (EMBEDDED) {
+          if (!EMBEDDED_STATE || EMBEDDED_STATE.status === 'waiting') {
+            setConn('wait'); return;
+          }
+          applyLiveData(EMBEDDED_STATE);
+          return;
+        }
         const url = '/api/dashboard-state' +
           (accountId ? '?account=' + encodeURIComponent(accountId) : '');
         const res = await fetch(url);
@@ -747,30 +780,18 @@
         if (!liveData || liveData.status === 'waiting') {
           setConn('wait'); return;
         }
-        accountId = liveData.account_id || accountId;
-        if (liveData.account)
-          state.account = { ...state.account, ...liveData.account };
-        if (liveData.hero)
-          state.hero = { ...state.hero, ...liveData.hero };
-        if (liveData.villages && liveData.villages.length > 0)
-          state.villages = liveData.villages;
-        if (liveData.audit_logs)
-          state.audit_logs = liveData.audit_logs;
-
-        document.getElementById('lastSyncTime').textContent =
-          new Date().toLocaleTimeString('it-IT');
-        setConn('live');
-        refreshLogFilters();
-        renderAccountAndHero();
-        renderVillages();
-        renderRadar();
-        renderLogs();
+        applyLiveData(liveData);
       } catch (e) {
-        setConn('off');
+        setConn(EMBEDDED ? 'wait' : 'off');
       }
     }
 
     async function sendCommand(action, villageName) {
+      if (EMBEDDED) {
+        alert('I comandi rapidi richiedono il server locale :8610 ' +
+              '(disponibili solo in esecuzione locale).');
+        return;
+      }
       try {
         const res = await fetch('/api/command', {
           method: 'POST',
@@ -795,7 +816,9 @@
     renderAccountAndHero();
     renderVillages();
     renderLogs();
-    setInterval(syncLiveTelemetry, POLL_MS);
+    if (!EMBEDDED) {
+      setInterval(syncLiveTelemetry, POLL_MS);
+    }
     syncLiveTelemetry();
   </script>
 </body>
