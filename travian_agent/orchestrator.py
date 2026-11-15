@@ -26,6 +26,7 @@ from .builder import (
     save_build_plan,
 )
 from .building_prereqs import (
+    GID_CRANNY,
     GID_MAIN_BUILDING,
     GID_SMITHY,
     GID_TOWN_HALL,
@@ -55,6 +56,7 @@ from .models import (
     GameState,
     GID_BARRACKS,
     GID_GRANARY,
+    GID_MARKETPLACE,
     GID_PALACE,
     GID_RESIDENCE,
     GID_STABLE,
@@ -172,13 +174,16 @@ def _persist_village_coords(
 
 # Corsa al 15c (spec): gid degli step critici del founder durante il
 # freeze — Palazzo/Residenza (coloni), Magazzino e Granaio (riserve),
-# Palazzo Pubblico (velocizza i lavori).
+# Palazzo Pubblico (velocizza i lavori), Deposito Segreto e Mercato
+# (anti-razzia: drenaggio ed evasione risorse consentiti in freeze).
 _EXPANSION_CRITICAL_GIDS = frozenset({
     GID_MAIN_BUILDING,
     GID_WAREHOUSE,
     GID_GRANARY,
     GID_RESIDENCE,
     GID_PALACE,
+    GID_CRANNY,
+    GID_MARKETPLACE,
 })
 
 
@@ -251,7 +256,7 @@ def _freeze_demote(state: GameState, action: Action) -> "Action | None":
                 reason=(
                     "Freeze espansione: solo passi critici "
                     "(Residenza/Palazzo, Magazzino, Granaio, "
-                    "Palazzo Pubblico)"
+                    "Palazzo Pubblico, Deposito Segreto, Mercato)"
                 ),
             )
     return None

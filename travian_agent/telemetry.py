@@ -113,6 +113,11 @@ def _audit_tail(account_id: str, limit: int = AUDIT_TAIL_LIMIT) -> list[dict]:
             continue
         if not isinstance(entry, dict):
             continue
+        # Il JSONL e' condiviso con _append_history (righe 'action'
+        # senza decision/module): le saltiamo o apparirebbero come
+        # duplicati privi di modulo nella dashboard.
+        if "decision" not in entry:
+            continue
         ts = float(entry.get("ts") or 0.0)
         out.append(
             {
