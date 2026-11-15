@@ -413,6 +413,7 @@ def _on_village_account_change() -> None:
             (
                 "role_", "target_", "units_", "focus_", "market_slot_",
                 "coord_x_", "coord_y_", "bqueue_", "bqpreset_", "bqtroop_",
+                "bqfoc_",
                 "bqsmithy_", "fqtgt_", "fqup_",
                 "fqdn_", "fqrm_", "fqadd_", "fqlvl_", "fqbtn_", "fqprst_",
             )
@@ -1382,6 +1383,17 @@ if page == "Villaggi":
                             "livello target) prima di passare al successivo. "
                             "Livello 0 = fino al massimo consentito."
                         )
+                        focus_enabled_sel = st.checkbox(
+                            "🎯 Abilita Focus Manuale (scavalca ruolo ed economia)",
+                            value=bool(
+                                getattr(
+                                    old_cfg, "building_focus_enabled", True
+                                )
+                            ),
+                            key=f"bqfoc_{cur_acc.account_id}_{vkey}",
+                            help="OFF: la coda resta salvata ma viene ignorata — "
+                                 "il bot torna a ruolo ed economia.",
+                        )
 
                         # Coda per-villaggio in session_state, seedata dalla
                         # config (step dict o chiavi legacy -> target 0).
@@ -2061,6 +2073,7 @@ if page == "Villaggi":
                         priority_units=list(parsed_units),
                         building_focus=parsed_focus,
                         building_queue_plan=parsed_focus,
+                        building_focus_enabled=bool(focus_enabled_sel),
                         is_bootstrap=old_cfg.is_bootstrap,
                         farm_enabled=old_cfg.farm_enabled,
                         farm_unit=old_cfg.farm_unit,

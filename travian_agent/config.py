@@ -58,6 +58,9 @@ class VillageConfig:
     # planner itera per priorita' crescente e passa allo step N+1 quando
     # tutti i target dello step N sono raggiunti.
     building_queue_plan: list = field(default_factory=list)
+    # Focus Manuale on/off: False ignora la coda senza cancellarla —
+    # il bot torna a ruolo/economia finche' non viene riattivato.
+    building_focus_enabled: bool = True
     # New Village Bootstrap (v2.0): villaggio appena fondato — il builder
     # esegue la sequenza startup (storage/main/campi/mercato/rally) prima
     # di passare al ruolo assegnato; il flag si auto-disattiva a soglie
@@ -415,6 +418,9 @@ def _parse_account_item(item: dict) -> Settings:
                                         or cfg.get("building_focus")
                                         or []
                                     ),
+                                    building_focus_enabled=bool(
+                                        cfg.get("building_focus_enabled", True)
+                                    ),
                                     is_bootstrap=bool(cfg.get("is_bootstrap", False)),
                                     is_reclaim_source=bool(
                                         cfg.get("is_reclaim_source", False)
@@ -606,6 +612,9 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                     "building_focus": list(cfg.building_focus),
                     "building_queue_plan": list(
                         cfg.building_queue_plan or cfg.building_focus
+                    ),
+                    "building_focus_enabled": bool(
+                        cfg.building_focus_enabled
                     ),
                     "is_bootstrap": cfg.is_bootstrap,
                     "is_reclaim_source": cfg.is_reclaim_source,

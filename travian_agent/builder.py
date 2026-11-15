@@ -446,7 +446,7 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
     """
     vcfg = settings.village_config_for(state.village_name, state.village_id)
     plan = []
-    if vcfg is not None:
+    if vcfg is not None and getattr(vcfg, "building_focus_enabled", True):
         plan = list(vcfg.building_queue_plan or vcfg.building_focus or [])
     if not plan:
         return []
@@ -522,7 +522,7 @@ def focus_skip_reasons(
         state.village_name, state.village_id
     )
     plan = []
-    if vcfg is not None:
+    if vcfg is not None and getattr(vcfg, "building_focus_enabled", True):
         plan = list(
             vcfg.building_queue_plan or vcfg.building_focus or []
         )
