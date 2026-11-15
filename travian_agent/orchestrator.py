@@ -1193,9 +1193,17 @@ async def monitor_all_villages(
                             vprefix, unpack_exc,
                         )
 
+            # ------------------------------------------------------------------
+            # Filtro ruoli e competenza territoriale per il Farming / Raid:
+            # - Fondatori e Feeder non eseguono raid.
+            # - Ogni villaggio raida SOLO i target di cui e' il piu' vicino
+            #   (nearest_village) e che non siano stati gia' attaccati di recente.
+            # ------------------------------------------------------------------
+            is_raiding_role = village.role not in ("early_cropper_founder", "feeder")
+
             # 4.1 Modulo farming: raid sui Custom Farm Targets approvati
             # (fallback: farm list nativa del Punto di Raduno), se scaduto
-            if farming_mgr is not None:
+            if farming_mgr is not None and is_raiding_role:
                 rally = find_rally_point(state.interior_fields())
                 try:
                     await farming_mgr.run_for_village(
@@ -1216,7 +1224,7 @@ async def monitor_all_villages(
             reports: list[dict] | None = None
 
             # 4.1.b Modulo AI Scout Brain: raid dinamico a coordinate libere basato su radar mappa e report
-            if scout_brain is not None and settings.scout_brain.enabled:
+            if scout_brain is not None and settings.scout_brain.enabled and is_raiding_role:
                 rally = find_rally_point(state.interior_fields())
                 if rally is not None:
                     try:
@@ -1228,10 +1236,6 @@ async def monitor_all_villages(
                         scanned = await observer.scan_map_area(
                             village.x or 0, village.y or 0, radius=settings.scout_brain.scan_radius
                         )
-                        # Bugfix radar: i villaggi propri non sono mai
-                        # bersagli — filtro a livello di coordinate su
-                        # radar e store + pulizia dei record storici
-                        # inquinati (routine eseguita a ogni scansione).
                         own_coords = {
                             (v.x, v.y) for v in villages
                             if v.x is not None and v.y is not None
@@ -1246,8 +1250,6 @@ async def monitor_all_villages(
                                 village.y or 0,
                                 own_coords=own_coords,
                             )
-                            # Custom Farm Targets: la stessa scansione
-                            # alimenta lo store farm (tile -> pending).
                             farm_store.register_scanned(
                                 scanned,
                                 origin_x=village.x or 0,
@@ -1259,68 +1261,89 @@ async def monitor_all_villages(
 
                         reports = await observer.read_combat_reports(limit=10)
                         if reports:
-                            scout_brain.process_combat_reports(reports, blacklist_hours=settings.scout_brain.blacklist_hours)
-
-                        plan = await scout_brain.decide_raid_plan(village, state.troops_home, settings)
-                        # Human-in-the-loop (spec 1.2): il raid dinamico
-                        # parte SOLO sui target approved del farm store;
-                        # gli altri restano pending finche' la dashboard
-                        # non li approva.
-                        approved_coords = {
-                            (t.x, t.y)
-                            for t in farm_store.get_approved_targets()
-                        }
-                        if plan:
-                            gated, skipped = [], []
-                            for t in plan:
-                                if (t.get("x"), t.get("y")) in approved_coords:
-                                    gated.append(t)
-                                else:
-                                    skipped.append(
-                                        f"({t.get('x')}|{t.get('y')}) non approved"
-                                    )
-                                    farm_store.record_raid_attempt(
-                                        int(t.get("x") or 0),
-                                        int(t.get("y") or 0),
-                                        False,
-                                        "target non approved "
-                                        "(approva in dashboard)",
-                                    )
-                            if skipped:
-                                logger.info(
-                                    "%s AI Scout: %d target saltati: %s",
-                                    vprefix, len(skipped), "; ".join(skipped),
-                                )
-                            plan = gated
-                        if plan:
-                            scout_act = Action(
-                                type=ActionType.SEND_CUSTOM_RAID,
-                                params={"rally_slot": rally.slot_id, "targets": plan},
-                                reason=f"AI Scout Brain: invio {len(plan)} raid dinamici mirati",
+                            scout_brain.process_combat_reports(
+                                reports, blacklist_hours=settings.scout_brain.blacklist_hours
                             )
-                            scout_res = await executor.execute(scout_act, village_id=target_vid)
-                            for t in plan:
-                                farm_store.record_raid_attempt(
-                                    int(t.get("x") or 0),
-                                    int(t.get("y") or 0),
-                                    scout_res.success,
-                                    scout_res.message,
+
+                        # Costruisce l'insieme delle coordinate di competenza di QUESTO villaggio
+                        # e fuori dal cooldown anti-doppio-invio.
+                        now_ts = time.time()
+                        min_revisit_sec = max(
+                            1200.0,
+                            float(getattr(settings.farming, "interval_min", 25) or 25) * 60.0,
+                        )
+                        vname_norm = (village.name or "").strip().lower()
+                        eligible_coords: set[tuple[int, int]] = set()
+
+                        for t_obj in farm_store.get_approved_targets():
+                            tx, ty = int(t_obj.x), int(t_obj.y)
+
+                            # 1. Competenza territoriale (nearest_village, con fallback su distanza minima)
+                            nearest = (getattr(t_obj, "nearest_village", "") or "").strip().lower()
+                            if not nearest and village_coords_map:
+                                nearest = min(
+                                    village_coords_map.keys(),
+                                    key=lambda vn: (
+                                        (village_coords_map[vn][0] - tx) ** 2
+                                        + (village_coords_map[vn][1] - ty) ** 2
+                                    ),
                                 )
-                            logger.info("%s AI Scout: %s", vprefix, scout_res.message)
-                        elif not approved_coords:
+                            if nearest and nearest != vname_norm:
+                                continue
+
+                            # 2. Cooldown per-coordinata (evita invii ravvicinati allo stesso target)
+                            last_sent = float(
+                                getattr(t_obj, "last_raid_ts", 0.0)
+                                or getattr(t_obj, "last_attempt_ts", 0.0)
+                                or 0.0
+                            )
+                            if last_sent > 0 and (now_ts - last_sent) < min_revisit_sec:
+                                continue
+
+                            eligible_coords.add((tx, ty))
+
+                        if not eligible_coords:
                             logger.info(
-                                "%s AI Scout: nessun target approved nello "
-                                "store farm — approva i bersagli dalla "
-                                "dashboard (Farming & Eroe).",
+                                "%s AI Scout: nessun target approvato di competenza o fuori cooldown.",
                                 vprefix,
                             )
                         else:
-                            logger.info(
-                                "%s AI Scout: nessun raid dinamico inviato: "
-                                "il piano AI non ha prodotto target "
-                                "approvati per questo villaggio.",
-                                vprefix,
+                            plan = await scout_brain.decide_raid_plan(
+                                village, state.troops_home, settings
                             )
+                            if plan:
+                                gated, skipped = [], []
+                                for t in plan:
+                                    tx = int(t.get("x") or 0)
+                                    ty = int(t.get("y") or 0)
+                                    if (tx, ty) in eligible_coords:
+                                        gated.append(t)
+                                    else:
+                                        skipped.append(
+                                            f"({tx}|{ty}) non di competenza / in cooldown"
+                                        )
+                                if skipped:
+                                    logger.info(
+                                        "%s AI Scout: %d target saltati: %s",
+                                        vprefix, len(skipped), "; ".join(skipped),
+                                    )
+                                plan = gated
+
+                            if plan:
+                                scout_act = Action(
+                                    type=ActionType.SEND_CUSTOM_RAID,
+                                    params={"rally_slot": rally.slot_id, "targets": plan},
+                                    reason=f"AI Scout Brain: invio {len(plan)} raid dinamici mirati",
+                                )
+                                scout_res = await executor.execute(scout_act, village_id=target_vid)
+                                for t in plan:
+                                    farm_store.record_raid_attempt(
+                                        int(t.get("x") or 0),
+                                        int(t.get("y") or 0),
+                                        scout_res.success,
+                                        scout_res.message,
+                                    )
+                                logger.info("%s AI Scout: %s", vprefix, scout_res.message)
                     except Exception as s_exc:
                         logger.warning("%s Errore modulo AI Scout Brain: %s", vprefix, s_exc)
 

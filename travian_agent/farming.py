@@ -269,6 +269,22 @@ class FarmingManager:
             return "t" + best[1][1:]
         return ""
 
+    @staticmethod
+    def _village_coords_map(settings: Settings) -> dict[str, tuple[int, int]]:
+        """nome_lower -> (x, y) dei villaggi configurati con coordinate note.
+
+        Serve al fallback di competenza territoriale quando il target
+        approved non ha ``nearest_village`` valorizzato.
+        """
+        out: dict[str, tuple[int, int]] = {}
+        for key, cfg_v in (getattr(settings, "villages", None) or {}).items():
+            name = (getattr(cfg_v, "name", "") or str(key)).strip().lower()
+            x = getattr(cfg_v, "x", None)
+            y = getattr(cfg_v, "y", None)
+            if name and x is not None and y is not None:
+                out[name] = (int(x), int(y))
+        return out
+
     def _schedule_scan(self, village_key: str, now: float | None = None) -> None:
         """Pianifica la prossima scansione mappa di scoperta target."""
         now = now if now is not None else time.time()
@@ -343,20 +359,79 @@ class FarmingManager:
         if not approved:
             return False
 
+        # ------------------------------------------------------------------
+        # Competenza territoriale + cooldown anti-doppio-invio (stessa
+        # logica del gate AI Scout in orchestrator): il villaggio raida
+        # solo i target di cui e' il piu' vicino e non colpiti di recente.
+        # ------------------------------------------------------------------
+        now_ts = time.time()
+        min_revisit_sec = max(
+            1200.0,
+            float(
+                getattr(
+                    settings.farming,
+                    "interval_min",
+                    getattr(settings.farming, "interval_min_minutes", 25),
+                )
+                or 25
+            )
+            * 60.0,
+        )
+        vname_norm = (village.name or "").strip().lower()
+        coords_map = self._village_coords_map(settings)
+        eligible: list = []
+        for t_obj in approved:
+            tx, ty = int(t_obj.x), int(t_obj.y)
+
+            # 1. Competenza territoriale (nearest_village, con fallback
+            #    su distanza minima rispetto ai villaggi dell'account)
+            nearest = (
+                getattr(t_obj, "nearest_village", "") or ""
+            ).strip().lower()
+            if not nearest and coords_map:
+                nearest = min(
+                    coords_map.keys(),
+                    key=lambda vn: (
+                        (coords_map[vn][0] - tx) ** 2
+                        + (coords_map[vn][1] - ty) ** 2
+                    ),
+                )
+            if nearest and nearest != vname_norm:
+                continue
+
+            # 2. Cooldown per-coordinata (evita invii ravvicinati allo
+            #    stesso target — last_raid_ts si aggiorna solo su
+            #    invio confermato)
+            last_sent = float(
+                getattr(t_obj, "last_raid_ts", 0.0)
+                or getattr(t_obj, "last_attempt_ts", 0.0)
+                or 0.0
+            )
+            if last_sent > 0 and (now_ts - last_sent) < min_revisit_sec:
+                continue
+
+            eligible.append(t_obj)
+
+        if not eligible:
+            logger.info(
+                "%s FarmTargets: nessun target approved di competenza "
+                "o fuori cooldown per '%s'.",
+                prefix, village.name,
+            )
+            return False
+        approved = eligible
+
         unit_key = self._raider_key(troops, unit_pref)
         if not unit_key:
-            # Sensore cieco o dizionario azzerato da lettura parziale:
-            # non interrompere il ciclo a monte (contratto del modulo:
-            # l'invio vuoto fallisce lato gioco senza conseguenze).
-            # t1 = primo slot relativo troop[t1] del form tt=2 — la
-            # fanteria base del villaggio, sempre presente nel form.
-            unit_key = "t1"
-            logger.warning(
-                "%s FarmTargets: sensore truppe cieco su '%s' "
-                "(lettura=%s, unit_pref='%s'): tentativo comunque con "
-                "slot relativo %s.",
-                prefix, village.name, troops, unit_pref, unit_key,
+            # Inventario a zero o sensore cieco: niente invio cieco — il
+            # vecchio fallback 't1' produceva 'troop_inputs|missed:t1'
+            # sui villaggi senza fanteria base.
+            logger.info(
+                "%s FarmTargets: nessuna unita' da raid disponibile in "
+                "'%s' (lettura=%s, unit_pref='%s') — raid saltato.",
+                prefix, village.name, troops, unit_pref,
             )
+            return False
 
         max_wave = max(1, int(settings.farming.targets_per_wave or 1))
         selected = approved[:max_wave]

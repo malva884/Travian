@@ -77,9 +77,11 @@ PYTHON_EXE = sys.executable
 
 # ---------------------------------------------------------------------------
 # Componente CCv2: lista drag-and-drop per la Coda Prioritaria Edifici.
-# Dichiarato UNA volta a livello modulo (requisito CCv2). Su drop emette
-# il trigger "order" con la nuova sequenza di id step; il fallback con i
-# pulsanti freccia resta attivo se il JS non e' disponibile.
+# Dichiarato UNA volta a livello modulo (requisito CCv2). A ogni
+# mutazione (drop, livello, rimozione, aggiunta) il componente pubblica
+# la coda completa come STATO persistente via setStateValue('queue'):
+# i trigger one-shot dentro st.form non arrivano mai al submit, mentre
+# lo stato persistente viene batchato e consegnato col submit del form.
 # ---------------------------------------------------------------------------
 _DND_QUEUE_SORTER = st.components.v2.component(
     "dnd_queue_sorter",
@@ -126,7 +128,7 @@ _DND_QUEUE_SORTER = st.components.v2.component(
 """,
     js="""
 export default function (component) {
-  const { data, parentElement, setTriggerValue } = component
+  const { data, parentElement, setStateValue } = component
   const list = parentElement.querySelector("#dq-list")
   const addKey = parentElement.querySelector("#dq-add-key")
   const addLvl = parentElement.querySelector("#dq-add-lvl")
@@ -135,11 +137,24 @@ export default function (component) {
   list.innerHTML = ""
   const items = (data && data.items) || []
   const options = (data && data.options) || []
-  const emit = (k, v) => setTriggerValue(k, v)
-  const emitOrder = () => emit(
-    "order",
-    Array.from(list.children).map((el) => el.dataset.id)
-  )
+  const newId = () => "u" + Math.random().toString(36).slice(2, 10)
+  // Stato persistente: pubblica la coda intera [{id, key, level}] dopo
+  // ogni mutazione. Dentro st.form i trigger one-shot si perdono; lo
+  // stato viene batchato e consegnato al submit del form come ogni
+  // widget — Python riconcilia la coda da questo array.
+  const syncQueue = () => {
+    const arr = Array.from(list.children).map((el, i) => {
+      const pos = el.querySelector(".dq-pos")
+      if (pos) pos.textContent = String(i + 1) + "."
+      const inp = el.querySelector(".dq-input")
+      return {
+        id: el.dataset.id,
+        key: el.dataset.key,
+        level: parseInt((inp && inp.value) || "0", 10) || 0,
+      }
+    })
+    setStateValue("queue", arr)
+  }
   const afterElement = (y) => {
     const els = Array.from(list.querySelectorAll(".dq-item:not(.dragging)"))
     let best = { offset: -Infinity, el: null }
@@ -150,28 +165,27 @@ export default function (component) {
     }
     return best.el
   }
-  items.forEach((it, idx) => {
+  const makeLi = (it) => {
     const li = document.createElement("li")
     li.className = "dq-item"
     li.draggable = false
     li.dataset.id = it.id
+    li.dataset.key = it.key
     const grip = document.createElement("span")
     grip.className = "dq-grip"; grip.textContent = "\\u2807"
     const pos = document.createElement("span")
-    pos.className = "dq-pos"; pos.textContent = String(idx + 1) + "."
+    pos.className = "dq-pos"; pos.textContent = ""
     const label = document.createElement("span")
     label.className = "dq-label"; label.textContent = it.label
     const lvl = document.createElement("input")
     lvl.className = "dq-input"; lvl.type = "number"
     lvl.min = "0"; lvl.max = "20"; lvl.value = String(it.level || 0)
     lvl.title = "Livello target 1-20 (0 = massimo)"
-    lvl.onchange = () => emit("level", {
-      id: it.id, level: parseInt(lvl.value || "0", 10) || 0,
-    })
+    lvl.onchange = () => syncQueue()
     const rm = document.createElement("button")
     rm.className = "dq-btn"; rm.type = "button"; rm.textContent = "✕"
     rm.title = "Rimuovi step"
-    rm.onclick = () => emit("remove", it.id)
+    rm.onclick = () => { li.remove(); syncQueue() }
     li.append(grip, pos, label, lvl, rm)
     // Drag SOLO dal grip: l'input livello resta editabile senza
     // attivare il trascinamento della riga.
@@ -181,8 +195,13 @@ export default function (component) {
     li.ondragend = () => {
       li.classList.remove("dragging")
       li.draggable = false
-      emitOrder()
+      syncQueue()
     }
+    return li
+  }
+  items.forEach((it, idx) => {
+    const li = makeLi(it)
+    li.querySelector(".dq-pos").textContent = String(idx + 1) + "."
     list.appendChild(li)
   })
   // Property-handler (non addEventListener): il mount rifa' girare
@@ -205,10 +224,16 @@ export default function (component) {
       addKey.appendChild(opt)
     })
     if (prev) addKey.value = prev
-    addBtn.onclick = () => emit("add", {
-      key: addKey.value,
-      level: parseInt((addLvl && addLvl.value) || "0", 10) || 0,
-    })
+    addBtn.onclick = () => {
+      const opt = options.find((o) => o.value === addKey.value)
+      if (!opt) return
+      const li = makeLi({
+        id: newId(), key: opt.value, label: opt.label,
+        level: parseInt((addLvl && addLvl.value) || "0", 10) || 0,
+      })
+      list.appendChild(li)
+      syncQueue()
+    }
   }
 }
 """,
@@ -218,25 +243,20 @@ export default function (component) {
 def _queue_sorter(items: list[dict], options: list[dict], *, key: str, height: int):
     """Editor completo drag-and-drop della coda prioritaria (CCv2).
 
-    `items`:   [{"id": uid_step, "label": nome edificio, "level": int}].
+    `items`:   [{"id": uid, "key": edificio, "label": nome, "level": int}].
     `options`: [{"value": chiave edificio, "label": nome}] per la riga
                "aggiungi step" integrata.
 
-    Trigger emessi (leggibili in ``st.session_state[key].<nome>`` nella
-    rerun successiva — leggerli PRIMA del mount per evitare flicker):
-    - ``order``:  nuova sequenza di id dopo un drop di riordino;
-    - ``level``:  {"id": uid, "level": int} su modifica livello target;
-    - ``remove``: uid dello step da rimuovere;
-    - ``add``:    {"key": chiave edificio, "level": int} nuovo step.
+    Il componente pubblica lo STATO persistente ``queue``
+    (``st.session_state[key]["queue"]``): lista completa
+    [{"id","key","level"}] dopo ogni mutazione. Dentro st.form viene
+    consegnato al submit — Python riconcilia la coda da quello stato
+    prima di serializzare parsed_focus.
     """
     return _DND_QUEUE_SORTER(
         key=key,
         data={"items": items, "options": options},
         height=height,
-        on_order_change=lambda: None,
-        on_level_change=lambda: None,
-        on_remove_change=lambda: None,
-        on_add_change=lambda: None,
     )
 
 # Regex per il tab Audits: formato "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
@@ -1264,6 +1284,19 @@ if page == "Villaggi":
                         bqtroop_key = f"bqtroop_{cur_acc.account_id}_{vkey}"
                         bqsmithy_key = f"bqsmithy_{cur_acc.account_id}_{vkey}"
                         units_widget_key = f"units_{cur_acc.account_id}_{vkey}"
+                        _dnd_key = f"bqdnd_{cur_acc.account_id}_{vkey}"
+
+                        def _clear_dnd_state() -> None:
+                            """Invalida la coda emessa dal componente dnd.
+
+                            Quando Python ricostruisce la coda (preset/
+                            reset ruolo), lo stato persistente 'queue'
+                            emesso prima resterebbe stale e alla run
+                            successiva sovrascriverebbe il nuovo seed.
+                            """
+                            _st = st.session_state.get(_dnd_key)
+                            if isinstance(_st, dict):
+                                _st["queue"] = None
 
                         def _queue_from(items) -> list[dict]:
                             """Normalizza step (dict o chiave legacy) in righe coda."""
@@ -1343,6 +1376,7 @@ if page == "Villaggi":
                             if _gen.get("building_queue"):
                                 _steps = _gen["building_queue"]
                             st.session_state[queue_key] = _queue_from(_steps)
+                            _clear_dnd_state()
                             st.session_state[bqtroop_key] = (
                                 troop_preset_for_role(role)
                             )
@@ -1470,6 +1504,7 @@ if page == "Villaggi":
                                     st.session_state[queue_key] = _queue_from(
                                         _steps
                                     )
+                                    _clear_dnd_state()
                         with _ph3:
                             if st.form_submit_button(
                                 "🔄 Applica Preset",
@@ -1494,73 +1529,64 @@ if page == "Villaggi":
                         # Editor coda completamente drag-and-drop (spec
                         # ottimizzazione coda founder): grip ⡿ per il
                         # riordino, input livello e ✕ su ogni riga, riga
-                        # "aggiungi edificio" integrata. I trigger del
-                        # componente vengono letti PRIMA del mount (niente
-                        # flicker) e ogni mutazione e' salvata subito su
-                        # accounts.json.
+                        # "aggiungi edificio" integrata. Il componente
+                        # pubblica la coda intera come STATO persistente
+                        # (setStateValue): dentro st.form i trigger
+                        # one-shot NON vengono consegnati, lo stato si'
+                        # (al submit). La coda viene riconciliata PRIMA
+                        # del mount e di parsed_focus.
                         for _s in queue:
                             _s.setdefault("_uid", uuid.uuid4().hex[:8])
-                        _dnd_key = f"bqdnd_{cur_acc.account_id}_{vkey}"
                         _dnd_state = st.session_state.get(_dnd_key)
 
-                        def _dnd_trig(name):
-                            v = getattr(_dnd_state, name, None)
-                            if v is None and isinstance(_dnd_state, dict):
-                                v = _dnd_state.get(name)
-                            return v
-
-                        _by_uid = {s["_uid"]: s for s in queue}
+                        _emitted = (
+                            _dnd_state.get("queue")
+                            if isinstance(_dnd_state, dict)
+                            else getattr(_dnd_state, "queue", None)
+                        )
                         _dnd_changed = False
-
-                        # Riordino: nuova sequenza completa di uid.
-                        _ord = _dnd_trig("order")
-                        _uids_now = [s["_uid"] for s in queue]
-                        if (
-                            isinstance(_ord, (list, tuple))
-                            and len(_ord) == len(_uids_now)
-                            and set(_ord) == set(_uids_now)
-                            and list(_ord) != _uids_now
-                        ):
-                            queue[:] = [_by_uid[u] for u in _ord]
-                            _dnd_changed = True
-                            st.toast(
-                                f"↕️ Coda di '{vname}' riordinata e salvata."
-                            )
-
-                        # Rimozione step.
-                        _rm = _dnd_trig("remove")
-                        if isinstance(_rm, str) and _rm in _by_uid:
-                            queue[:] = [s for s in queue if s["_uid"] != _rm]
-                            _dnd_changed = True
-                            st.toast(
-                                f"✕ Step rimosso dalla coda di '{vname}'."
-                            )
-
-                        # Modifica livello target.
-                        _lv = _dnd_trig("level")
-                        if isinstance(_lv, dict) and _lv.get("id") in _by_uid:
-                            _by_uid[_lv["id"]]["target_level"] = max(
-                                0, min(20, int(_lv.get("level") or 0))
-                            )
-                            _dnd_changed = True
-
-                        # Aggiunta nuovo step.
-                        _ad = _dnd_trig("add")
-                        if (
-                            isinstance(_ad, dict)
-                            and str(_ad.get("key") or "") in canonical_focus_keys
-                        ):
-                            queue.append({
-                                "key": str(_ad["key"]),
-                                "target_level": max(
-                                    0, min(20, int(_ad.get("level") or 0))
-                                ),
-                                "_uid": uuid.uuid4().hex[:8],
-                            })
-                            _dnd_changed = True
-                            st.toast(
-                                f"➕ Step aggiunto alla coda di '{vname}'."
-                            )
+                        if isinstance(_emitted, list):
+                            # Riconciliazione completa: la coda emessa
+                            # [{id,key,level}] e' autoritativa per
+                            # ordine, livelli, aggiunte e rimozioni.
+                            _by_uid = {s["_uid"]: s for s in queue}
+                            _rebuilt: list[dict] = []
+                            for _it in _emitted:
+                                if not isinstance(_it, dict):
+                                    continue
+                                _k = str(_it.get("key") or "")
+                                if _k not in canonical_focus_keys:
+                                    continue
+                                _lv = max(
+                                    0, min(20, int(_it.get("level") or 0))
+                                )
+                                _uid = str(_it.get("id") or "")
+                                _prev = _by_uid.get(_uid)
+                                if _prev is not None and _prev["key"] == _k:
+                                    _prev["target_level"] = _lv
+                                    _rebuilt.append(_prev)
+                                else:
+                                    _rebuilt.append({
+                                        "key": _k,
+                                        "target_level": _lv,
+                                        "_uid": _uid
+                                        or uuid.uuid4().hex[:8],
+                                    })
+                            _sig_new = [
+                                (s["key"], int(s["target_level"]))
+                                for s in _rebuilt
+                            ]
+                            _sig_cur = [
+                                (s["key"], int(s["target_level"]))
+                                for s in queue
+                            ]
+                            if _sig_new != _sig_cur:
+                                queue[:] = _rebuilt
+                                _dnd_changed = True
+                                st.toast(
+                                    f"↕️ Coda di '{vname}' aggiornata e "
+                                    "salvata."
+                                )
 
                         if _dnd_changed:
                             _dnd_cfg = cur_acc.villages.get(vname) or (
@@ -1584,6 +1610,7 @@ if page == "Villaggi":
                         _queue_sorter(
                             [
                                 {"id": s["_uid"],
+                                 "key": s["key"],
                                  "label": building_focus_labels.get(
                                      s["key"], s["key"]),
                                  "level": int(s.get("target_level") or 0)}
