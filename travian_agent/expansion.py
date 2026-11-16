@@ -805,6 +805,10 @@ class ExpansionManager:
         settlers = await get_available_settlers(
             observer, residence.slot_id, founder.village_id
         )
+        # Snapshot per la telemetria: 'Coloni: X/3' nella card founder.
+        founder_state = (states_by_village or {}).get(founder.name or "")
+        if founder_state is not None:
+            founder_state.settlers_home = settlers
         if settlers < SETTLERS_REQUIRED:
             # Addestra coloni + attiva rete feeder verso il fondatore
             self.feed_target = founder.name

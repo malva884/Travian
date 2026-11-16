@@ -232,6 +232,10 @@ class GameState:
     fields: list[Field] = field(default_factory=list)
     build_queue: list[BuildQueueItem] = field(default_factory=list)
     incoming_attacks: int = 0
+    # Movimenti truppe dalla Piazza d'Armi (radar telemetria):
+    # dettaglio con tipo, countdown all'impatto e controparte.
+    incoming_moves: list["IncomingAttack"] = field(default_factory=list)
+    outgoing_moves: list["IncomingAttack"] = field(default_factory=list)
     village_name: str = ""
     village_id: int = 0  # newdid del villaggio attivo durante la lettura
     # snapshot risorse/capacita' degli altri villaggi (nome -> Resources)

@@ -1,10 +1,10 @@
-# Tema dark "security console" (stile Raven.io / Aperture)
+# Tema dark "Command Center // Ops Console" (obsidian + cyan)
 [theme]
 base = "dark"
-primaryColor = "#f97316"
-backgroundColor = "#0c0e12"
-secondaryBackgroundColor = "#14181e"
-textColor = "#e2e6ec"
+primaryColor = "#06b6d4"
+backgroundColor = "#070b14"
+secondaryBackgroundColor = "#0e1525"
+textColor = "#e2e8f0"
 font = "sans serif"
 
 [browser]

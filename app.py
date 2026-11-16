@@ -133,7 +133,7 @@ _DND_QUEUE_SORTER = st.components.v2.component(
   border: 1px solid var(--st-border-color, rgba(128,128,128,.35));
   border-radius: 6px; cursor: pointer; padding: 1px 7px; font-size: 12px;
 }
-.dq-btn:hover { border-color: var(--st-primary-color, #f63366); }
+.dq-btn:hover { border-color: var(--st-primary-color, #06b6d4); }
 .dq-addrow { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
 """,
     js="""
@@ -653,6 +653,76 @@ def _selected_account() -> "Settings | None":
 
 # Caricamento account configurati
 accounts = load_accounts()
+
+# ============================================================================
+# COMMAND CENTER SUITE — il template in web/command_center/index.html
+# SOSTITUISCE l'intera UI Streamlit (sidebar + dispatch pagine qui sotto
+# restano nel codice ma non vengono piu' renderizzati: st.stop()).
+# La telemetria di OGNI account viene iniettata nella pagina
+# (__EMBEDDED_ALL_STATES__) cosi' lo switch account funziona anche in
+# modalita' embedded, dove non esiste /api/dashboard-state.
+# ============================================================================
+_sel_acc = _selected_account()
+
+
+def _load_snapshot(path) -> dict:
+    if path is None:
+        return {}
+    try:
+        _p = Path(path)
+        if _p.exists():
+            return json.loads(_p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+_snap_path = (
+    telemetry.telemetry_path(_sel_acc.account_id)
+    if _sel_acc is not None
+    else telemetry.latest_telemetry_path()
+)
+_snap = _load_snapshot(_snap_path)
+_all_snaps = {
+    a.account_id: _load_snapshot(telemetry.telemetry_path(a.account_id))
+    for a in accounts
+}
+
+_cc_html_path = BASE_DIR / "web" / "command_center" / "index.html"
+if not _cc_html_path.exists():
+    st.error("web/command_center/index.html non trovato.")
+    st.stop()
+
+_doc = _cc_html_path.read_text(encoding="utf-8")
+_inject = (
+    "<script>window.__EMBEDDED__=true;window.__EMBEDDED_ACCOUNTS__="
+    + json.dumps(
+        [{"id": a.account_id, "url": a.server_url} for a in accounts],
+        ensure_ascii=False,
+    ).replace("</", "<\\/")
+    + ";window.__EMBEDDED_ALL_STATES__="
+    + json.dumps(_all_snaps, ensure_ascii=False).replace("</", "<\\/")
+    + ";window.__EMBEDDED_STATE__="
+    + json.dumps(_snap or None, ensure_ascii=False).replace("</", "<\\/")
+    + ";</script>"
+)
+_doc = _doc.replace("<script>", _inject + "\n<script>", 1)
+
+# Chrome Streamlit nascosto: l'iframe occupa tutta la viewport.
+st.markdown(
+    "<style>"
+    "[data-testid='stHeader'], [data-testid='stToolbar'], footer {display:none !important;}"
+    "[data-testid='stMainBlockContainer'], .block-container {padding:0 !important; max-width:100% !important;}"
+    "iframe {height:100vh !important; border:0 !important;}"
+    "</style>",
+    unsafe_allow_html=True,
+)
+components.html(_doc, height=1000, scrolling=True)
+
+# Auto-refresh telemetria: ricarica la pagina ogni 8s.
+time.sleep(8)
+st.rerun()
+st.stop()
 
 # --- BARRA LATERALE ---
 with st.sidebar:

@@ -14,7 +14,11 @@ from . import db, selectors
 from .actions import ActionExecutor
 from .ai_scout_brain import AIScoutBrain, assess_account_power
 from .brain import LLMBrain, RuleBasedBrain
-from .browser import TravianBrowser
+from .browser import (
+    ConcurrentSessionError,
+    TravianBrowser,
+    navigate_via_dom,
+)
 from .builder import (
     bootstrap_complete,
     crop_threshold,
@@ -52,6 +56,7 @@ from .farming import FarmingManager, find_rally_point
 from .hero import HeroManager
 from .models import (
     Action,
+    ActionResult,
     ActionType,
     Field,
     GameState,
@@ -74,6 +79,11 @@ from .presets import (
 )
 from .replenishment import TroopReplenishmentManager
 from .sensors import GameObserver
+from .stealth import (
+    ModulePauseRegistry,
+    human_cycle_interval,
+    night_sleep_remaining,
+)
 from . import telemetry
 from .war import (
     MAX_WAVES_PER_DISPATCH,
@@ -102,6 +112,58 @@ _war_stores: dict[str, WarStore] = {}
 # Throttle del ciclo Fucina auto (villaggio -> ts ultimo tentativo).
 _last_smithy_try: dict[str, float] = {}
 SMITHY_RETRY_SECONDS = 1800.0  # un tentativo ogni ~30 min per villaggio
+# Pause anti-detection: moduli in SKIPPED/BLOCKED non riprovano al
+# ciclo successivo ma dopo 15-30 min (o al cambio delle risorse).
+_module_pauses = ModulePauseRegistry()
+
+
+def _module_pause_left(
+    settings: Settings,
+    village_key: str,
+    module: str,
+    decision: str | None = None,
+    resources: Resources | None = None,
+) -> float:
+    """Secondi residui di pausa del modulo; 0 se eseguibile.
+
+    ``decision=None`` = qualunque pausa del modulo (gate a livello
+    di chiamata del manager). Passare ``resources`` per lo sblocco
+    anticipato quando i magazzini cambiano sensibilmente.
+    """
+    if not getattr(settings, "stealth_pauses", True):
+        return 0.0
+    return _module_pauses.remaining(
+        settings.account_id,
+        village_key,
+        module,
+        decision,
+        resources=resources,
+    )
+
+
+def _record_module_paused(
+    settings: Settings,
+    *,
+    state: GameState | None = None,
+    village: Village | None = None,
+    module: str,
+    decision: str,
+    remaining: float,
+) -> None:
+    """Audit del salto per pausa anti-detection (decisione esente:
+    'MODULE_PAUSED' non ri-pausa il modulo)."""
+    _record_decision(
+        settings,
+        state=state,
+        village=village,
+        module=module,
+        decision="MODULE_PAUSED",
+        outcome=DECISION_OUTCOME_SKIPPED,
+        reason=(
+            f"Modulo in pausa anti-detection dopo esito di '{decision}': "
+            f"riprovo tra {int(remaining)}s"
+        ),
+    )
 
 
 def _persist_village_coords(
@@ -1163,6 +1225,28 @@ _audit_last_write: dict[tuple, float] = {}
 _audit_jsonl_compacted: dict[str, float] = {}
 _AUDIT_JSONL_COMPACT_EVERY = 3600.0
 
+# Decisioni che NON mettono in pausa il modulo: diagnostica, stati di
+# monitoraggio benigni ed esiti di pause gia' attive. Senza esenzioni,
+# uno SKIPPED di routine (es. 'step coda scavalcato', 'attacco solo
+# monitorato', 'drain non necessario') spegnerebbe per 15-30 min
+# moduli che invece devono restare sempre attivi (difesa = emergenze).
+_PAUSE_EXEMPT_DECISIONS = frozenset(
+    {
+        "PRIORITY_QUEUE_STEP",   # diagnostica builder, non un fallimento
+        "ATTACK_MONITORED",     # stato di sorveglianza, non un blocco
+        "ATTACK_DETECTED",      # rilevamento, gia' EXECUTED comunque
+        "RESOURCE_DRAIN",       # 'stock basso' e' benigno e frequente
+        "MARKET_DRAIN",         # 'surplus coperto dai cranny' benigno
+        "TROOP_DODGE",          # skip per poche truppe: il monitor resta
+        "DODGE_SCHEDULED",
+        "EMERGENCY_LOCK",
+        "MODULE_PAUSED",        # esito del gate stesso: non ri-pausare
+        "MODULE_EVENT",         # fallback generico dei moduli
+        "NEW_VILLAGE_BOOTSTRAP",
+    }
+)
+_PAUSE_EXEMPT_PREFIXES = ("MANUAL_",)  # comandi utente dal Command Center
+
 
 def _audit_entry(
     settings: Settings,
@@ -1253,6 +1337,33 @@ def _record_decision(
             reason=reason,
             context=context,
         )
+        # Anti-detection: un modulo che fallisce (SKIPPED/BLOCKED) va in
+        # pausa 15-30 min invece di riprovare al ciclo dopo. Registrato
+        # PRIMA della dedup: eventi ripetuti rinnovano la pausa.
+        _vkey = str(entry["village_id"] or entry["village_name"] or "0")
+        if outcome == DECISION_OUTCOME_EXECUTED:
+            # Un successo sblocca subito la pausa della stessa decisione.
+            _module_pauses.clear(
+                settings.account_id, _vkey, module, decision
+            )
+        elif (
+            outcome in (
+                DECISION_OUTCOME_SKIPPED,
+                DECISION_OUTCOME_BLOCKED,
+            )
+            and getattr(settings, "stealth_pauses", True)
+            and decision not in _PAUSE_EXEMPT_DECISIONS
+            and not decision.startswith(_PAUSE_EXEMPT_PREFIXES)
+        ):
+            _module_pauses.register(
+                settings.account_id,
+                _vkey,
+                module,
+                decision,
+                resources=state.resources if state is not None else None,
+                min_seconds=settings.module_pause_minutes * 60.0,
+                max_seconds=settings.module_pause_max_minutes * 60.0,
+            )
         if outcome in (
             DECISION_OUTCOME_SKIPPED,
             DECISION_OUTCOME_BLOCKED,
@@ -1572,14 +1683,25 @@ async def monitor_all_villages(
         vname = village.name or f"villaggio {v_idx + 1}"
         vprefix = f"{prefix}[{vname}:{village.role}]"
         try:
-            # Naviga al villaggio specifico (l'URL contiene già il newdid)
+            # Naviga al villaggio specifico (l'URL contiene già il newdid).
+            # Anti-detection: con dom_navigation si prova il click sulla
+            # sidebar prima di un GET diretto dell'URL completo.
             if village.url:
-                if village.url.startswith("http"):
-                    await browser.page.goto(
-                        village.url, wait_until="domcontentloaded"
-                    )
-                else:
-                    await browser.goto(village.url)
+                _nav_ok = False
+                if getattr(settings, "dom_navigation", False):
+                    try:
+                        _nav_ok = await navigate_via_dom(
+                            browser.page, village.url
+                        )
+                    except Exception:
+                        _nav_ok = False
+                if not _nav_ok:
+                    if village.url.startswith("http"):
+                        await browser.page.goto(
+                            village.url, wait_until="domcontentloaded"
+                        )
+                    else:
+                        await browser.goto(village.url)
             elif v_idx > 0:
                 logger.warning("%s Villaggio '%s' privo di URL newdid, impossibile navigare.", prefix, vname)
                 continue  # senza URL non si può cambiare villaggio
@@ -1704,6 +1826,30 @@ async def monitor_all_villages(
                     managers=(defense_mgr,),
                 )
 
+            # 3.52 Movimenti truppe (telemetria radar): in arrivo e in
+            #     partenza dalla Piazza d'Armi. Con la difesa attiva la
+            #     pagina e' gia' stata caricata da get_incoming_attacks:
+            #     nessuna navigazione extra in quel caso.
+            rally_mv = find_rally_point(state.interior_fields())
+            if rally_mv is not None:
+                try:
+                    inc, outg = await observer.get_troop_movements(
+                        rally_mv.slot_id, village.village_id
+                    )
+                    state.incoming_moves = inc
+                    state.outgoing_moves = outg
+                    hostile = [a for a in inc if a.is_threat]
+                    if hostile:
+                        state.incoming_attacks = max(
+                            state.incoming_attacks, len(hostile)
+                        )
+                except Exception as mv_exc:
+                    logger.debug(
+                        "%s Lettura movimenti truppe fallita "
+                        "(non bloccante): %s",
+                        vprefix, mv_exc,
+                    )
+
             # 3.55 Smart Reinforce Coordinator: il villaggio corrente,
             #     se non minacciato, valuta il registro attacchi e manda
             #     un muro di rinforzo ai villaggi alleati sotto attacco.
@@ -1712,24 +1858,43 @@ async def monitor_all_villages(
                 and settings.defense.enabled
                 and settings.defense.reinforce_coordination
             ):
-                rally_co = find_rally_point(state.interior_fields())
+                _pl = _module_pause_left(
+                    settings,
+                    str(village.village_id or village.name or "0"),
+                    "defense",
+                    "REINFORCE_SEND",
+                    resources=state.resources,
+                )
+                if _pl > 0:
+                    _record_module_paused(
+                        settings,
+                        state=state,
+                        village=village,
+                        module="defense",
+                        decision="REINFORCE_SEND",
+                        remaining=_pl,
+                    )
+                    rally_co = None
+                else:
+                    rally_co = find_rally_point(state.interior_fields())
                 market_co = find_market(state.interior_fields())
                 try:
-                    await _coordinate_inter_village_defense(
-                        executor=executor,
-                        observer=observer,
-                        settings=settings,
-                        village=village,
-                        state=state,
-                        villages=villages,
-                        last_states=last_states,
-                        defense_mgr=defense_mgr,
-                        replenish_mgr=replenish_mgr,
-                        rally_slot=rally_co.slot_id if rally_co else 0,
-                        market_slot=market_co.slot_id if market_co else 0,
-                        prefix=vprefix,
-                        now=time.time(),
-                    )
+                    if rally_co is not None:
+                        await _coordinate_inter_village_defense(
+                            executor=executor,
+                            observer=observer,
+                            settings=settings,
+                            village=village,
+                            state=state,
+                            villages=villages,
+                            last_states=last_states,
+                            defense_mgr=defense_mgr,
+                            replenish_mgr=replenish_mgr,
+                            rally_slot=rally_co.slot_id if rally_co else 0,
+                            market_slot=market_co.slot_id if market_co else 0,
+                            prefix=vprefix,
+                            now=time.time(),
+                        )
                 except Exception as rc_exc:
                     logger.warning(
                         "%s Errore coordinatore rinforzi "
@@ -1877,25 +2042,50 @@ async def monitor_all_villages(
             rule_name = str(
                 (action.params or {}).pop("rule", "") or ""
             )
-            result = await executor.execute(action, village_id=target_vid)
-            _append_history(settings.account_id, state, action)
-            _record_decision(
+            # Anti-detection: un modulo in pausa non riprova l'azione
+            # al ciclo successivo (es. coda piena, deficit risorse).
+            _act_mod = _action_module(action)
+            _pl = _module_pause_left(
                 settings,
-                state=state,
-                village=village,
-                module=_action_module(action),
-                decision=action.type.value.upper(),
-                outcome=(
-                    DECISION_OUTCOME_EXECUTED
-                    if result.success
-                    else DECISION_OUTCOME_BLOCKED
-                ),
-                reason=action.reason or result.message or "",
-                context={
-                    "rule": rule_name,
-                    "executor_message": result.message,
-                },
+                str(village.village_id or village.name or "0"),
+                _act_mod,
+                action.type.value.upper(),
+                resources=state.resources,
             )
+            if _pl > 0:
+                _record_module_paused(
+                    settings,
+                    state=state,
+                    village=village,
+                    module=_act_mod,
+                    decision=action.type.value.upper(),
+                    remaining=_pl,
+                )
+                result = ActionResult(
+                    True,
+                    f"modulo '{_act_mod}' in pausa anti-detection",
+                )
+                _append_history(settings.account_id, state, action)
+            else:
+                result = await executor.execute(action, village_id=target_vid)
+                _append_history(settings.account_id, state, action)
+                _record_decision(
+                    settings,
+                    state=state,
+                    village=village,
+                    module=_action_module(action),
+                    decision=action.type.value.upper(),
+                    outcome=(
+                        DECISION_OUTCOME_EXECUTED
+                        if result.success
+                        else DECISION_OUTCOME_BLOCKED
+                    ),
+                    reason=action.reason or result.message or "",
+                    context={
+                        "rule": rule_name,
+                        "executor_message": result.message,
+                    },
+                )
             if not result.success:
                 logger.warning(
                     "%s Azione non eseguita: %s", vprefix, result.message
@@ -1977,18 +2167,34 @@ async def monitor_all_villages(
             # 4.1 Modulo farming: raid sui Custom Farm Targets approvati
             # (fallback: farm list nativa del Punto di Raduno), se scaduto
             if farming_mgr is not None and is_raiding_role:
+                _pl = _module_pause_left(
+                    settings,
+                    str(village.village_id or village.name or "0"),
+                    "farming",
+                    resources=state.resources,
+                )
+                if _pl > 0:
+                    _record_module_paused(
+                        settings,
+                        state=state,
+                        village=village,
+                        module="farming",
+                        decision="RAID_SEND",
+                        remaining=_pl,
+                    )
                 rally = find_rally_point(state.interior_fields())
                 try:
-                    await farming_mgr.run_for_village(
-                        browser=browser,
-                        observer=observer,
-                        executor=executor,
-                        settings=settings,
-                        village=village,
-                        rally_slot=rally.slot_id if rally else 0,
-                        prefix=vprefix,
-                        farm_store=farm_store,
-                    )
+                    if _pl <= 0:
+                        await farming_mgr.run_for_village(
+                            browser=browser,
+                            observer=observer,
+                            executor=executor,
+                            settings=settings,
+                            village=village,
+                            rally_slot=rally.slot_id if rally else 0,
+                            prefix=vprefix,
+                            farm_store=farm_store,
+                        )
                 except Exception as f_exc:
                     logger.warning("%s Errore modulo farming: %s", vprefix, f_exc)
                 _flush_module_audits(
@@ -2005,8 +2211,23 @@ async def monitor_all_villages(
 
             # 4.1.b Modulo AI Scout Brain: raid dinamico a coordinate libere basato su radar mappa e report
             if scout_brain is not None and settings.scout_brain.enabled and is_raiding_role:
+                _pl = _module_pause_left(
+                    settings,
+                    str(village.village_id or village.name or "0"),
+                    "scout",
+                    resources=state.resources,
+                )
+                if _pl > 0:
+                    _record_module_paused(
+                        settings,
+                        state=state,
+                        village=village,
+                        module="scout",
+                        decision="TARGET_FILTER",
+                        remaining=_pl,
+                    )
                 rally = find_rally_point(state.interior_fields())
-                if rally is not None:
+                if rally is not None and _pl <= 0:
                     try:
                         troops = await observer.read_troops_home(rally.slot_id, village.village_id)
                         if troops:
@@ -2238,11 +2459,26 @@ async def monitor_all_villages(
                         "(emergenza difesa attiva)"
                     ),
                 )
+            _pl = _module_pause_left(
+                settings,
+                str(village.village_id or village.name or "0"),
+                "replenishment",
+                resources=state.resources,
+            )
             if (
                 replenish_mgr is not None
                 and settings.replenishment.enabled
                 and not emergency_locked
             ):
+                if _pl > 0:
+                    _record_module_paused(
+                        settings,
+                        state=state,
+                        village=village,
+                        module="replenishment",
+                        decision="TROOP_TRAINING",
+                        remaining=_pl,
+                    )
                 try:
                     # Scenario 2: il villaggio sotto assedio blocca rimpiazzo
                     # e rinforzi; se la difesa e' stabile si sblocca da solo.
@@ -2255,9 +2491,13 @@ async def monitor_all_villages(
                     vcfg_rep = settings.village_config_for(
                         village.name, target_vid
                     )
-                    if vcfg_rep is not None and (
-                        vcfg_rep.troop_targets
-                        or vcfg_rep.troop_replenishment_preset
+                    if (
+                        _pl <= 0
+                        and vcfg_rep is not None
+                        and (
+                            vcfg_rep.troop_targets
+                            or vcfg_rep.troop_replenishment_preset
+                        )
                     ):
                         # Scenario 1: report -> blocco target suicida e
                         # congelamento unita' offensive coinvolte.
@@ -2436,6 +2676,13 @@ async def monitor_all_villages(
                     and smithy is not None
                     and emergency_locked
                     and (time.time() - last_try) >= SMITHY_RETRY_SECONDS
+                    and _module_pause_left(
+                        settings,
+                        str(village.village_id or village.name or "0"),
+                        "smithy",
+                        resources=state.resources,
+                    )
+                    <= 0
                 ):
                     _last_smithy_try[vname] = time.time()
                     _record_decision(
@@ -2454,6 +2701,13 @@ async def monitor_all_villages(
                     and smithy is not None
                     and not emergency_locked
                     and (time.time() - last_try) >= SMITHY_RETRY_SECONDS
+                    and _module_pause_left(
+                        settings,
+                        str(village.village_id or village.name or "0"),
+                        "smithy",
+                        resources=state.resources,
+                    )
+                    <= 0
                 ):
                     _last_smithy_try[vname] = time.time()
 
@@ -2565,7 +2819,23 @@ async def monitor_all_villages(
                     else (market.slot_id if market is not None else 0)
                 )
                 surplus = feeder_surplus(state)
-                if market_slot and surplus:
+                _pl = _module_pause_left(
+                    settings,
+                    str(village.village_id or village.name or "0"),
+                    "expansion",
+                    "FEEDER_SEND",
+                    resources=state.resources,
+                )
+                if _pl > 0 and market_slot and surplus:
+                    _record_module_paused(
+                        settings,
+                        state=state,
+                        village=village,
+                        module="expansion",
+                        decision="FEEDER_SEND",
+                        remaining=_pl,
+                    )
+                if market_slot and surplus and _pl <= 0:
                     f_target = expansion_mgr.feed_target
                     # Destinatario per nome o newdid: le coordinate del
                     # payload si leggono SOLO dal suo record, mai dal
@@ -2683,6 +2953,23 @@ async def monitor_all_villages(
                 and not expansion_mgr.feed_target
                 else {}
             )
+            _pl = _module_pause_left(
+                settings,
+                str(village.village_id or village.name or "0"),
+                "expansion",
+                "BOOTSTRAP_BRIDGE",
+                resources=state.resources,
+            )
+            if bt and _pl > 0:
+                _record_module_paused(
+                    settings,
+                    state=state,
+                    village=village,
+                    module="expansion",
+                    decision="BOOTSTRAP_BRIDGE",
+                    remaining=_pl,
+                )
+                bt = {}
             if bt:
                 b_id = int(bt.get("village_id") or 0)
                 b_name = str(bt.get("name") or "")
@@ -2816,7 +3103,15 @@ async def monitor_all_villages(
         )
 
     # 3. Step espansione account-level: coloni/CP/target dopo il giro
-    if expansion_mgr is not None:
+    _pl = _module_pause_left(settings, "0", "expansion")
+    if _pl > 0:
+        _record_module_paused(
+            settings,
+            module="expansion",
+            decision="NEW_VILLAGE",
+            remaining=_pl,
+        )
+    if expansion_mgr is not None and _pl <= 0:
         try:
             await expansion_mgr.step(
                 browser=browser,
@@ -2837,7 +3132,15 @@ async def monitor_all_villages(
         )
 
     # 3.1 Modulo eroe: cura, avventure, attributi (account-level, con cooldown)
-    if hero_mgr is not None and settings.hero.enabled:
+    _pl = _module_pause_left(settings, "0", "hero")
+    if _pl > 0:
+        _record_module_paused(
+            settings,
+            module="hero",
+            decision="HERO_TASKS",
+            remaining=_pl,
+        )
+    if hero_mgr is not None and settings.hero.enabled and _pl <= 0:
         try:
             await hero_mgr.run(browser=browser, settings=settings, prefix=prefix)
         except Exception as h_exc:
@@ -2945,11 +3248,13 @@ async def run_single_account_loop(
                     await browser.recover()
                     assert browser.page is not None
                     observer = GameObserver(browser.page)
+                    observer.dom_nav = settings.dom_navigation
                     executor = ActionExecutor(browser, settings)
 
                 assert browser.page is not None
                 if observer is None:
                     observer = GameObserver(browser.page)
+                    observer.dom_nav = settings.dom_navigation
                 else:
                     observer.page = browser.page
 
@@ -3027,7 +3332,7 @@ async def run_single_account_loop(
                 if once:
                     return
 
-                interval = random.uniform(
+                interval = human_cycle_interval(
                     settings.loop_interval_min, settings.loop_interval_max
                 )
                 logger.info("%s Prossimo ciclo tra %.0fs", prefix, interval)
@@ -3047,6 +3352,66 @@ async def run_single_account_loop(
                     await asyncio.sleep(_step)
                     _waited += _step
 
+                # Sonno notturno: nessuna richiesta per 4-6h (inizio e
+                # durata randomizzati per giorno intorno al base_hour).
+                _ns_left = (
+                    night_sleep_remaining(
+                        settings.account_id,
+                        base_hour=settings.night_sleep_start_hour,
+                        hours_min=settings.night_sleep_hours_min,
+                        hours_max=settings.night_sleep_hours_max,
+                    )
+                    if settings.night_sleep_enabled
+                    else 0.0
+                )
+                if _ns_left > 0:
+                    logger.info(
+                        "%s Sonno notturno: prossima attivita' tra %.0f min.",
+                        prefix,
+                        _ns_left / 60.0,
+                    )
+                _ns_waited = 0.0
+                while _ns_waited < _ns_left:
+                    # I flag operativi restano attivi anche durante il sonno.
+                    if stop_file.exists() or pause_file.exists():
+                        logger.info(
+                            "%s Sonno notturno interrotto da flag di controllo.",
+                            prefix,
+                        )
+                        break
+                    if _tick_flag.exists():
+                        _tick_flag.unlink(missing_ok=True)
+                        logger.info(
+                            "%s FORCE_TICK: sonno interrotto dalla dashboard.",
+                            prefix,
+                        )
+                        break
+                    _step = min(60.0, _ns_left - _ns_waited)
+                    await asyncio.sleep(_step)
+                    _ns_waited += _step
+
+            except ConcurrentSessionError as cs_exc:
+                # Login manuale altrove (o sessione invalidata): il bot si
+                # ferma, niente contesa di sessione. Dopo la pausa il loop
+                # riprova il login normalmente.
+                logger.warning(
+                    "%s %s Pausa di cortesia di %.0f min prima del retry.",
+                    prefix,
+                    cs_exc,
+                    settings.session_conflict_pause_minutes,
+                )
+                browser.reset_session_tracking()
+                try:
+                    await asyncio.sleep(
+                        settings.session_conflict_pause_minutes * 60.0
+                    )
+                except asyncio.CancelledError:
+                    logger.info(
+                        "%s Ciclo interrotto durante la pausa sessione.",
+                        prefix,
+                    )
+                    break
+                continue
             except asyncio.CancelledError:
                 logger.info("%s Ciclo interrotto (cancellazione ricevuta).", prefix)
                 break

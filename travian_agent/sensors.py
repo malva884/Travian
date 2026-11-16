@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urljoin
 
@@ -25,6 +26,10 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Dump diagnostici dei parser (testo della pagina quando una lettura
+# non produce dati): stessa convenzione di settings.debug_dir.
+_DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
 
 _DIGITS = re.compile(r"\d+")
 _TIMER = re.compile(r"(?:(\d+)\s*[-+]\s*)?(?:(\d+):)?(\d+):(\d{2})")
@@ -182,8 +187,49 @@ async def _text_of(locator, selector_list: list[str]) -> str:
 class TravianParser:
     """Sensore e Parser ad alte prestazioni: JS Injection + selettori CSS."""
 
+    # Suffix delle tab della Residenza/Palazzo provate da
+    # read_culture_points: il riepilogo CP vive su una tab diversa a
+    # seconda della versione/skin ('' = panoramica di default).
+    _CP_TAB_SUFFIXES = ("", "&tt=3", "&tt=2", "&tt=4", "&tt=1")
+
     def __init__(self, page: Page) -> None:
         self.page = page
+        # Tab Residenza che l'ultima volta conteneva il riepilogo CP:
+        # evita di riprovare tutte le tab a ogni ciclo.
+        self._cp_tab: str | None = None
+        # Anti-detection: navigazione via click DOM quando possibile
+        # (impostata dall'orchestrator da settings.dom_navigation).
+        self.dom_nav: bool = True
+
+    async def _goto(self, url: str, **kwargs) -> None:
+        """Naviga verso ``url`` preferendo i click DOM al GET diretto.
+
+        Tenta prima ``navigate_via_dom`` (sidebar newdid, slot mappa,
+        navbar); se non copre il caso ripiega su ``page.goto``:
+        la resilienza viene sempre prima del realismo.
+        """
+        if self.dom_nav:
+            try:
+                from .browser import navigate_via_dom
+                if await navigate_via_dom(self.page, url):
+                    return
+            except Exception:
+                pass
+        kwargs.setdefault("wait_until", "domcontentloaded")
+        await self.page.goto(url, **kwargs)
+
+    async def _dump_page_text(self, tag: str) -> None:
+        """Salva URL + innerText in debug/<tag>.txt per diagnosi parser."""
+        try:
+            _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            txt = await self.page.evaluate(
+                "() => (document.body && document.body.innerText) || ''"
+            )
+            (_DEBUG_DIR / f"{tag}.txt").write_text(
+                f"URL: {self.page.url}\n\n{txt}", encoding="utf-8"
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     async def get_village_state(self) -> Dict[str, Any]:
         """Raccoglie lo stato completo del villaggio corrente in formato dizionario."""
@@ -808,7 +854,7 @@ class TravianParser:
             target_url = _abs_game_url(current_url, selectors.PATH_DORF2)
             if match:
                 target_url += f"?newdid={match.group(1)}"
-            await page.goto(target_url, wait_until="domcontentloaded")
+            await self._goto(target_url)
 
         try:
             interior_data = await page.evaluate("""
@@ -900,17 +946,94 @@ class TravianParser:
             return []
 
     async def read_production(self, village_id: int = 0) -> dict:
-        """Legge produzione oraria e bilancio netto grano da production.php.
+        """Legge produzione oraria e bilancio netto grano.
 
-        Ritorna {"production": {ResourceType: int}, "crop_balance": int}.
-        La tabella #production di T4.x ha una riga per risorsa (produzione
-        oraria) e una riga finale col bilancio del grano al netto
-        dell'upkeep truppe (valore anche negativo). Se la pagina non
-        e' raggiungibile o la tabella non c'e', ritorna {}.
+        Ritorna {"production": {ResourceType: int}, "crop_balance": int|None}.
+
+        Fonte primaria: i globali JS dello stock bar (``window.production``,
+        ``resources.production``, ``Travian.Game.production``) presenti in
+        OGNI pagina di gioco T4.x — l1..l3 produzione oraria e l4 ritmo
+        netto del contatore grano (anche negativo). Zero navigazioni.
+        Fallback: la tabella di production.php, con righe identificate
+        sia per icona (img.r1-r4, indipendente dalla lingua) sia per
+        nome risorsa localizzato.
         """
         page = self.page
         if page is None:
             return {}
+
+        # 1) Globali JS dello stock bar: nessuna navigazione necessaria.
+        try:
+            gdata = await page.evaluate("""
+                () => {
+                    const num = (v) => {
+                        const s = String(v ?? '')
+                            .replace(/[\\u2212\\u2010-\\u2015]/g, '-');
+                        const m = s.match(/-?\\d[\\d.,\\s]*/);
+                        if (!m) return null;
+                        const n = parseInt(m[0].replace(/[^\\d-]/g, ''), 10);
+                        return isNaN(n) ? null : n;
+                    };
+                    const pick = (o) =>
+                        (o && typeof o === 'object') ? o : null;
+                    const cands = [];
+                    try { cands.push(pick(window.production)); } catch (e) {}
+                    try {
+                        cands.push(pick(window.resources &&
+                            window.resources.production));
+                    } catch (e) {}
+                    try {
+                        if (window.Travian && Travian.Game) {
+                            cands.push(pick(Travian.Game.production));
+                            if (Travian.Game.village) {
+                                cands.push(pick(
+                                    Travian.Game.village.production
+                                ));
+                            }
+                        }
+                    } catch (e) {}
+                    for (const p of cands) {
+                        if (!p) continue;
+                        const out = {
+                            wood: num(p.l1 ?? p.wood ?? p.lumber),
+                            clay: num(p.l2 ?? p.clay),
+                            iron: num(p.l3 ?? p.iron),
+                            crop: num(p.l4 ?? p.crop ?? p.wheat),
+                            // l5 = grano netto (lordo - upkeep truppe):
+                            // il contatore del granaio varia a questo ritmo.
+                            crop_net: num(p.l5 ?? p.freeCrop ?? p.free_crop
+                                          ?? p.cropNet ?? p.crop_net),
+                        };
+                        if (Object.values(out).some(v => v !== null)) {
+                            return out;
+                        }
+                    }
+                    return null;
+                }
+            """)
+        except Exception:
+            gdata = None
+
+        if gdata:
+            prod: dict[ResourceType, int] = {}
+            balance: int | None = None
+            for key, rtype in (
+                ("wood", ResourceType.WOOD),
+                ("clay", ResourceType.CLAY),
+                ("iron", ResourceType.IRON),
+                ("crop", ResourceType.CROP),
+            ):
+                val = safe_int_opt(gdata.get(key))
+                if val is None:
+                    continue
+                prod[rtype] = abs(val)
+            # l5 = bilancio netto grano (lordo - upkeep); se il globale
+            # non lo espone resta None, mai stimato dal lordo.
+            balance = safe_int_opt(gdata.get("crop_net"))
+            if prod or balance is not None:
+                return {"production": prod, "crop_balance": balance}
+
+        # 2) Fallback: tabella di production.php.
         try:
             current_url = page.url or ""
             if "production.php" not in current_url:
@@ -918,20 +1041,26 @@ class TravianParser:
                 target_url = _abs_game_url(current_url, "production.php")
                 if match:
                     target_url += f"?newdid={match.group(1)}"
-                await page.goto(target_url, wait_until="domcontentloaded")
+                await self._goto(target_url)
 
             data = await page.evaluate("""
                 () => {
                     const out = { production: {}, crop_balance: null };
                     const resKeys = {
-                        wood: ['wood', 'legno', 'holz', 'bois', 'madera'],
+                        wood: ['wood', 'legno', 'holz', 'bois', 'madera',
+                               'lumber'],
                         clay: ['clay', 'argilla', 'lehm', 'argile', 'barro'],
                         iron: ['iron', 'ferro', 'eisen', 'fer', 'hierro'],
                         crop: ['crop', 'grano', 'getreide', 'cereale',
                                'cereal', 'wheat', 'blé', 'trigo'],
                     };
+                    const iconKeys = {
+                        r1: 'wood', r2: 'clay', r3: 'iron', r4: 'crop',
+                    };
                     const balKeys = ['bilancio', 'balance', 'saldo',
-                                     'equilibrio', 'equilibre', 'crop balance'];
+                                     'equilibrio', 'equilibre',
+                                     'crop balance', 'free crop',
+                                     'grano libero', 'bilancio del grano'];
                     const toInt = (s) => parseInt(
                         String(s)
                             .replace(/[\\u2212\\u2010-\\u2015]/g, '-')
@@ -956,6 +1085,19 @@ class TravianParser:
                             }
                             return;
                         }
+                        // Icona r1-r4: identificazione indipendente
+                        // dalla lingua (il nome risorsa puo' mancare).
+                        const cls = String(row.className || '') + ' ' +
+                            Array.from(row.querySelectorAll('img,td,th'))
+                                .map(e => String(e.className || ''))
+                                .join(' ');
+                        for (const [ic, res] of Object.entries(iconKeys)) {
+                            if (new RegExp('\\\\b' + ic + '\\\\b').test(cls)
+                                && !(res in out.production)) {
+                                out.production[res] = Math.abs(nums[0]);
+                                return;
+                            }
+                        }
                         for (const [key, words] of Object.entries(resKeys)) {
                             if (words.some(w => txt.includes(w))) {
                                 if (!(key in out.production)) {
@@ -968,7 +1110,7 @@ class TravianParser:
                     return out;
                 }
             """)
-            prod: dict[ResourceType, int] = {}
+            prod = {}
             for key, val in (data or {}).get("production", {}).items():
                 try:
                     prod[ResourceType(key)] = safe_int(val)
@@ -978,10 +1120,16 @@ class TravianParser:
             # None semantico: bilancio non letto -> il consumer decide
             balance = safe_int_opt(raw_balance)
             if not prod and balance is None:
+                await self._dump_page_text("production_parse_fail")
+                logger.info(
+                    "Produzione non letta da production.php (%s) — "
+                    "dump in debug/production_parse_fail.txt",
+                    page.url,
+                )
                 return {}
             return {"production": prod, "crop_balance": balance}
         except Exception as exc:
-            logger.debug("Errore lettura production.php: %s", exc)
+            logger.info("Errore lettura produzione: %s (%s)", exc, page.url)
             return {}
 
     async def read_build_queue(self) -> list[BuildQueueItem]:
@@ -1079,38 +1227,46 @@ class TravianParser:
     ) -> list[IncomingAttack]:
         """Elenca i movimenti in arrivo dalla panoramica del Punto di Raduno.
 
-        Naviga a build.php?id=<rally_slot> e legge le righe 'in' delle
-        tabelle movimenti: tipo (icona att/def), countdown all'impatto,
-        eventuale conteggio truppe leggibile e nome attaccante.
-        Restituisce una lista vuota se il Punto di Raduno non esiste o
+        Wrapper retro-compatibile su :meth:`get_troop_movements` (una
+        sola navigazione per entrambe le direzioni).
+        """
+        incoming, _outgoing = await self.get_troop_movements(
+            rally_slot, village_id
+        )
+        return incoming
+
+    async def get_troop_movements(
+        self, rally_slot: int = 0, village_id: int = 0
+    ) -> tuple[list[IncomingAttack], list[IncomingAttack]]:
+        """Legge (movimenti in arrivo, movimenti in partenza) dalla
+        panoramica del Punto di Raduno.
+
+        Naviga a build.php?id=<rally_slot> e legge le righe 'in'/'out'
+        delle tabelle movimenti: tipo (icona att/def), countdown
+        all'impatto, conteggio truppe leggibile e controparte
+        (attaccante per gli 'in', destinazione per gli 'out').
+        Restituisce due liste vuote se il Punto di Raduno non esiste o
         il parse fallisce.
         """
         if not self.page or not rally_slot:
-            return []
+            return [], []
         url = f"{selectors.PATH_BUILD}?id={rally_slot}"
         if village_id:
             url += f"&newdid={village_id}"
         try:
             if f"id={rally_slot}" not in (self.page.url or ""):
-                await self.page.goto(
+                await self._goto(
                     _abs_game_url(self.page.url or "", url),
-                    wait_until="domcontentloaded",
                     timeout=20000,
                 )
             raw = await self.page.evaluate(
                 """
                 () => {
-                    const out = [];
-                    const rows = document.querySelectorAll(
-                        '#content table.troop_details tr.in, ' +
-                        '#content tr.in, table.troop_details tr.in, ' +
-                        '.troop_details tr.in, #content .troop_details tr'
-                    );
-                    rows.forEach(row => {
+                    const parseRow = (row) => {
                         const img = row.querySelector('img');
                         const imgKey = (
-                            (img && img.getAttribute('class')) || '' + ' ' +
-                            ((img && img.alt) || '')
+                            ((img && img.getAttribute('class')) || '') +
+                            ' ' + ((img && img.alt) || '')
                         ).toLowerCase();
                         let mtype = 'unknown';
                         if (/att\\d?|attack/.test(imgKey)) mtype = 'attack';
@@ -1153,55 +1309,97 @@ class TravianParser:
                             }
                         });
 
-                        // Attaccante/origine, se leggibile dal link giocatore
-                        let attacker = '';
+                        // Controparte: attaccante per 'in', destinazione
+                        // per 'out' (link giocatore/villaggio/mappa).
+                        let other = '';
                         const pLink = row.querySelector(
                             'a[href*="spieler"], a[href*="profile"], a[href*="karte"]'
                         );
                         if (pLink) {
-                            attacker = (pLink.innerText || '').trim();
+                            other = (pLink.innerText || '').trim();
                         }
 
-                        out.push({
+                        return {
                             type: mtype,
                             seconds: secs,
                             count: count,
-                            attacker: attacker,
+                            attacker: other,
                             label: rowText.slice(0, 160),
-                        });
+                        };
+                    };
+                    const incoming = [];
+                    const outgoing = [];
+                    // In T4.x le righe dei movimenti portano la classe
+                    // 'in' (arrivo) o 'out' (partenza). La variante
+                    // '#content .troop_details tr' copre le skin senza
+                    // marcatura esplicita: restano nel bucket 'in'
+                    // (comportamento storico del parser).
+                    document.querySelectorAll(
+                        '#content table.troop_details tr.in, ' +
+                        '#content tr.in, table.troop_details tr.in, ' +
+                        '.troop_details tr.in, #content .troop_details tr'
+                    ).forEach(row => {
+                        const cls = ' ' +
+                            (row.className || '').toLowerCase() + ' ';
+                        if (/\\bout\\b/.test(cls)) {
+                            outgoing.push(parseRow(row));
+                        } else {
+                            incoming.push(parseRow(row));
+                        }
                     });
-                    return out;
+                    document.querySelectorAll(
+                        '#content table.troop_details tr.out, ' +
+                        '#content tr.out, table.troop_details tr.out, ' +
+                        '.troop_details tr.out'
+                    ).forEach(row => outgoing.push(parseRow(row)));
+                    return { incoming: incoming, outgoing: outgoing };
                 }
                 """
             )
         except Exception as exc:
-            logger.debug("Parse attacchi in arrivo fallito: %s", exc)
-            return []
+            logger.debug("Parse movimenti Piazza d'Armi fallito: %s", exc)
+            return [], []
 
         now = time.time()
-        attacks: list[IncomingAttack] = []
-        for item in raw or []:
-            secs = safe_int(item.get("seconds") or 0)
-            attacks.append(
-                IncomingAttack(
-                    movement_type=str(item.get("type") or "unknown"),
-                    seconds_remaining=secs,
-                    troop_count=safe_int(item.get("count") or 0),
-                    arrival_ts=now + secs,
-                    attacker=str(item.get("attacker") or ""),
-                    label=str(item.get("label") or ""),
+
+        def _build(items: list[dict]) -> list[IncomingAttack]:
+            moves: list[IncomingAttack] = []
+            for item in items or []:
+                secs = safe_int(item.get("seconds") or 0)
+                moves.append(
+                    IncomingAttack(
+                        movement_type=str(item.get("type") or "unknown"),
+                        seconds_remaining=secs,
+                        troop_count=safe_int(item.get("count") or 0),
+                        arrival_ts=now + secs,
+                        attacker=str(item.get("attacker") or ""),
+                        label=str(item.get("label") or ""),
+                    )
                 )
-            )
-        if attacks:
+            return moves
+
+        raw = raw or {}
+        incoming = _build(raw.get("incoming") or [])
+        outgoing = _build(raw.get("outgoing") or [])
+        if incoming:
             logger.info(
                 "Piazza d'Armi: %d movimenti in arrivo (%s)",
-                len(attacks),
+                len(incoming),
                 ", ".join(
                     f"{a.movement_type} in {a.seconds_remaining}s"
-                    for a in attacks
+                    for a in incoming
                 ),
             )
-        return attacks
+        if outgoing:
+            logger.info(
+                "Piazza d'Armi: %d movimenti in partenza (%s)",
+                len(outgoing),
+                ", ".join(
+                    f"{a.movement_type} in {a.seconds_remaining}s"
+                    for a in outgoing
+                ),
+            )
+        return incoming, outgoing
 
     async def _read_incoming_attacks(self) -> int:
         box = await _first_locator(self.page, selectors.TROOP_MOVEMENT_BOX)
@@ -1245,52 +1443,194 @@ class TravianParser:
     ) -> tuple[int, int, int]:
         """Legge (CP attuali, CP richiesti, PC/giorno) da Residenza/Palazzo.
 
-        Naviga a build.php?id=<slot residenza> e cerca il pattern 'X/Y'
-        accanto alle diciture 'punti cultura' / 'culture points', piu'
-        la produzione giornaliera se riportata nella stessa scheda.
-        Ritorna (0, 0, 0) se la pagina non e' leggibile.
+        Il riepilogo dei Punti Cultura vive su tab diverse a seconda
+        della versione/skin di T4.x (panoramica di default oppure le
+        tab ``&tt=N``): si scansiona prima la tab che ha funzionato
+        l'ultima volta (cache ``_cp_tab``) e poi le altre.
+        Ritorna (0, 0, 0) se nessuna pagina espone il dato.
         """
         if not self.page or not residence_slot:
             return (0, 0, 0)
-        url = f"{selectors.PATH_BUILD}?id={residence_slot}"
-        if village_id:
-            url += f"&newdid={village_id}"
-        try:
-            await self.page.goto(
-                _abs_game_url(self.page.url or "", url),
-                wait_until="domcontentloaded",
-            )
-        except Exception:
-            return (0, 0, 0)
-        try:
-            data = await self.page.evaluate("""
-                () => {
-                    const text = (document.body && document.body.innerText) || '';
-                    // "Punti cultura: 1234 / 5000" o "Culture points 1234/5000"
-                    const m = text.match(
-                        /(?:punti cultura|culture points?|kulturpunkte|puntos? de cultura|points? de culture)[^0-9]{0,30}([0-9][0-9.,]*)[^0-9]{0,5}[/][^0-9]{0,5}([0-9][0-9.,]*)/i
-                    );
-                    const clean = (s) => parseInt(String(s).replace(/[^0-9]/g, ''), 10) || 0;
-                    // Produzione giornaliera (stessa scheda o blocco vicino):
-                    // "produzione: 250 al giorno" / "production 250 per day".
-                    const day = text.match(
-                        /(\\d[0-9.,]*)[^0-9]{0,15}(?:al giorno|per day|pro tag|par jour|al d[ií]a)/i
-                    );
-                    const daily = day ? clean(day[1]) : 0;
-                    if (m) return { have: clean(m[1]), need: clean(m[2]), daily: daily };
-                    const single = text.match(
-                        /(?:punti cultura|culture points?|kulturpunkte|puntos? de cultura|points? de culture)[^0-9]{0,30}([0-9][0-9.,]*)/i
-                    );
-                    return { have: single ? clean(single[1]) : 0, need: 0, daily: daily };
+
+        suffixes = (
+            [self._cp_tab] if self._cp_tab is not None else []
+        ) + [s for s in self._CP_TAB_SUFFIXES if s != self._cp_tab]
+
+        # JS condiviso dalle navigazioni (scan tab + link diretto).
+        cp_eval_js = """
+            () => {
+                const raw = (document.body
+                    && document.body.innerText) || '';
+                // Travian avvolge i numeri nei mark direzionali
+                // U+202D/U+202C: normalizza tutto a spazi.
+                const text = raw.replace(
+                    /[\\u202d\\u202c\\u202f\\u00a0\\u200b]/g, ' ');
+                const clean = (s) => parseInt(
+                    String(s).replace(/[^0-9]/g, ''), 10) || 0;
+                const num = '([0-9][0-9.,\\\\s]*)';
+                const cpLabel =
+                    '(?:punti\\\\s+(?:di\\\\s+)?cultura' +
+                    '|punti\\\\s+culturali|culture\\\\s+points?' +
+                    '|kulturpunkte|puntos?\\\\s+de\\\\s+cultura' +
+                    '|points?\\\\s+de\\\\s+culture)';
+                const out = {
+                    have: 0, need: 0, daily: 0,
+                    matched: false, specific: false,
+                    has_cp: new RegExp(cpLabel, 'i').test(text),
+                };
+                if (!out.has_cp) return out;
+                // Link diretto alla tab CP dalla navbar della
+                // Residenza (la label "Punti cultura" e' presente
+                // nella navbar di tutte le tab).
+                const navLink = Array.from(
+                    document.querySelectorAll('a[href]')
+                ).find((a) => new RegExp(
+                    '^' + cpLabel + '$', 'i'
+                ).test((a.innerText || '').trim()));
+                if (navLink) {
+                    out.cp_nav_href = navLink.href || '';
+                    const tm = (navLink.getAttribute('href') || '')
+                        .match(/tt=(\\d+)/);
+                    if (tm) out.cp_nav_tt = '&tt=' + tm[1];
                 }
-            """)
-            return (
-                safe_int((data or {}).get("have", 0)),
-                safe_int((data or {}).get("need", 0)),
-                safe_int((data or {}).get("daily", 0)),
-            )
-        except Exception:
-            return (0, 0, 0)
+                // -- Campi specifici tab "Punti cultura" T4.x --
+                // have: "Punti cultura prodotti finora 1517"
+                let m = text.match(new RegExp(
+                    cpLabel + '\\\\s+prodotti\\\\s+finora' +
+                    '[^0-9]{0,15}' + num, 'i')) ||
+                    text.match(
+                    /(?:produced\\s+(?:so\\s+far|until\\s+now)|bisher\\s+produziert)[^0-9]{0,15}([0-9][0-9.,\\s]*)/i);
+                if (m) {
+                    out.have = clean(m[1]);
+                    out.matched = true;
+                    out.specific = true;
+                }
+                // need: "Il prossimo villaggio sara' disponibile
+                //        a 2000"
+                m = text.match(
+                    /(?:prossimo\\s+villaggio\\s+sar.{0,10}disponibile\\s+a|prossimo\\s+villaggio\\s+.{0,25}richiede|next\\s+village.{0,20}(?:available|requires)|n.chstes\\s+dorf.{0,25}(?:verf.gbar|ben.tigt))[^0-9]{0,10}([0-9][0-9.,\\s]*)/i
+                );
+                if (m) {
+                    out.need = clean(m[1]);
+                    out.matched = true;
+                    out.specific = true;
+                }
+                // daily: sezione "Punti cultura al giorno" ->
+                //        ultima riga "Totale 123"
+                m = text.match(new RegExp(
+                    cpLabel + '\\\\s+al\\\\s+giorno' +
+                    '[\\\\s\\\\S]{0,400}?(?:totale|total|gesamt)' +
+                    '[^0-9]{0,10}' + num, 'i')) ||
+                    text.match(
+                    /(?:culture\\s+points?\\s+per\\s+day|kulturpunkte\\s+pro\\s+tag)[\\s\\S]{0,400}?(?:total|gesamt)[^0-9]{0,10}([0-9][0-9.,\\s]*)/i);
+                if (m) {
+                    out.daily = clean(m[1]);
+                    out.matched = true;
+                    out.specific = true;
+                }
+                if (out.specific) return out;
+                // -- Fallback generico: "X / Y" o "X di Y" --
+                m = text.match(new RegExp(
+                    cpLabel + '[^0-9]{0,40}' + num +
+                    '[^0-9]{0,10}(?:/|\\\\bdi\\\\b|\\\\bof\\\\b' +
+                    '|\\\\bvon\\\\b|\\\\bde\\\\b)[^0-9]{0,10}' +
+                    num, 'i'));
+                if (m) {
+                    out.have = clean(m[1]);
+                    out.need = clean(m[2]);
+                    out.matched = true;
+                } else {
+                    // \\b impedisce "serve" dentro "server" (l'ora del
+                    // server veniva letta come CP richiesti).
+                    const n = text.match(
+                        /\\b(?:richiesti|necessari|servono|serve|needed|required|ben.tigt|requis|erforderlich)\\b[^0-9]{0,25}([0-9][0-9.,\\s]*)/i
+                    );
+                    if (n) {
+                        out.need = clean(n[1]);
+                        out.matched = true;
+                    }
+                }
+                // daily generico: "250 al giorno", "250 per day"
+                const d = text.match(
+                    /([0-9][0-9.,\\s]*)[^0-9]{0,20}(?:al giorno|per day|a day|pro tag|par jour|al d[ií]a|daily)/i
+                ) || text.match(
+                    /(?:produzione|production|producci.n)[^0-9]{0,25}([0-9][0-9.,\\s]*)[^0-9]{0,15}(?:punti|points|cultur)/i
+                );
+                if (d) out.daily = clean(d[1]);
+                return out;
+            }
+        """
+
+        accepted = None   # (suffix, data) con campi specifici matchati
+        generic = None    # (suffix, data) solo match generico
+        nav_link = None   # (suffix_tt, href) dalla navbar
+        tried = set()     # suffix gia' navigati
+
+        for suffix in suffixes:
+            url = f"{selectors.PATH_BUILD}?id={residence_slot}{suffix}"
+            if village_id:
+                url += f"&newdid={village_id}"
+            tried.add(suffix)
+            try:
+                await self._goto(
+                    _abs_game_url(self.page.url or "", url),
+                )
+            except Exception:
+                continue
+            try:
+                data = await self.page.evaluate(cp_eval_js)
+            except Exception:
+                continue
+            data = data or {}
+            if nav_link is None and data.get("cp_nav_href"):
+                nav_link = (
+                    data.get("cp_nav_tt") or "",
+                    data["cp_nav_href"],
+                )
+            if data.get("specific"):
+                accepted = (suffix, data)
+                break
+            if generic is None and data.get("matched"):
+                generic = (suffix, data)
+            if nav_link:
+                # Link diretto disponibile: evita lo scan cieco.
+                break
+
+        # La navbar espone il link diretto alla tab CP: se la tab
+        # scansionata non aveva campi specifici si naviga li'.
+        if accepted is None and nav_link:
+            nav_suffix, nav_href = nav_link
+            if not nav_suffix or nav_suffix not in tried:
+                try:
+                    await self._goto(nav_href)
+                    data = await self.page.evaluate(cp_eval_js)
+                    data = data or {}
+                    if data.get("matched"):
+                        accepted = (nav_suffix, data)
+                except Exception:
+                    pass
+
+        if accepted is None:
+            accepted = generic
+        if accepted is not None:
+            suffix, data = accepted
+            self._cp_tab = suffix or ""
+            have = safe_int(data.get("have", 0))
+            need = safe_int(data.get("need", 0))
+            daily = safe_int(data.get("daily", 0))
+            # Parse parziale (label CP trovata ma have/daily a zero):
+            # dump per confrontare il formato numerico reale del server.
+            if not have or not daily:
+                await self._dump_page_text("culture_points_partial")
+            return (have, need, daily)
+
+        await self._dump_page_text("culture_points_fail")
+        logger.info(
+            "Punti cultura non letti nella Residenza (slot %s): "
+            "dump in debug/culture_points_fail.txt",
+            residence_slot,
+        )
+        return (0, 0, 0)
 
     async def read_troops_home(self, rally_slot: int = 0, village_id: int = 0) -> dict[str, int]:
         """Legge le truppe presenti nel villaggio.
@@ -1312,9 +1652,8 @@ class TravianParser:
             if village_id:
                 url += f"&newdid={village_id}"
             try:
-                await self.page.goto(
+                await self._goto(
                     _abs_game_url(self.page.url or "", url),
-                    wait_until="domcontentloaded",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
@@ -1326,7 +1665,7 @@ class TravianParser:
             # contingenti del villaggio anche quando la pagina rally ha
             # un markup diverso (spec bugfix parser truppe).
             try:
-                await self.page.goto(
+                await self._goto(
                     _abs_game_url(
                         self.page.url or "",
                         selectors.PATH_DORF1
@@ -1459,9 +1798,8 @@ class TravianParser:
         if village_id:
             url += f"&newdid={village_id}"
         try:
-            await self.page.goto(
+            await self._goto(
                 _abs_game_url(self.page.url or "", url),
-                wait_until="domcontentloaded",
             )
         except Exception:
             return {}
@@ -1513,9 +1851,8 @@ class TravianParser:
         if village_id:
             url += f"&newdid={village_id}"
         try:
-            await self.page.goto(
+            await self._goto(
                 _abs_game_url(self.page.url or "", url),
-                wait_until="domcontentloaded",
             )
         except Exception:
             return []
@@ -1559,9 +1896,8 @@ class TravianParser:
         data: dict | None = None
         for path in ("position_details.php", selectors.PATH_MAP):
             try:
-                await self.page.goto(
+                await self._goto(
                     _abs_game_url(self.page.url or "", f"{path}?x={x}&y={y}"),
-                    wait_until="domcontentloaded",
                 )
             except Exception:
                 continue
@@ -1629,7 +1965,7 @@ class TravianParser:
         if not self.page or not village_id:
             return None
         try:
-            await self.page.goto(
+            await self._goto(
                 _abs_game_url(
                     self.page.url or "",
                     f"{selectors.PATH_MAP}?newdid={village_id}",
@@ -1708,9 +2044,8 @@ class TravianParser:
         if not self.page:
             return []
         try:
-            await self.page.goto(
+            await self._goto(
                 _abs_game_url(self.page.url or "", f"{selectors.PATH_MAP}?x={center_x}&y={center_y}"),
-                wait_until="domcontentloaded",
             )
             # T4.5/T4.6: la griglia mappa e' renderizzata via JS dopo il
             # DOMContentLoaded — attendiamo la comparsa di almeno un tile
@@ -1863,9 +2198,8 @@ class TravianParser:
         if not self.page:
             return []
         try:
-            await self.page.goto(
+            await self._goto(
                 _abs_game_url(self.page.url or "", "berichte.php?t=1"),
-                wait_until="domcontentloaded",
             )
         except Exception:
             return []

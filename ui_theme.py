@@ -21,26 +21,44 @@ import streamlit as st
 
 _CSS = """
 <style>
-/* ============================ PALETTE ============================ */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+/* ============================ PALETTE (Command Center // Ops) ===== */
 :root {
-  --tv-bg:        #0c0e12;
-  --tv-panel:     #14181e;
-  --tv-panel-2:   #191f27;
-  --tv-border:    #232a34;
-  --tv-text:      #e2e6ec;
-  --tv-dim:       #8b93a1;
-  --tv-accent:    #cc5e16;
-  --tv-green:     #fb923c;   /* ex verde — spec: tono arancione in tutta la UI */
-  --tv-red:       #f87171;
+  --tv-bg:        #070b14;   /* obsidian */
+  --tv-panel:     #0e1525;   /* surface */
+  --tv-panel-2:   #131c31;   /* surfaceCard */
+  --tv-border:    rgba(51, 65, 85, 0.65);
+  --tv-text:      #e2e8f0;
+  --tv-dim:       #94a3b8;
+  --tv-accent:    #06b6d4;   /* cyan-500 */
+  --tv-accent-hi: #67e8f9;   /* cyan-300 */
+  --tv-green:     #10b981;   /* emerald-500 */
+  --tv-red:       #ef4444;
   --tv-amber:     #fbbf24;
-  --tv-blue:      #60a5fa;
-  --tv-gray:      #9ca3af;
-  --tv-radius:    10px;
+  --tv-blue:      #22d3ee;   /* cyan-400 */
+  --tv-gray:      #94a3b8;
+  --tv-radius:    16px;      /* rounded-2xl */
+  --tv-radius-sm: 12px;      /* rounded-xl  */
+  --tv-font-sans: "Inter", -apple-system, "Segoe UI", Roboto, sans-serif;
   --tv-font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
 }
 
 /* ============================ BASE ============================ */
-.stApp { background: var(--tv-bg); }
+html, body, .stApp, [data-testid="stAppViewContainer"],
+[data-baseweb], button, input, select, textarea {
+  font-family: var(--tv-font-sans);
+}
+.stApp {
+  background-color: var(--tv-bg);
+  background-image:
+    radial-gradient(circle at 18% 12%, rgba(6, 182, 212, 0.08), transparent 36%),
+    radial-gradient(circle at 85% 88%, rgba(16, 185, 129, 0.06), transparent 36%),
+    linear-gradient(to right, rgba(30, 41, 59, 0.24) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(30, 41, 59, 0.24) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 28px 28px, 28px 28px;
+  background-attachment: fixed;
+}
+::selection { background: rgba(6, 182, 212, 0.3); color: #a5f3fc; }
 header[data-testid="stHeader"] { background: transparent; }
 div[data-testid="stDecoration"] { display: none; }
 footer { visibility: hidden; }
@@ -59,7 +77,8 @@ hr { border-color: var(--tv-border); }
 
 /* ============================ SIDEBAR ============================ */
 section[data-testid="stSidebar"] {
-  background: #0a0c10;
+  background: rgba(10, 16, 30, 0.94);
+  backdrop-filter: blur(14px);
   border-right: 1px solid var(--tv-border);
 }
 section[data-testid="stSidebar"] .block-container { padding: 1.2rem 1rem; }
@@ -99,9 +118,9 @@ div[data-testid="stTabs"] [data-baseweb="tab-border"] { display: none; }
 
 /* ============================ METRIC -> CARD ============================ */
 div[data-testid="stMetric"] {
-  background: var(--tv-panel);
+  background: rgba(14, 21, 37, 0.88);
   border: 1px solid var(--tv-border);
-  border-radius: var(--tv-radius);
+  border-radius: var(--tv-radius-sm);
   padding: 0.9rem 1.1rem;
 }
 div[data-testid="stMetric"] label { color: var(--tv-dim) !important; font-size: 0.8rem; }
@@ -114,9 +133,10 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"] {
 /* ============================ CONTAINERS / EXPANDERS ============================ */
 div[data-testid="stVerticalBlockBorderWrapper"],
 div[data-testid="stExpander"] details {
-  background: var(--tv-panel);
+  background: rgba(14, 21, 37, 0.88);
   border: 1px solid var(--tv-border) !important;
   border-radius: var(--tv-radius) !important;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
 }
 div[data-testid="stExpander"] details summary {
   font-weight: 600;
@@ -128,17 +148,17 @@ div[data-testid="stExpander"] details summary:hover { color: var(--tv-accent); }
 div[data-baseweb="select"] > div,
 div[data-baseweb="input"] > div,
 textarea, input[type="text"], input[type="number"], input[type="password"] {
-  background-color: var(--tv-panel-2) !important;
+  background-color: #020617 !important;   /* slate-950 */
   border-color: var(--tv-border) !important;
-  border-radius: 8px !important;
+  border-radius: 10px !important;
 }
 div[data-baseweb="select"] > div:focus-within,
 div[data-baseweb="input"] > div:focus-within { border-color: var(--tv-accent) !important; }
 
 button[kind="primary"], button[data-testid="stBaseButton-primary"] {
-  background: var(--tv-accent) !important;
-  border-color: var(--tv-accent) !important;
-  color: #0c0e12 !important;
+  background: rgba(6, 182, 212, 0.18) !important;
+  border-color: rgba(6, 182, 212, 0.45) !important;
+  color: var(--tv-accent-hi) !important;
   font-weight: 600;
 }
 button[kind="secondary"], button[data-testid="stBaseButton-secondary"],
@@ -155,7 +175,7 @@ input[type="checkbox"]:checked + div { background: var(--tv-accent) !important; 
   font-family: var(--tv-font-mono) !important;
 }
 pre {
-  background: #0a0c10 !important;
+  background: #020617 !important;
   border: 1px solid var(--tv-border) !important;
   border-radius: var(--tv-radius) !important;
   font-size: 0.78rem !important;
@@ -170,10 +190,10 @@ div[data-testid="stDataFrame"] {
 }
 
 /* ============================ SCROLLBAR ============================ */
-::-webkit-scrollbar { width: 9px; height: 9px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #2a3140; border-radius: 8px; }
-::-webkit-scrollbar-thumb:hover { background: #39414f; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #070b14; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: #06b6d4; }
 
 /* ============================ COMPONENTI CUSTOM ============================ */
 .tv-brand {
@@ -181,22 +201,29 @@ div[data-testid="stDataFrame"] {
   padding: 4px 2px 6px 2px;
 }
 .tv-brand .logo {
-  width: 34px; height: 34px; border-radius: 8px;
-  background: linear-gradient(135deg, var(--tv-accent), #4d7c0f);
+  width: 36px; height: 36px; border-radius: 12px;
+  background: rgba(6, 182, 212, 0.15);
+  border: 1px solid rgba(6, 182, 212, 0.4);
+  box-shadow: 0 0 16px rgba(6, 182, 212, 0.22);
   display: flex; align-items: center; justify-content: center;
   font-size: 18px;
 }
-.tv-brand .name { font-weight: 700; font-size: 0.95rem; letter-spacing: 0.05em; }
-.tv-brand .sub  { color: var(--tv-dim); font-size: 0.7rem; letter-spacing: 0.14em; text-transform: uppercase; }
+.tv-brand .name { font-weight: 700; font-size: 0.95rem; letter-spacing: 0.05em; color: #f1f5f9; }
+.tv-brand .sub  {
+  color: var(--tv-blue); font-size: 0.65rem; letter-spacing: 0.18em;
+  text-transform: uppercase; font-family: var(--tv-font-mono);
+}
 
 .kpi-grid { display: flex; gap: 14px; margin: 6px 0 18px 0; flex-wrap: wrap; }
 .kpi-card {
   flex: 1 1 0; min-width: 180px;
-  background: var(--tv-panel);
+  background: rgba(10, 16, 30, 0.82);
   border: 1px solid var(--tv-border);
-  border-radius: var(--tv-radius);
+  border-radius: var(--tv-radius-sm);
   padding: 14px 18px;
+  transition: border-color 0.2s ease;
 }
+.kpi-card:hover { border-color: rgba(6, 182, 212, 0.45); }
 .kpi-card .kpi-label {
   color: var(--tv-dim); font-size: 0.75rem; font-weight: 600;
   text-transform: uppercase; letter-spacing: 0.08em;
@@ -219,16 +246,17 @@ div[data-testid="stDataFrame"] {
   border: 1px solid transparent;
   white-space: nowrap;
 }
-.pill.success { color: var(--tv-green); border-color: rgba(251,146,60,.35); background: rgba(251,146,60,.08); }
-.pill.danger  { color: var(--tv-red);   border-color: rgba(248,113,113,.35); background: rgba(248,113,113,.08); }
-.pill.warning { color: var(--tv-amber); border-color: rgba(251,191,36,.35);  background: rgba(251,191,36,.08); }
-.pill.info    { color: var(--tv-blue);  border-color: rgba(96,165,250,.35);  background: rgba(96,165,250,.08); }
-.pill.neutral { color: var(--tv-gray);  border-color: rgba(156,163,175,.3);  background: rgba(156,163,175,.07); }
+.pill.success { color: #34d399; border-color: rgba(16,185,129,.35);  background: rgba(16,185,129,.12); }
+.pill.danger  { color: #f87171; border-color: rgba(239,68,68,.35);   background: rgba(239,68,68,.10); }
+.pill.warning { color: #fbbf24; border-color: rgba(251,191,36,.35);  background: rgba(251,191,36,.10); }
+.pill.info    { color: #22d3ee; border-color: rgba(6,182,212,.35);   background: rgba(6,182,212,.12); }
+.pill.neutral { color: #94a3b8; border-color: rgba(148,163,184,.3);  background: rgba(148,163,184,.07); }
 
 /* ---- Console table ---- */
 .tv-table-wrap {
   border: 1px solid var(--tv-border); border-radius: var(--tv-radius);
-  overflow: hidden; background: var(--tv-panel); margin-bottom: 10px;
+  overflow: hidden; background: rgba(14, 21, 37, 0.88); margin-bottom: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
 }
 table.tv-table { width: 100%; border-collapse: collapse; font-size: 0.83rem; }
 table.tv-table thead th {
@@ -239,11 +267,11 @@ table.tv-table thead th {
   background: var(--tv-panel-2);
 }
 table.tv-table tbody td {
-  padding: 9px 14px; border-bottom: 1px solid #1a2029;
+  padding: 9px 14px; border-bottom: 1px solid rgba(51, 65, 85, 0.35);
   color: var(--tv-text); vertical-align: middle;
 }
 table.tv-table tbody tr:last-child td { border-bottom: none; }
-table.tv-table tbody tr:hover td { background: #171c24; }
+table.tv-table tbody tr:hover td { background: rgba(51, 65, 85, 0.22); }
 table.tv-table td.mono, .mono { font-family: var(--tv-font-mono); font-size: 0.78rem; }
 table.tv-table td.dim, .dim { color: var(--tv-dim); }
 
@@ -260,8 +288,9 @@ table.tv-table td.dim, .dim { color: var(--tv-dim); }
 
 /* ---- Village card ---- */
 .vc {
-  background: var(--tv-panel); border: 1px solid var(--tv-border);
+  background: rgba(14, 21, 37, 0.88); border: 1px solid var(--tv-border);
   border-radius: var(--tv-radius); padding: 14px 18px; margin-bottom: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
 }
 .vc-head {
   display: flex; justify-content: space-between; align-items: center;
@@ -280,16 +309,16 @@ table.tv-table td.dim, .dim { color: var(--tv-dim); }
   display: flex; justify-content: space-between;
   font-size: 0.72rem; color: var(--tv-dim); margin-bottom: 4px;
 }
-.bar { height: 6px; background: #1a2029; border-radius: 4px; overflow: hidden; }
-.bar > i { display: block; height: 100%; background: var(--tv-accent); border-radius: 4px; }
+.bar { height: 6px; background: #020617; border-radius: 9999px; overflow: hidden; border: 1px solid rgba(51, 65, 85, 0.5); }
+.bar > i { display: block; height: 100%; background: var(--tv-accent); border-radius: 9999px; }
 .bar.warn > i { background: var(--tv-amber); }
 .bar.crit > i { background: var(--tv-red); }
 .vc-foot {
   color: var(--tv-dim); font-size: 0.74rem;
-  border-top: 1px solid #1a2029; padding-top: 8px;
+  border-top: 1px solid rgba(51, 65, 85, 0.45); padding-top: 8px;
 }
 .vc-foot code {
-  background: #0a0c10; border: 1px solid var(--tv-border);
+  background: #020617; border: 1px solid var(--tv-border);
   padding: 1px 7px; border-radius: 5px; font-size: 0.72rem;
 }
 @media (max-width: 900px) { .vc-bars { grid-template-columns: 1fr; } }
@@ -317,9 +346,11 @@ section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
   background: var(--tv-panel-2) !important;
 }
 section[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"] {
-  background: rgba(132,204,22,.12) !important;
-  color: var(--tv-accent) !important;
-  border-color: rgba(132,204,22,.28) !important;
+  background: linear-gradient(90deg, rgba(6,182,212,.18), rgba(6,182,212,.03)) !important;
+  color: var(--tv-accent-hi) !important;
+  border: 1px solid transparent !important;
+  border-left: 3px solid var(--tv-accent) !important;
+  border-radius: 12px !important;
 }
 </style>
 """
@@ -386,11 +417,17 @@ def render_table(headers: list[str], rows: list[list[str]]) -> None:
     st.markdown(console_table(headers, rows), unsafe_allow_html=True)
 
 
-def brand_block(name: str = "TRAVIAN AGENT", sub: str = "OPS CONSOLE") -> None:
+def brand_block(name: str = "TRAVIAN AGENT", sub: str = "COMMAND CENTER") -> None:
     """Logo + nome nella sidebar, stile icon-rail delle console."""
     st.markdown(
         '<div class="tv-brand">'
-        '<div class="logo">🛡️</div>'
+        '<div class="logo">'
+        '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" '
+        'stroke="#22d3ee" stroke-width="2" stroke-linecap="round" '
+        'stroke-linejoin="round">'
+        '<path d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10'
+        "a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z\""
+        "/></svg></div>"
         f'<div><div class="name">{esc(name)}</div>'
         f'<div class="sub">{esc(sub)}</div></div>'
         "</div>",

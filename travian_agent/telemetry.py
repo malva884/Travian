@@ -301,11 +301,49 @@ def _village_payload(
     town_hall_lvl = max(
         (f.level for f in interiors if f.gid == GID_TOWN_HALL), default=0
     )
+    # Slot map completa (dorf1 campi + dorf2 edifici) per la dashboard:
+    # i campi risorsa non hanno gid nel DOM — si ricava dal resource_type.
+    _res_gid = {"wood": 1, "clay": 2, "iron": 3, "crop": 4}
+    slots = []
+    if state is not None:
+        for f in state.fields:
+            gid = int(getattr(f, "gid", -1) or -1)
+            if f.is_resource_field:
+                rtype = str(
+                    getattr(getattr(f, "resource_type", None), "value", "")
+                    or ""
+                ).lower()
+                gid = _res_gid.get(rtype, gid)
+            slots.append(
+                {
+                    "slot": int(getattr(f, "slot_id", 0) or 0),
+                    "gid": gid,
+                    "name": str(getattr(f, "name", "") or ""),
+                    "level": int(getattr(f, "level", 0) or 0),
+                }
+            )
     role_raw = getattr(village.role, "value", village.role)
     is_capital = str(role_raw).lower() == "capital" or any(
         f.gid == GID_PALACE for f in interiors
     )
     attacks = int(getattr(state, "incoming_attacks", 0) or 0)
+
+    def _mv(move) -> dict:
+        return {
+            "type": str(getattr(move, "movement_type", "") or "unknown"),
+            "seconds": int(getattr(move, "seconds_remaining", 0) or 0),
+            "arrival_ts": float(getattr(move, "arrival_ts", 0.0) or 0.0),
+            "count": int(getattr(move, "troop_count", 0) or 0),
+            "who": str(getattr(move, "attacker", "") or ""),
+            "label": str(getattr(move, "label", "") or "")[:140],
+        }
+
+    moves_in = getattr(state, "incoming_moves", None) or []
+    moves_out = getattr(state, "outgoing_moves", None) or []
+    incoming_payload = [_mv(m) for m in moves_in]
+    if not incoming_payload:
+        # Fallback: conteggio sidebar senza dettagli Piazza d'Armi.
+        incoming_payload = [{"type": "attack"} for _ in range(attacks)]
     return {
         "id": str(village.village_id or village.name),
         "name": village.name,
@@ -325,8 +363,10 @@ def _village_payload(
             "prod_iron": _prod(res, ResourceType.IRON) if res else 0,
             "net_crop": int(getattr(res, "crop_balance", None) or 0),
         },
-        "incoming_attacks": [{"type": "attack"} for _ in range(attacks)],
+        "incoming_attacks": incoming_payload,
+        "outgoing_attacks": [_mv(m) for m in moves_out],
         "building_queue": queue,
+        "slots": slots,
         "settlers": {
             "trained": int(getattr(state, "settlers_home", 0) or 0),
             "in_queue": 0,

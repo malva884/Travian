@@ -239,10 +239,31 @@ class Settings:
     password: str = ""
     account_id: str = "default"
     headless: bool = True
-    loop_interval_min: float = 30.0
-    loop_interval_max: float = 90.0
+    # Intervallo tra due iterazioni del loop (secondi). Default 4-14 min:
+    # cicli al minuto troppo regolari sono un pattern da bot.
+    loop_interval_min: float = 240.0
+    loop_interval_max: float = 840.0
     action_delay_min: float = 0.8
     action_delay_max: float = 2.5
+    # --- Anti-detection (stealth) ---
+    # Pausa dei moduli che vanno in SKIPPED/BLOCKED: non riprovano al
+    # ciclo successivo ma dopo N-M minuti (o prima se cambiano le risorse).
+    stealth_pauses: bool = True
+    module_pause_minutes: float = 15.0
+    module_pause_max_minutes: float = 30.0
+    # Finestra di "sonno" quotidiana: nessun ciclo per 4-6 ore, inizio
+    # e durata randomizzati per giorno intorno a `night_sleep_start_hour`.
+    night_sleep_enabled: bool = True
+    night_sleep_start_hour: float = 1.0
+    night_sleep_hours_min: float = 4.0
+    night_sleep_hours_max: float = 6.0
+    # Navigazione via click DOM (sidebar, mappa villaggio, navbar) con
+    # fallback a page.goto: simula il flusso reale dell'utente.
+    dom_navigation: bool = True
+    # Se la sessione cade a meta' run (login manuale altrove o scadenza),
+    # il bot non combatte per la sessione: attesa di N minuti prima di
+    # ritentare il login (mai due sessioni contemporanee).
+    session_conflict_pause_minutes: float = 25.0
     max_build_queue: int = 2
     max_resource_queue: int = 1
     max_interior_queue: int = 1
@@ -326,10 +347,21 @@ def _parse_account_item(item: dict) -> Settings:
                             username=item.get("username", ""),
                             password=item.get("password", ""),
                             headless=item.get("headless", True),
-                            loop_interval_min=float(item.get("loop_interval_min", 30.0)),
-                            loop_interval_max=float(item.get("loop_interval_max", 90.0)),
+                            loop_interval_min=float(item.get("loop_interval_min", 240.0)),
+                            loop_interval_max=float(item.get("loop_interval_max", 840.0)),
                             action_delay_min=float(item.get("action_delay_min", 0.8)),
                             action_delay_max=float(item.get("action_delay_max", 2.5)),
+                            stealth_pauses=bool(item.get("stealth_pauses", True)),
+                            module_pause_minutes=float(item.get("module_pause_minutes", 15.0)),
+                            module_pause_max_minutes=float(item.get("module_pause_max_minutes", 30.0)),
+                            night_sleep_enabled=bool(item.get("night_sleep_enabled", True)),
+                            night_sleep_start_hour=float(item.get("night_sleep_start_hour", 1.0)),
+                            night_sleep_hours_min=float(item.get("night_sleep_hours_min", 4.0)),
+                            night_sleep_hours_max=float(item.get("night_sleep_hours_max", 6.0)),
+                            dom_navigation=bool(item.get("dom_navigation", True)),
+                            session_conflict_pause_minutes=float(
+                                item.get("session_conflict_pause_minutes", 25.0)
+                            ),
                             max_build_queue=int(item.get("max_build_queue", 2)),
                             max_resource_queue=int(item.get("max_resource_queue", 1)),
                             max_interior_queue=int(item.get("max_interior_queue", 1)),
@@ -527,6 +559,15 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
             "loop_interval_max": acc.loop_interval_max,
             "action_delay_min": acc.action_delay_min,
             "action_delay_max": acc.action_delay_max,
+            "stealth_pauses": acc.stealth_pauses,
+            "module_pause_minutes": acc.module_pause_minutes,
+            "module_pause_max_minutes": acc.module_pause_max_minutes,
+            "night_sleep_enabled": acc.night_sleep_enabled,
+            "night_sleep_start_hour": acc.night_sleep_start_hour,
+            "night_sleep_hours_min": acc.night_sleep_hours_min,
+            "night_sleep_hours_max": acc.night_sleep_hours_max,
+            "dom_navigation": acc.dom_navigation,
+            "session_conflict_pause_minutes": acc.session_conflict_pause_minutes,
             "max_build_queue": acc.max_build_queue,
             "max_resource_queue": acc.max_resource_queue,
             "max_interior_queue": acc.max_interior_queue,
@@ -681,11 +722,20 @@ def save_env_settings(values: dict[str, str | int | float | bool], env_path: str
         f"TRAVIAN_PASSWORD={values.get('TRAVIAN_PASSWORD', '')}",
         "",
         f"HEADLESS={str(values.get('HEADLESS', True)).lower()}",
-        f"LOOP_INTERVAL_MIN={values.get('LOOP_INTERVAL_MIN', 30.0)}",
-        f"LOOP_INTERVAL_MAX={values.get('LOOP_INTERVAL_MAX', 90.0)}",
+        f"LOOP_INTERVAL_MIN={values.get('LOOP_INTERVAL_MIN', 240.0)}",
+        f"LOOP_INTERVAL_MAX={values.get('LOOP_INTERVAL_MAX', 840.0)}",
         f"ACTION_DELAY_MIN={values.get('ACTION_DELAY_MIN', 0.8)}",
         f"ACTION_DELAY_MAX={values.get('ACTION_DELAY_MAX', 2.5)}",
         f"MAX_BUILD_QUEUE={values.get('MAX_BUILD_QUEUE', 1)}",
+        f"STEALTH_PAUSES={str(values.get('STEALTH_PAUSES', True)).lower()}",
+        f"MODULE_PAUSE_MINUTES={values.get('MODULE_PAUSE_MINUTES', 15.0)}",
+        f"MODULE_PAUSE_MAX_MINUTES={values.get('MODULE_PAUSE_MAX_MINUTES', 30.0)}",
+        f"NIGHT_SLEEP_ENABLED={str(values.get('NIGHT_SLEEP_ENABLED', True)).lower()}",
+        f"NIGHT_SLEEP_START_HOUR={values.get('NIGHT_SLEEP_START_HOUR', 1.0)}",
+        f"NIGHT_SLEEP_HOURS_MIN={values.get('NIGHT_SLEEP_HOURS_MIN', 4.0)}",
+        f"NIGHT_SLEEP_HOURS_MAX={values.get('NIGHT_SLEEP_HOURS_MAX', 6.0)}",
+        f"DOM_NAVIGATION={str(values.get('DOM_NAVIGATION', True)).lower()}",
+        f"SESSION_CONFLICT_PAUSE_MINUTES={values.get('SESSION_CONFLICT_PAUSE_MINUTES', 25.0)}",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -725,9 +775,20 @@ def load_settings(
         username=username,
         password=password,
         headless=_env_bool("HEADLESS", True),
-        loop_interval_min=_env_float("LOOP_INTERVAL_MIN", 30.0),
-        loop_interval_max=_env_float("LOOP_INTERVAL_MAX", 90.0),
+        loop_interval_min=_env_float("LOOP_INTERVAL_MIN", 240.0),
+        loop_interval_max=_env_float("LOOP_INTERVAL_MAX", 840.0),
         action_delay_min=_env_float("ACTION_DELAY_MIN", 0.8),
         action_delay_max=_env_float("ACTION_DELAY_MAX", 2.5),
         max_build_queue=int(_env_float("MAX_BUILD_QUEUE", 1)),
+        stealth_pauses=_env_bool("STEALTH_PAUSES", True),
+        module_pause_minutes=_env_float("MODULE_PAUSE_MINUTES", 15.0),
+        module_pause_max_minutes=_env_float("MODULE_PAUSE_MAX_MINUTES", 30.0),
+        night_sleep_enabled=_env_bool("NIGHT_SLEEP_ENABLED", True),
+        night_sleep_start_hour=_env_float("NIGHT_SLEEP_START_HOUR", 1.0),
+        night_sleep_hours_min=_env_float("NIGHT_SLEEP_HOURS_MIN", 4.0),
+        night_sleep_hours_max=_env_float("NIGHT_SLEEP_HOURS_MAX", 6.0),
+        dom_navigation=_env_bool("DOM_NAVIGATION", True),
+        session_conflict_pause_minutes=_env_float(
+            "SESSION_CONFLICT_PAUSE_MINUTES", 25.0
+        ),
     )
