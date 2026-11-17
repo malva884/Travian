@@ -32,6 +32,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .config import ACCOUNTS_FILE, BASE_DIR
+from . import debug_trace
 from .telemetry import (
     SUPPORTED_COMMANDS,
     enqueue_command,
@@ -269,7 +270,7 @@ _ACCOUNT_FIELDS = {
     "strategy_profile", "loop_interval_min", "loop_interval_max",
     "action_delay_min", "action_delay_max", "max_build_queue",
     "max_resource_queue", "max_interior_queue", "allow_parallel_build",
-    "auto_video_bonus", "min_net_crop_threshold",
+    "auto_video_bonus", "min_net_crop_threshold", "builder_enabled",
 }
 
 
@@ -285,6 +286,7 @@ def _account_config(acc) -> dict:
         "loop_interval_min": acc.loop_interval_min,
         "loop_interval_max": acc.loop_interval_max,
         "min_net_crop_threshold": acc.min_net_crop_threshold,
+        "builder_enabled": acc.builder_enabled,
         "farming": asdict(acc.farming),
         "scout_brain": asdict(acc.scout_brain),
         "hero": asdict(acc.hero),
@@ -321,18 +323,83 @@ def _coerce_value(new, cur):
     return new
 
 
+def _coerce_checked(new, cur) -> tuple:
+    """Come ``_coerce_value`` ma ritorna (valore, ok, nota_errore).
+
+    Lo schema validator lo usa per segnalare le conversioni di tipo
+    fallite, che altrimenti silenzierebbero il mantenimento del vecchio
+    valore.
+    """
+    if isinstance(cur, bool):
+        if isinstance(new, bool):
+            return new, True, ""
+        s = str(new).strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True, True, ""
+        if s in ("0", "false", "no", "off"):
+            return False, True, ""
+        return cur, False, f"'{new}' non interpretabile come bool"
+    if isinstance(cur, int) and not isinstance(cur, bool):
+        try:
+            return int(float(new)), True, ""
+        except (TypeError, ValueError):
+            return cur, False, f"'{new}' non convertibile in int"
+    if isinstance(cur, float):
+        try:
+            return float(new), True, ""
+        except (TypeError, ValueError):
+            return cur, False, f"'{new}' non convertibile in float"
+    if isinstance(cur, list):
+        if isinstance(new, (list, tuple)):
+            return list(new), True, ""
+        return cur, False, f"'{new}' non e' una lista"
+    if isinstance(cur, dict):
+        if isinstance(new, dict):
+            return dict(new), True, ""
+        return cur, False, f"'{new}' non e' un oggetto"
+    if cur is None:
+        return new, True, ""
+    return new, True, ""
+
+
 def _apply_fields(obj, patch: dict) -> dict:
     """Applica il patch ai soli campi del dataclass; ritorna le chiavi usate."""
-    applied = {}
-    fields = obj.__dataclass_fields__
+    applied, _diff, _warnings = _apply_fields_checked(obj, patch)
+    return applied
+
+
+def _apply_fields_checked(
+    obj, patch: dict, allowed: set | None = None
+) -> tuple[dict, dict, list[str]]:
+    """Applica il patch validando contro il dataclass target.
+
+    Ritorna ``(applied, diff, warnings)``:
+    - ``applied``: chiave -> nuovo valore effettivamente impostato;
+    - ``diff``: chiave -> {"old", "new"} per i soli campi cambiati;
+    - ``warnings``: chiavi sconosciute (prima ignorate in silenzio) e
+      conversioni di tipo fallite. ``allowed`` restringe le chiavi
+      ammesse (es. sezione 'account' -> _ACCOUNT_FIELDS).
+    """
+    applied: dict = {}
+    diff: dict = {}
+    warnings: list[str] = []
+    fields = getattr(obj, "__dataclass_fields__", {})
     for k, v in patch.items():
-        if k not in fields:
+        if k not in fields or (allowed is not None and k not in allowed):
+            warnings.append(f"chiave '{k}' sconosciuta: ignorata")
             continue
         cur = getattr(obj, k)
-        new = _coerce_value(v, cur)
+        new, ok, note = _coerce_checked(v, cur)
+        if not ok:
+            warnings.append(
+                f"campo '{k}': {note} (mantenuto {cur!r})"
+            )
+            continue
         setattr(obj, k, new)
         applied[k] = new
-    return applied
+        if new != cur:
+            diff[k] = {"old": cur, "new": new}
+    return applied, diff, warnings
 
 
 def _handle_config_patch(body: dict) -> tuple[dict, int]:
@@ -423,10 +490,14 @@ def _handle_config_patch(body: dict) -> tuple[dict, int]:
         )
 
     applied: dict = {}
+    diff: dict = {}
+    warnings: list[str] = []
+    patch_village = ""
     if section == "village":
         vname = str(body.get("village") or "").strip()
         if not vname:
             return {"status": "rejected", "reason": "village mancante"}, 400
+        patch_village = vname
         cfg = acc.villages.get(vname)
         if cfg is None:
             cfg = next(
@@ -435,19 +506,18 @@ def _handle_config_patch(body: dict) -> tuple[dict, int]:
         if cfg is None:
             cfg = VillageConfig(name=vname)
             acc.villages[vname] = cfg
-        applied = _apply_fields(cfg, patch)
+        applied, diff, warnings = _apply_fields_checked(cfg, patch)
         # le personalizzazioni manuali non vengono sovrascritte dai preset
         cfg.custom_modified = True
     elif section == "account":
-        for k, v in patch.items():
-            if k in _ACCOUNT_FIELDS and hasattr(acc, k):
-                new = _coerce_value(v, getattr(acc, k))
-                setattr(acc, k, new)
-                applied[k] = new
+        applied, diff, warnings = _apply_fields_checked(
+            acc, patch, allowed=_ACCOUNT_FIELDS
+        )
     elif section in _CONFIG_SECTIONS:
         cfg = getattr(acc, _CONFIG_SECTIONS[section])
         if section == "expansion" and "target_slots" in patch:
             # lista di ExpansionTarget, non dict generici
+            old_slots = [asdict(t) for t in cfg.target_slots]
             cfg.target_slots = [
                 ExpansionTarget(
                     x=int(t.get("x", 0)),
@@ -458,13 +528,61 @@ def _handle_config_patch(body: dict) -> tuple[dict, int]:
                 if isinstance(t, dict)
             ]
             applied["target_slots"] = [asdict(t) for t in cfg.target_slots]
+            if applied["target_slots"] != old_slots:
+                diff["target_slots"] = {
+                    "old": old_slots,
+                    "new": applied["target_slots"],
+                }
             patch = {k: v for k, v in patch.items() if k != "target_slots"}
-        applied.update(_apply_fields(cfg, patch))
+        _app, _dif, _warn = _apply_fields_checked(cfg, patch)
+        applied.update(_app)
+        diff.update(_dif)
+        warnings.extend(_warn)
     else:
         return (
             {"status": "rejected", "reason": f"sezione '{section}' sconosciuta"},
             400,
         )
+
+    if not applied:
+        # Patch con soli campi sconosciuti (es. server avviato con codice
+        # vecchio: il dataclass non ha ancora il campo). Rifiutare e'
+        # piu' onesto che un 'saved' che non ha persistito nulla.
+        for w in warnings:
+            logger.warning(
+                "Config patch %s/%s: %s", account_id, section, w
+            )
+        return (
+            {
+                "status": "rejected",
+                "reason": "nessun campo valido nel patch: riavvia "
+                "l'app per caricare il codice aggiornato",
+                "warnings": warnings,
+            },
+            400,
+        )
+
+    # Config Diff & Schema Validator (debug trace): chiavi sconosciute
+    # inviate dalla UI e coercion fallite non devono piu' sparire nel
+    # silenzio — WARNING nel log + evento strutturato su JSONL.
+    for w in warnings:
+        logger.warning(
+            "Config patch %s/%s: %s", account_id, section, w
+        )
+    try:
+        debug_trace.append_trace(
+            account_id,
+            "config_patch",
+            {
+                "section": section,
+                "village": patch_village,
+                "diff": diff,
+                "applied": applied,
+                "warnings": warnings,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
     save_accounts(accounts)
 
@@ -506,6 +624,8 @@ def _handle_config_patch(body: dict) -> tuple[dict, int]:
         "account_id": account_id,
         "section": section,
         "applied": applied,
+        "diff": diff,
+        "warnings": warnings,
     }, 200
 
 
@@ -642,6 +762,209 @@ def _read_snapshot(account_id: str = "") -> tuple[dict | None, int]:
         return json.loads(path.read_text(encoding="utf-8")), 200
     except (OSError, ValueError):
         return None, 500
+
+
+# ---------------------------------------------------------------------------
+# Dry-Run "Simula Ciclo" (debug pipeline): brain.decide senza browser
+# ---------------------------------------------------------------------------
+_RES_GID_TO_TYPE = {1: "wood", 2: "clay", 3: "iron", 4: "crop"}
+
+
+def _state_from_snapshot(snap: dict, village_name: str = ""):
+    """Ricostruisce un GameState dal payload dashboard_state_<acc>.json.
+
+    Approssimazioni note: gli item di coda non hanno slot_id nello
+    snapshot (0 = sconosciuto) e incoming_moves sono riassunti dal
+    conteggio attacchi. Sufficiente per valutare le regole del brain.
+    """
+    from .models import (
+        BuildQueueItem,
+        Field,
+        GameState,
+        ResourceType,
+        Resources,
+    )
+
+    villages = snap.get("villages") or []
+    target = next(
+        (
+            v for v in villages
+            if not village_name
+            or str(v.get("name") or "") == village_name
+            or str(v.get("id") or "") == village_name
+        ),
+        villages[0] if villages else None,
+    )
+    if target is None:
+        return None
+
+    state = GameState()
+    vres = target.get("resources") or {}
+    prod_map = {
+        "wood": ResourceType.WOOD,
+        "clay": ResourceType.CLAY,
+        "iron": ResourceType.IRON,
+    }
+    state.resources = Resources(
+        wood=int(vres.get("wood") or 0),
+        clay=int(vres.get("clay") or 0),
+        iron=int(vres.get("iron") or 0),
+        crop=int(vres.get("crop") or 0),
+        warehouse_capacity=int(vres.get("warehouse_cap") or 0),
+        granary_capacity=int(vres.get("granary_cap") or 0),
+        production_per_hour={
+            prod_map[k]: int(vres.get(f"prod_{k}") or 0) for k in prod_map
+        },
+        crop_balance=(
+            int(vres["net_crop"]) if vres.get("net_crop") is not None else None
+        ),
+    )
+
+    # "fields" = i 18 campi dorf1 (fonte primaria, spec slot/gid/level);
+    # "slots" copre gli interni dorf2 e gli snapshot pre-'fields'.
+    field_rows = list(target.get("fields") or [])
+    slot_rows = list(target.get("slots") or [])
+    if field_rows:
+        seen = {int(s.get("slot") or 0) for s in field_rows}
+        slot_rows = field_rows + [
+            s for s in slot_rows if int(s.get("slot") or 0) not in seen
+        ]
+    for s in slot_rows:
+        slot_id = int(s.get("slot") or s.get("slot_id") or 0)
+        gid = int(s.get("gid", -1) if s.get("gid") is not None else -1)
+        rtype = None
+        if slot_id <= 18:
+            # Campi dorf1: gid risorsa 1-4 (letto dal DOM dei sensori),
+            # il resource_type ne deriva per la logica economica.
+            rtype = (
+                ResourceType(_RES_GID_TO_TYPE[gid])
+                if gid in _RES_GID_TO_TYPE
+                else None
+            )
+        state.fields.append(
+            Field(
+                slot_id=slot_id,
+                name=str(s.get("name") or ""),
+                level=int(s.get("level") or 0),
+                resource_type=rtype,
+                gid=gid,
+            )
+        )
+
+    for q in target.get("building_queue") or []:
+        state.build_queue.append(
+            BuildQueueItem(
+                name=str(q.get("name") or ""),
+                level=int(q.get("target_level") or 0),
+                remaining_seconds=int(q.get("seconds_remaining") or 0),
+            )
+        )
+
+    state.incoming_attacks = len(target.get("incoming_attacks") or [])
+    state.village_name = str(target.get("name") or "")
+    try:
+        state.village_id = int(target.get("id") or 0)
+    except (TypeError, ValueError):
+        state.village_id = 0
+    state.settlers_home = int(
+        (target.get("settlers") or {}).get("trained") or 0
+    )
+    state.single_village = len(villages) <= 1
+    state.under_raid_pressure = any(
+        str(m.get("type") or "") in ("attack", "raid", "unknown")
+        for m in (target.get("incoming_attacks") or [])
+        if isinstance(m, dict)
+    )
+
+    acc = snap.get("account") or {}
+    state.culture_points = int(acc.get("cp_current") or 0)
+    state.culture_points_required = int(acc.get("cp_required") or 0)
+    state.culture_points_daily = int(acc.get("cp_daily_production") or 0)
+    state.feed_target = str(acc.get("feed_target") or "")
+
+    for peer in villages:
+        if peer is target:
+            continue
+        pres = peer.get("resources") or {}
+        state.peer_villages[str(peer.get("name") or "")] = Resources(
+            wood=int(pres.get("wood") or 0),
+            clay=int(pres.get("clay") or 0),
+            iron=int(pres.get("iron") or 0),
+            crop=int(pres.get("crop") or 0),
+            warehouse_capacity=int(pres.get("warehouse_cap") or 0),
+            granary_capacity=int(pres.get("granary_cap") or 0),
+        )
+    return state
+
+
+def _handle_debug_simulate(body: dict) -> tuple[dict, int]:
+    """POST /api/debug/simulate — dry-run di brain.decide su snapshot.
+
+    {"account_id", "village"?} -> esegue l'intero albero decisionale in
+    memoria (nessun browser) e ritorna il trace completo: inputs,
+    regole valutate con motivi di skip, pool candidati, azione finale.
+    """
+    from .brain import RuleBasedBrain
+    from .config import load_accounts
+
+    account_id = str(body.get("account_id") or "") or _default_account_id()
+    village = str(body.get("village") or "").strip()
+    if not account_id:
+        return {"status": "rejected", "reason": "account_id mancante"}, 400
+
+    snap, _status = _read_snapshot(account_id)
+    if snap is None:
+        return (
+            {
+                "status": "rejected",
+                "reason": "nessuno snapshot: serve almeno un ciclo "
+                "dell'agente per simulare",
+            },
+            503,
+        )
+    state = _state_from_snapshot(snap, village)
+    if state is None:
+        return (
+            {
+                "status": "rejected",
+                "reason": f"villaggio '{village}' non trovato nello snapshot",
+            },
+            404,
+        )
+
+    settings = next(
+        (a for a in load_accounts() if a.account_id == account_id), None
+    )
+    if settings is None:
+        return (
+            {"status": "rejected",
+             "reason": f"account '{account_id}' non in accounts.json"},
+            404,
+        )
+
+    brain = RuleBasedBrain(settings)
+    brain.trace_tag = "simulate"
+    try:
+        action = brain.decide(state)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Simula ciclo fallita", exc_info=True)
+        return {"status": "error", "reason": str(exc)}, 500
+
+    return (
+        {
+            "status": "ok",
+            "account_id": account_id,
+            "village": state.village_name,
+            "simulated": True,
+            "action": {
+                "type": action.type.value,
+                "reason": action.reason,
+                "params": action.params,
+            },
+            "trace": brain.last_trace,
+        },
+        200,
+    )
 
 
 def _default_account_id() -> str:
@@ -799,6 +1122,20 @@ class _CommandCenterHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         route = parsed.path.rstrip("/")
+        if route == "/api/debug/simulate":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            try:
+                raw = self.rfile.read(max(0, length))
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                self._send_json({"error": "invalid json"}, status=400)
+                return
+            payload, status = _handle_debug_simulate(body)
+            self._send_json(payload, status=status)
+            return
         if route == "/api/config":
             try:
                 length = int(self.headers.get("Content-Length") or 0)

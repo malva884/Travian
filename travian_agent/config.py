@@ -108,6 +108,14 @@ class VillageConfig:
             self.priority_units = list(self.allowed_units)
         elif not self.allowed_units and self.priority_units:
             self.allowed_units = list(self.priority_units)
+        # Coda edilizia unificata: building_queue_plan e' la fonte
+        # primaria; se vuota si ripiega sul legacy building_focus.
+        # I due campi vengono riallineati in uscita cosi' i consumer
+        # legacy (focus) e nuovi (plan) leggono sempre lo stesso piano.
+        if not self.building_queue_plan and self.building_focus:
+            self.building_queue_plan = list(self.building_focus)
+        elif not self.building_focus and self.building_queue_plan:
+            self.building_focus = list(self.building_queue_plan)
 
 
 @dataclass
@@ -132,6 +140,13 @@ class ExpansionConfig:
     # Cropper Finder (human-in-the-loop): scansione mappa -> candidati dashboard
     cropper_scan: bool = True        # scansione automatica tile 9c/15c liberi
     scan_radius: int = 15            # raggio di scansione mappa in campi
+    # Freeze Espansione (toggle dashboard): True = sul founder le spese non
+    # critiche vengono congelate finche' i 3 coloni non sono pronti.
+    spending_freeze: bool = True
+    # Gate di maturita' economica del freeze: il blocco scatta solo se il
+    # villaggio produce almeno cosi' tanto lordo all'ora (wood+clay+iron+crop).
+    # Default tarato su server 1x: su speed server impostare ~ speed * 900.
+    min_freeze_hourly_prod: int = 900
 
 
 @dataclass
@@ -239,10 +254,10 @@ class Settings:
     password: str = ""
     account_id: str = "default"
     headless: bool = True
-    # Intervallo tra due iterazioni del loop (secondi). Default 4-14 min:
+    # Intervallo tra due iterazioni del loop (secondi). Default 4-10 min:
     # cicli al minuto troppo regolari sono un pattern da bot.
     loop_interval_min: float = 240.0
-    loop_interval_max: float = 840.0
+    loop_interval_max: float = 600.0
     action_delay_min: float = 0.8
     action_delay_max: float = 2.5
     # --- Anti-detection (stealth) ---
@@ -260,6 +275,10 @@ class Settings:
     # Navigazione via click DOM (sidebar, mappa villaggio, navbar) con
     # fallback a page.goto: simula il flusso reale dell'utente.
     dom_navigation: bool = True
+    # TRANSIENT (mai serializzato su accounts.json): soglie campionate a
+    # ogni ciclo per l'anti-detection — storage ~0.82-0.93, cura eroe
+    # ~0.45-0.62. Popolato dall'orchestrator via sample_cycle_thresholds().
+    cycle_jitter: dict = field(default_factory=dict)
     # Se la sessione cade a meta' run (login manuale altrove o scadenza),
     # il bot non combatte per la sessione: attesa di N minuti prima di
     # ritentare il login (mai due sessioni contemporanee).
@@ -270,6 +289,10 @@ class Settings:
     # True = costruzione parallela campo+edificio (tribu' romana / Plus).
     # False = una sola costruzione alla volta per villaggio.
     allow_parallel_build: bool = True
+    # Toggle dashboard "Builder": False = le azioni di costruzione
+    # (UPGRADE_FIELD) vengono declassate a WAIT; gli altri moduli
+    # (farming, eroe, difesa, mercato) restano attivi.
+    builder_enabled: bool = True
     # True = attiva automaticamente il bonus +15% sulle risorse guardando il video alla scadenza (8h)
     auto_video_bonus: bool = True
     # Grain Safety Net: margine netto grano minimo globale (unita'/ora);
@@ -366,6 +389,7 @@ def _parse_account_item(item: dict) -> Settings:
                             max_resource_queue=int(item.get("max_resource_queue", 1)),
                             max_interior_queue=int(item.get("max_interior_queue", 1)),
                             allow_parallel_build=bool(item.get("allow_parallel_build", True)),
+                            builder_enabled=bool(item.get("builder_enabled", True)),
                             auto_video_bonus=bool(item.get("auto_video_bonus", True)),
                             min_net_crop_threshold=float(item.get("min_net_crop_threshold", 10.0)),
                             strategy_profile=str(item.get("strategy_profile", "balanced")),
@@ -423,6 +447,12 @@ def _parse_account_item(item: dict) -> Settings:
                                 ),
                                 scan_radius=int(
                                     dict(item.get("expansion_settings") or {}).get("scan_radius", 15)
+                                ),
+                                spending_freeze=bool(
+                                    dict(item.get("expansion_settings") or {}).get("spending_freeze", True)
+                                ),
+                                min_freeze_hourly_prod=int(
+                                    dict(item.get("expansion_settings") or {}).get("min_freeze_hourly_prod", 900)
                                 ),
                                 target_slots=[
                                     ExpansionTarget(
@@ -572,6 +602,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
             "max_resource_queue": acc.max_resource_queue,
             "max_interior_queue": acc.max_interior_queue,
             "allow_parallel_build": acc.allow_parallel_build,
+            "builder_enabled": acc.builder_enabled,
             "auto_video_bonus": acc.auto_video_bonus,
             "min_net_crop_threshold": acc.min_net_crop_threshold,
             "strategy_profile": acc.strategy_profile,
@@ -637,6 +668,8 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                 "min_culture_margin": acc.expansion.min_culture_margin,
                 "cropper_scan": acc.expansion.cropper_scan,
                 "scan_radius": acc.expansion.scan_radius,
+                "spending_freeze": acc.expansion.spending_freeze,
+                "min_freeze_hourly_prod": acc.expansion.min_freeze_hourly_prod,
                 "target_slots": [
                     {"x": t.x, "y": t.y, "note": t.note}
                     for t in acc.expansion.target_slots

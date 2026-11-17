@@ -26,8 +26,10 @@ from .builder import (
     focus_intents,
     focus_skip_reasons,
     is_founder_village,
+    load_build_plans,
     net_crop,
     plan_upgrades,
+    queue_slots_free,
     save_build_plan,
 )
 from .building_prereqs import (
@@ -58,6 +60,7 @@ from .models import (
     Action,
     ActionResult,
     ActionType,
+    BuildQueueItem,
     Field,
     GameState,
     GID_BARRACKS,
@@ -81,8 +84,11 @@ from .replenishment import TroopReplenishmentManager
 from .sensors import GameObserver
 from .stealth import (
     ModulePauseRegistry,
+    eta_pause_bounds,
     human_cycle_interval,
     night_sleep_remaining,
+    resource_eta_seconds,
+    sample_cycle_thresholds,
 )
 from . import telemetry
 from .war import (
@@ -109,6 +115,11 @@ _hero_managers: dict[str, HeroManager] = {}
 _defense_managers: dict[str, DefenseManager] = {}
 _replenish_managers: dict[str, TroopReplenishmentManager] = {}
 _war_stores: dict[str, WarStore] = {}
+# Cache dei 18 campi dorf1 per villaggio (chiave account:newdid):
+# mantiene state.fields completo anche nei cicli in cui l'agente
+# visita solo dorf2.php o la lettura dorf1 torna vuota, cosi'
+# fields_count=18 non blocca Coda Prioritaria e weakest_field.
+_last_dorf1_fields: dict[str, list[Field]] = {}
 # Throttle del ciclo Fucina auto (villaggio -> ts ultimo tentativo).
 _last_smithy_try: dict[str, float] = {}
 SMITHY_RETRY_SECONDS = 1800.0  # un tentativo ogni ~30 min per villaggio
@@ -293,6 +304,86 @@ def _freeze_demote(state: GameState, action: Action) -> "Action | None":
                 ),
             )
     return None
+
+
+# Riscatto premi on-demand (spec 4): attacchi in arrivo entro questa
+# finestra congelano i premi-risorse (restano protetti nella UI task).
+_TASK_CLAIM_THREAT_WINDOW = 20 * 60
+
+
+def _task_claim_ctx(
+    settings: Settings,
+    *,
+    village: Village,
+    vname: str,
+    last_states: dict[str, Resources] | None,
+    expansion_mgr: ExpansionManager | None,
+    defense_mgr: DefenseManager | None,
+) -> dict:
+    """Contesto decisionale per il riscatto on-demand dei premi task.
+
+    - ``target_costs``: obiettivi pendenti del villaggio — primo step
+      del build plan persistito (next_upgrade stimato, Residenza 10
+      inclusa via founder_intents) e, sul fondatore in deficit coloni
+      (feed_target attivo), il costo di UN colono (max fra le tribu');
+    - ``threat_incoming``: minaccia registrata con impatto entro
+      ``_TASK_CLAIM_THREAT_WINDOW`` secondi;
+    - ``crop_balance``: bilancio grano del ciclo precedente (gate
+      premi-truppe). Stock/capienze sono lette live dalla pagina task.
+    """
+    now = time.time()
+    costs: list[dict] = []
+    try:
+        plans = load_build_plans(settings.account_id)
+        plan = plans.get(vname) or plans.get(village.name or "") or []
+        step = dict(plan[0]) if plan else {}
+        gid = int(step.get("gid") or 0)
+        lvl = int(step.get("target_level") or 0)
+        if gid > 0 and lvl > 0:
+            from .config_engine import level_cost  # no cicli
+
+            cost = level_cost(gid, lvl)
+            if cost:
+                costs.append(cost)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        feed = str(getattr(expansion_mgr, "feed_target", "") or "")
+        if feed and feed in (vname, str(village.name or "")):
+            from .replenishment import settler_reserve  # no cicli
+
+            one = {
+                k: int(v // 3) for k, v in (settler_reserve() or {}).items()
+            }
+            if any(one.values()):
+                costs.append(one)
+    except Exception:  # noqa: BLE001
+        pass
+    threat = False
+    try:
+        if defense_mgr is not None:
+            info = (
+                (defense_mgr.threats or {}).get(str(village.village_id or 0))
+                or {}
+            )
+            arrival = float(info.get("arrival_ts") or 0.0)
+            threat = now < arrival <= now + _TASK_CLAIM_THREAT_WINDOW
+    except Exception:  # noqa: BLE001
+        pass
+    crop_balance = None
+    try:
+        res = (last_states or {}).get(vname) or (last_states or {}).get(
+            village.name or ""
+        )
+        if res is not None:
+            crop_balance = res.crop_balance
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "target_costs": costs,
+        "threat_incoming": threat,
+        "crop_balance": crop_balance,
+    }
 
 
 async def _run_manual_commands(
@@ -1160,6 +1251,16 @@ def _raid_pressure_on_village(
     return False
 
 
+def _fields_max_level_by_gid(state: GameState) -> dict[int, int]:
+    """gid -> livello massimo tra gli slot del villaggio."""
+    out: dict[int, int] = {}
+    for f in state.fields or []:
+        g = int(getattr(f, "gid", 0) or 0)
+        if g > 0:
+            out[g] = max(out.get(g, 0), int(getattr(f, "level", 0) or 0))
+    return out
+
+
 def _append_history(
     account_id: str, state: GameState, action: Action, tribe: str = ""
 ) -> None:
@@ -1187,10 +1288,10 @@ def _append_history(
                 for k, v in (state.resources.production_per_hour or {}).items()
             },
             "crop_balance": state.resources.crop_balance,
+            # gid -> livello max: piu' campi risorsa condividono lo
+            # stesso gid (1-4), serve il massimo non l'ultimo letto.
             "buildings": {
-                str(f.gid): int(f.level)
-                for f in (state.fields or [])
-                if getattr(f, "gid", 0) > 0
+                str(g): lvl for g, lvl in _fields_max_level_by_gid(state).items()
             },
             "troops": dict(state.troops_home or {}),
             # Tribu' account per il Role-Aware Configurator (seed unita').
@@ -1706,12 +1807,28 @@ async def monitor_all_villages(
                 logger.warning("%s Villaggio '%s' privo di URL newdid, impossibile navigare.", prefix, vname)
                 continue  # senza URL non si può cambiare villaggio
 
-            # 2.5 Riscossione task/premi del villaggio: i premi sono
-            # localizzati per insediamento, quindi va fatto in questo
-            # contesto prima delle routine economiche/militari.
+            # 2.5 Riscossione task/premi del villaggio — ON-DEMAND
+            #     (spec 4): i premi sono una riserva non depredabile;
+            #     si incassano solo se sbloccano un obiettivo pendente
+            #     (next upgrade, coloni) senza overflow e senza attacchi
+            #     in arrivo. I premi sono localizzati per insediamento,
+            #     quindi va fatto in questo contesto prima delle routine
+            #     economiche/militari; lo step 3 rilegge lo stock col
+            #     premio gia' incassato e il builder lo spende nel
+            #     medesimo ciclo.
             try:
+                claim_ctx = _task_claim_ctx(
+                    settings,
+                    village=village,
+                    vname=vname,
+                    last_states=last_states,
+                    expansion_mgr=expansion_mgr,
+                    defense_mgr=defense_mgr,
+                )
                 claimed = await executor.claim_village_tasks(
-                    village_id=village.village_id, village_name=vname
+                    village_id=village.village_id,
+                    village_name=vname,
+                    claim_ctx=claim_ctx,
                 )
                 if claimed:
                     logger.info(
@@ -1729,6 +1846,25 @@ async def monitor_all_villages(
             state = await observer.read_state()
             state.fields = await observer.read_fields()
             state.build_queue = await observer.read_build_queue()
+
+            # Cache campi dorf1: se il ciclo ha visitato solo dorf2 o la
+            # lettura dei 18 campi e' tornata vuota, ripristina l'ultima
+            # lettura valida invece di propagare fields_count=0 a brain
+            # e telemetry (bloccherebbe Coda Prioritaria e weakest_field).
+            _fkey = (
+                f"{settings.account_id}:"
+                f"{village.village_id or village.name or '0'}"
+            )
+            _res_fields = [f for f in state.fields if f.is_resource_field]
+            if _res_fields:
+                _last_dorf1_fields[_fkey] = _res_fields
+            elif _fkey in _last_dorf1_fields:
+                state.fields = list(_last_dorf1_fields[_fkey])
+                logger.debug(
+                    "%s Campi dorf1 da cache (%d): lettura corrente vuota.",
+                    vprefix,
+                    len(state.fields),
+                )
 
             # Edifici interni del dorf2 (slot 19-40): fusi in state.fields
             interior = await observer.read_interior_fields()
@@ -1762,6 +1898,13 @@ async def monitor_all_villages(
                 state.village_name = village.name
             if not state.village_id and village.village_id:
                 state.village_id = village.village_id
+
+            # DOM & Sensor Health Check (debug pipeline): selettori
+            # rotti o layout cambiato -> SENSOR_ANOMALY sul trace.
+            try:
+                check_state_health(state, account_id=settings.account_id)
+            except Exception:
+                pass
 
             # Bootstrap auto-off (spec 2): requisiti minimi raggiunti ->
             # is_bootstrap=False e passaggio al ruolo assegnato.
@@ -1956,6 +2099,21 @@ async def monitor_all_villages(
 
             action = brain.decide(state)
 
+            # Toggle dashboard "Builder": disattivato -> nessuna nuova
+            # costruzione (le code in corso proseguono comunque).
+            try:
+                if (
+                    not getattr(settings, "builder_enabled", True)
+                    and action.type == ActionType.UPGRADE_FIELD
+                ):
+                    action = Action(
+                        type=ActionType.WAIT,
+                        params=dict(action.params or {}),
+                        reason="Builder disabilitato dalla dashboard",
+                    )
+            except Exception:
+                pass
+
             # Corsa al 15c — Congelamento spese non-espansione (spec):
             # sul founder con coloni < 3 e CP pronti (o Reggia >= 8)
             # solo Palazzo/Residenza, Magazzino, Granaio e Palazzo
@@ -2067,6 +2225,23 @@ async def monitor_all_villages(
                 )
                 _append_history(settings.account_id, state, action)
             else:
+                # Fallback opportunistico (spec 2): stock + produzione
+                # per la valutazione pagabilita'/ETA dei candidati coda.
+                if action.type == ActionType.UPGRADE_FIELD:
+                    _p = dict(action.params or {})
+                    _p["stock"] = {
+                        "wood": int(state.resources.wood or 0),
+                        "clay": int(state.resources.clay or 0),
+                        "iron": int(state.resources.iron or 0),
+                        "crop": int(state.resources.crop or 0),
+                    }
+                    _p["prod_h"] = {
+                        str(getattr(k, "value", k)): int(v or 0)
+                        for k, v in (
+                            state.resources.production_per_hour or {}
+                        ).items()
+                    }
+                    action.params = _p
                 result = await executor.execute(action, village_id=target_vid)
                 _append_history(settings.account_id, state, action)
                 _record_decision(
@@ -2086,6 +2261,49 @@ async def monitor_all_villages(
                         "executor_message": result.message,
                     },
                 )
+                # Resource-ETA Sleep: upgrade fallito per deficit risorse
+                # -> cooldown builder pari al tempo di produzione reale
+                # del deficit (niente polling a vuoto ogni ciclo).
+                if (
+                    not result.success
+                    and action.type == ActionType.UPGRADE_FIELD
+                    and (result.data or {}).get("cost")
+                ):
+                    _cost = result.data["cost"]
+                    _deficit = {
+                        k: max(
+                            0,
+                            int(v or 0)
+                            - int(getattr(state.resources, k, 0) or 0),
+                        )
+                        for k, v in _cost.items()
+                    }
+                    _prod = {
+                        str(getattr(k, "value", k)): int(v or 0)
+                        for k, v in (
+                            state.resources.production_per_hour or {}
+                        ).items()
+                    }
+                    _eta = resource_eta_seconds(_deficit, _prod)
+                    if _eta and _eta > 0:
+                        _lo, _hi = eta_pause_bounds(_eta)
+                        _module_pauses.register(
+                            settings.account_id,
+                            str(
+                                village.village_id
+                                or village.name
+                                or "0"
+                            ),
+                            "builder",
+                            action.type.value.upper(),
+                            resources=state.resources,
+                            min_seconds=_lo,
+                            max_seconds=_hi,
+                        )
+                        logger.info(
+                            "%s Builder in pausa ETA %.0fmin: deficit %s",
+                            vprefix, _eta / 60.0, _deficit,
+                        )
             if not result.success:
                 logger.warning(
                     "%s Azione non eseguita: %s", vprefix, result.message
@@ -2143,6 +2361,113 @@ async def monitor_all_villages(
                             vprefix, unpack_exc,
                         )
 
+            # Doppia coda Romani/Plus: l'upgrade appena avviato occupa
+            # una sola vista (dorf1 campi o dorf2 edifici). Simuliamo la
+            # voce in coda e facciamo decidere di nuovo il brain: se
+            # l'altra vista e' libera avvia subito anche quella nello
+            # stesso ciclo, senza attendere il giro successivo.
+            if result.success and action.type == ActionType.UPGRADE_FIELD:
+                _done_slot = int(
+                    (result.data or {}).get("slot_id") or 0
+                )
+                if _done_slot <= 0:
+                    # Fallback: il primo candidato e' il preferito del brain.
+                    for _c in (action.params or {}).get("candidates") or []:
+                        try:
+                            _done_slot = int(_c)
+                            break
+                        except (TypeError, ValueError):
+                            continue
+                if _done_slot > 0:
+                    state.build_queue.append(
+                        BuildQueueItem(
+                            name="(upgrade avviato)",
+                            slot_id=_done_slot,
+                            is_resource_field=_done_slot <= 18,
+                        )
+                    )
+                _can_out, _can_in = queue_slots_free(state, settings)
+                if _can_out or _can_in:
+                    action2 = brain.decide(state)
+                    rule2 = str(
+                        (action2.params or {}).pop("rule", "") or ""
+                    )
+                    try:
+                        if expansion_freeze(state, settings):
+                            _frz = _freeze_demote(state, action2)
+                            if _frz is not None:
+                                action2 = _frz
+                    except Exception:
+                        pass
+                    if action2.type == ActionType.UPGRADE_FIELD:
+                        _pl2 = _module_pause_left(
+                            settings,
+                            str(
+                                village.village_id or village.name or "0"
+                            ),
+                            "builder",
+                            action2.type.value.upper(),
+                            resources=state.resources,
+                        )
+                        if _pl2 > 0:
+                            _record_module_paused(
+                                settings,
+                                state=state,
+                                village=village,
+                                module="builder",
+                                decision=action2.type.value.upper(),
+                                remaining=_pl2,
+                            )
+                        else:
+                            _p2 = dict(action2.params or {})
+                            _p2["stock"] = {
+                                "wood": int(state.resources.wood or 0),
+                                "clay": int(state.resources.clay or 0),
+                                "iron": int(state.resources.iron or 0),
+                                "crop": int(state.resources.crop or 0),
+                            }
+                            _p2["prod_h"] = {
+                                str(getattr(k, "value", k)): int(v or 0)
+                                for k, v in (
+                                    state.resources.production_per_hour
+                                    or {}
+                                ).items()
+                            }
+                            action2.params = _p2
+                            result2 = await executor.execute(
+                                action2, village_id=target_vid
+                            )
+                            _append_history(
+                                settings.account_id, state, action2
+                            )
+                            _record_decision(
+                                settings,
+                                state=state,
+                                village=village,
+                                module="builder",
+                                decision=action2.type.value.upper(),
+                                outcome=(
+                                    DECISION_OUTCOME_EXECUTED
+                                    if result2.success
+                                    else DECISION_OUTCOME_BLOCKED
+                                ),
+                                reason=(
+                                    "[coda parallela] "
+                                    + (action2.reason or result2.message or "")
+                                ),
+                                context={
+                                    "rule": rule2,
+                                    "executor_message": result2.message,
+                                    "parallel_second_slot": True,
+                                },
+                            )
+                            if result2.success:
+                                logger.info(
+                                    "%s Doppia coda: avviato anche il "
+                                    "secondo slot parallelo.",
+                                    vprefix,
+                                )
+
             # ------------------------------------------------------------------
             # Filtro ruoli e competenza territoriale per il Farming / Raid:
             # - Fondatori e Feeder non eseguono raid.
@@ -2165,8 +2490,18 @@ async def monitor_all_villages(
                 )
 
             # 4.1 Modulo farming: raid sui Custom Farm Targets approvati
-            # (fallback: farm list nativa del Punto di Raduno), se scaduto
-            if farming_mgr is not None and is_raiding_role:
+            # (fallback: farm list nativa del Punto di Raduno), se scaduto.
+            # Il gate enabled (globale + per-villaggio) precede il check di
+            # pausa anti-detection: un modulo disabilitato esce subito e non
+            # produce ne' SKIPPED ne' MODULE_PAUSED nel log.
+            _vcfg_farm = settings.village_config_for(
+                village.name, village.village_id
+            )
+            farming_enabled = bool(
+                getattr(settings.farming, "enabled", True)
+                and (_vcfg_farm is None or _vcfg_farm.farm_enabled)
+            )
+            if farming_mgr is not None and is_raiding_role and farming_enabled:
                 _pl = _module_pause_left(
                     settings,
                     str(village.village_id or village.name or "0"),
@@ -3209,6 +3544,9 @@ async def run_single_account_loop(
                             settings.village_roles = fresh_acc.village_roles
                             settings.strategy_profile = fresh_acc.strategy_profile
                             settings.allow_parallel_build = fresh_acc.allow_parallel_build
+                            settings.builder_enabled = fresh_acc.builder_enabled
+                            settings.auto_video_bonus = fresh_acc.auto_video_bonus
+                            settings.min_net_crop_threshold = fresh_acc.min_net_crop_threshold
                             settings.loop_interval_min = fresh_acc.loop_interval_min
                             settings.loop_interval_max = fresh_acc.loop_interval_max
                             settings.farming = fresh_acc.farming
@@ -3220,6 +3558,11 @@ async def run_single_account_loop(
                             break
                 except Exception as hr_err:
                     logger.debug("%s Errore hot-reload config: %s", prefix, hr_err)
+
+                # Jitter anti-detection: soglie campionate una volta per
+                # ciclo (storage ~0.82-0.93, cura eroe ~45-62%) e lette
+                # dalle regole del brain e dal modulo eroe.
+                settings.cycle_jitter = sample_cycle_thresholds()
 
                 # 0.1 Stop selettivo per-account (flag creato dalla dashboard GUI):
                 # termina solo questo task, lasciando attivi gli altri account.
@@ -3336,8 +3679,9 @@ async def run_single_account_loop(
                     settings.loop_interval_min, settings.loop_interval_max
                 )
                 logger.info("%s Prossimo ciclo tra %.0fs", prefix, interval)
-                # Attesa a chunk: il flag FORCE_TICK (POST /api/command dal
-                # Command Center) interrompe l'attesa e forza il ciclo.
+                # Attesa a chunk: FORCE_TICK anticipa il ciclo; i flag
+                # stop/pausa vengono rilevati entro ~5s (non solo a fine
+                # attesa), cosi' Interrompi/Pausa rispondono subito.
                 _tick_flag = telemetry.force_tick_path(settings.account_id)
                 _waited = 0.0
                 while _waited < interval:
@@ -3345,6 +3689,13 @@ async def run_single_account_loop(
                         _tick_flag.unlink(missing_ok=True)
                         logger.info(
                             "%s FORCE_TICK: ciclo anticipato dalla dashboard.",
+                            prefix,
+                        )
+                        break
+                    if stop_file.exists() or pause_file.exists():
+                        logger.info(
+                            "%s Attesa interrotta da flag di controllo "
+                            "(stop/pausa).",
                             prefix,
                         )
                         break

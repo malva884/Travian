@@ -198,8 +198,19 @@ class Field:
 
     @property
     def is_empty_site(self) -> bool:
-        """Area di costruzione vuota nel dorf2 (classe g0)."""
-        return not self.is_resource_field and self.gid == GID_EMPTY
+        """Area di costruzione vuota nel dorf2.
+
+        gid 0 = classe g0 (vuoto esplicito); gid -1 con level 0 = slot
+        vuoto il cui markup non espone la classe gid. Un gid -1 con
+        level > 0 e' invece un edificio occupato con gid non letto
+        (segnalato da check_state_health): NON va trattato come libero
+        o il brain proporrebbe costruzioni su slot gia' edificati.
+        """
+        return (
+            not self.is_resource_field
+            and self.gid in (GID_EMPTY, -1)
+            and self.level <= 0
+        )
 
 
 @dataclass

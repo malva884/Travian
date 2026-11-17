@@ -12,8 +12,8 @@ from __future__ import annotations
 import logging
 from typing import Callable, Protocol
 
+from . import builder, debug_trace
 from .config import Settings
-from . import builder
 from .models import (
     GID_BARRACKS,
     GID_GRANARY,
@@ -86,9 +86,41 @@ def _upgradeable_fields(state: GameState, fields: list[Field]) -> list[Field]:
     return builder.upgradeable_fields(state, fields)
 
 
+_RES_NAMES: tuple[str, ...] = ("legno", "argilla", "ferro", "grano")
+
+
+def _field_upgrade_affordable(state: GameState, f: Field) -> bool:
+    """True se lo stock copre il costo stimato del prossimo livello."""
+    cost = builder.field_upgrade_cost(builder.field_gid(f), f.level + 1)
+    if cost is None:
+        return True  # tabella non applicabile: non bloccare il campo
+    res = state.resources
+    return (
+        res.wood >= cost[0]
+        and res.clay >= cost[1]
+        and res.iron >= cost[2]
+        and res.crop >= cost[3]
+    )
+
+
+def _field_upgrade_deficit(state: GameState, f: Field) -> str:
+    """Deficit per risorsa del prossimo livello (per i messaggi di skip)."""
+    cost = builder.field_upgrade_cost(builder.field_gid(f), f.level + 1)
+    res = state.resources
+    stock = (res.wood, res.clay, res.iron, res.crop)
+    if cost is None:
+        return "costo stimato non disponibile"
+    parts = [
+        f"servono ~{cost[i]} {_RES_NAMES[i]}, disponibili {stock[i]}"
+        for i in range(4)
+        if cost[i] > stock[i]
+    ]
+    return "; ".join(parts) or "costo coperto"
+
+
 def _queue_free(state: GameState, settings: Settings, resource_field: bool) -> bool:
     """True se la coda pertinente (campi o interni) puo' accettare un upgrade."""
-    if settings.allow_parallel_build:
+    if builder.parallel_build_enabled(settings):
         if resource_field:
             return (
                 len(state.resource_queue()) < settings.max_resource_queue
@@ -119,7 +151,7 @@ def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action |
     if builder.expansion_freeze(state, settings):
         return None
 
-    if settings.allow_parallel_build:
+    if builder.parallel_build_enabled(settings):
         if (
             len(state.resource_queue()) >= settings.max_resource_queue
             or len(state.build_queue) >= settings.max_build_queue
@@ -144,7 +176,19 @@ def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action |
     if not candidates:
         candidates = sorted(fields, key=lambda f: (f.level, f.slot_id))
 
-    target = candidates[0]
+    # Affordability: il campo piu' debole non pagabile non deve bloccare
+    # gli altri — prima tra i campi del tipo scarcest, poi tra tutti.
+    affordable = [f for f in candidates if _field_upgrade_affordable(state, f)]
+    if not affordable:
+        affordable = [
+            f
+            for f in sorted(fields, key=lambda f: (f.level, f.slot_id))
+            if _field_upgrade_affordable(state, f)
+        ]
+    if not affordable:
+        return None
+
+    target = affordable[0]
     return Action(
         type=ActionType.UPGRADE_FIELD,
         params={
@@ -152,9 +196,88 @@ def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action |
             "resource": scarcest.value,
         },
         reason=(
-            f"Coda libera: upgrade di '{target.name or 'slot ' + str(target.slot_id)}' "
+            f"Coda libera: upgrade di '{builder.field_label(target)}' "
             f"(livello {target.level}) per aumentare {scarcest.value}"
         ),
+    )
+
+
+def weakest_field_skip_reason(
+    state: GameState, settings: Settings
+) -> str:
+    """Motivo esatto per cui rule_upgrade_weakest_field non produce azioni.
+
+    Replica i gate della regola nell'ordine in cui vengono valutati e
+    restituisce il primo blocco incontrato, con conteggi espliciti:
+    fields_count=0 (dorf1 non letto/esportato), campi tutti in coda o
+    al cap, coda dorf1/totale piena, freeze o grain safety.
+    """
+    if builder.crop_safety_needed(state, settings):
+        return "grain safety attiva (solo upgrade grano ammessi)"
+    if builder.expansion_freeze(state, settings):
+        return "freeze espansione attivo (campi fuori whitelist)"
+    if builder.parallel_build_enabled(settings):
+        res_q = len(state.resource_queue())
+        tot_q = len(state.build_queue)
+        if res_q >= settings.max_resource_queue:
+            return (
+                f"coda dorf1 piena "
+                f"({res_q}/{settings.max_resource_queue})"
+            )
+        if tot_q >= settings.max_build_queue:
+            return (
+                f"coda totale piena "
+                f"({tot_q}/{settings.max_build_queue})"
+            )
+    elif state.build_queue:
+        return f"coda occupata ({len(state.build_queue)} lavori)"
+
+    raw_fields = state.resource_fields()
+    if not raw_fields:
+        return (
+            "fields_count=0: nessun campo dorf1 nello stato "
+            "(snapshot/lettura sensori senza i 18 campi)"
+        )
+    queued = _queued_slot_ids(state)
+    in_queue = [f for f in raw_fields if f.slot_id in queued]
+    at_cap = [
+        f
+        for f in raw_fields
+        if f.level >= builder.field_max_level(state, f)
+    ]
+    upgradable = [
+        f
+        for f in raw_fields
+        if f.slot_id not in queued
+        and f.level < builder.field_max_level(state, f)
+    ]
+    if upgradable:
+        # Campi upgradabili ma nessuna azione: quasi certamente il
+        # filtro affordability ha scartato tutti i candidati.
+        affordable = [
+            f for f in upgradable if _field_upgrade_affordable(state, f)
+        ]
+        if not affordable:
+            weakest = sorted(
+                upgradable, key=lambda f: (f.level, f.slot_id)
+            )[0]
+            return (
+                f"risorse insufficienti per "
+                f"'{builder.field_label(weakest)}' lv.{weakest.level + 1}: "
+                f"{_field_upgrade_deficit(state, weakest)}"
+            )
+        return (
+            f"{len(upgradable)} campi upgradabili e pagabili ma "
+            f"nessuna azione (anomalia non classificata)"
+        )
+    parts = []
+    if in_queue:
+        parts.append(f"{len(in_queue)} in coda")
+    if at_cap:
+        parts.append(f"{len(at_cap)} al cap")
+    return (
+        f"0 campi upgradabili su {len(raw_fields)} dorf1 "
+        f"({', '.join(parts) or 'tutti filtrati'})"
     )
 
 
@@ -180,7 +303,7 @@ def rule_upgrade_storage(state: GameState, settings: Settings) -> Action | None:
     Supporta la costruzione parallela: se c'e' gia' un campo risorsa
     in corso ma nessun edificio interno, lo storage puo' essere avviato.
     """
-    if settings.allow_parallel_build:
+    if builder.parallel_build_enabled(settings):
         if (
             len(state.interior_queue()) >= settings.max_interior_queue
             or len(state.build_queue) >= settings.max_build_queue
@@ -189,7 +312,10 @@ def rule_upgrade_storage(state: GameState, settings: Settings) -> Action | None:
     elif state.build_queue:
         return None
 
-    needed = _storage_needed(state)
+    # Jitter anti-detection: soglia storage campionata per ciclo
+    # (uniform 0.82-0.93) invece del 0.90 fisso — niente firma metrica.
+    _jit = getattr(settings, "cycle_jitter", None) or {}
+    needed = _storage_needed(state, float(_jit.get("storage", 0.90)))
     if not needed:
         return None
 
@@ -235,7 +361,7 @@ def rule_upgrade_storage(state: GameState, settings: Settings) -> Action | None:
             "construct": builder.construct_gids(state, candidates),
         },
         reason=(
-            f"Storage quasi pieno: upgrade di '{target.name or 'slot ' + str(target.slot_id)}' "
+            f"Storage quasi pieno: upgrade di '{builder.field_label(target)}' "
             f"(livello {target.level}, slot {target.slot_id})"
         ),
     )
@@ -403,7 +529,7 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
                 },
                 reason=(
                     f"Storage pieno: spesa locale su "
-                    f"'{head.name or 'slot ' + str(head.slot_id)}' "
+                    f"'{builder.field_label(head)}' "
                     f"(livello {head.level}) per smaltire {surplus}"
                 ),
             )
@@ -430,7 +556,7 @@ def rule_emergency_overflow(state: GameState, settings: Settings) -> Action | No
                     "priority_units": priority_units,
                 },
                 reason=(
-                    f"Storage pieno: addestramento in '{trainer.name or 'slot ' + str(trainer.slot_id)}' "
+                    f"Storage pieno: addestramento in '{builder.field_label(trainer)}' "
                     f"(slot {trainer.slot_id}) per smaltire risorse"
                 ),
             )
@@ -516,7 +642,7 @@ def rule_grain_safety(state: GameState, settings: Settings) -> Action | None:
         reason=(
             f"Grain safety: margine {builder.net_crop(state)}/h sotto soglia "
             f"{builder.crop_threshold(state, settings):g}/h — upgrade di "
-            f"'{head.name or 'slot ' + str(head.slot_id)}' (livello {head.level})"
+            f"'{builder.field_label(head)}' (livello {head.level})"
         ),
     )
 
@@ -552,7 +678,7 @@ def rule_anti_raid(state: GameState, settings: Settings) -> Action | None:
         },
         reason=(
             f"Anti-Raid: protezione {protected} < target {target} — "
-            f"upgrade di '{head.name or 'slot ' + str(head.slot_id)}' "
+            f"upgrade di '{builder.field_label(head)}' "
             f"(livello {head.level}, slot {head.slot_id})"
         ),
     )
@@ -576,7 +702,7 @@ def rule_building_focus(state: GameState, settings: Settings) -> Action | None:
             "construct": builder.construct_gids(state, intents),
         },
         reason=(
-            f"Focus manuale: upgrade di '{head.name or 'slot ' + str(head.slot_id)}' "
+            f"Focus manuale: upgrade di '{builder.field_label(head)}' "
             f"(livello {head.level}, slot {head.slot_id})"
         ),
     )
@@ -611,7 +737,7 @@ def rule_culture_boost(state: GameState, settings: Settings) -> Action | None:
         reason=(
             f"CP Booster: PC {state.culture_points}/"
             f"{state.culture_points_required} — upgrade di "
-            f"'{head.name or 'slot ' + str(head.slot_id)}' "
+            f"'{builder.field_label(head)}' "
             f"(livello {head.level})"
         ),
     )
@@ -658,23 +784,39 @@ def rule_role_buildings(state: GameState, settings: Settings) -> Action | None:
         },
         reason=(
             f"Sviluppo ruolo '{role}': upgrade di "
-            f"'{head.name or 'slot ' + str(head.slot_id)}' "
+            f"'{builder.field_label(head)}' "
             f"(livello {head.level}, slot {head.slot_id})"
         ),
     )
 
 
 def rule_wait(state: GameState, settings: Settings) -> Action:
-    """Fallback: niente da fare in questa iterazione."""
+    """Fallback: niente da fare in questa iterazione.
+
+    Doppia coda (Romani/Plus): "occupata" solo se entrambe le viste
+    sono piene; se una resta libera il motivo lo dichiara — serve a
+    distinguere un attesa reale da un candidato mancante/non pagabile.
+    """
     if state.build_queue:
         eta = min(
             (item.remaining_seconds for item in state.build_queue),
             default=0,
         )
+        can_out, can_in = builder.queue_slots_free(state, settings)
+        if not can_out and not can_in:
+            reason = (
+                f"Coda occupata, prossima costruzione tra ~{eta}s"
+            )
+        else:
+            free_side = "campi (dorf1)" if can_out else "edifici (dorf2)"
+            reason = (
+                f"Coda {free_side} libera ma nessun upgrade avviabile; "
+                f"prossima costruzione tra ~{eta}s"
+            )
         return Action(
             type=ActionType.WAIT,
             params={"suggest_seconds": eta},
-            reason=f"Coda occupata, prossima costruzione tra ~{eta}s",
+            reason=reason,
         )
     return Action(type=ActionType.WAIT, reason="Nessuna azione necessaria")
 
@@ -701,19 +843,158 @@ class RuleBasedBrain:
     def __init__(self, settings: Settings, rules: tuple[Rule, ...] | None = None) -> None:
         self.settings = settings
         self.rules = rules or self.DEFAULT_RULES
+        # Decision Trace: ultima radiografia decisionale (letta anche dal
+        # dry-run /api/debug/simulate). trace_tag marca le simulazioni.
+        self.last_trace: dict = {}
+        self.trace_tag: str = ""
+
+    def _rule_skip_note(self, rule: Rule, state: GameState) -> str:
+        """Motivo piu' probabile per cui la regola non ha prodotto azioni.
+
+        Euristica per regola sui flag gia' calcolati: basta a spiegare
+        il 90% dei 'no_match' senza strumentare ogni funzione.
+        """
+        name = getattr(rule, "__name__", "")
+        try:
+            if name == "rule_upgrade_storage":
+                if not _queue_free(state, self.settings, resource_field=False):
+                    return "coda edifici (dorf2) occupata"
+                return "nessuno storage oltre la soglia di riempimento"
+            if name == "rule_grain_safety":
+                if not builder.crop_safety_needed(state, self.settings):
+                    return "margine netto grano sopra soglia (safety inattiva)"
+                return "grain safety attiva ma nessun candidato/coda piena"
+            if name == "rule_emergency_overflow":
+                return "storage non al 100% (o upgrade storage gia' possibile)"
+            if name == "rule_anti_raid":
+                if not getattr(state, "under_raid_pressure", False):
+                    return "nessuna pressione raid sul villaggio"
+                return "pressione raid ma nessun intent Nascondigli/coda piena"
+            if name == "rule_building_focus":
+                why = builder.focus_skip_reasons(state, self.settings)
+                if why:
+                    return "; ".join(why)
+                try:
+                    pre = builder.focus_candidates(state, self.settings)
+                    post = builder.focus_intents(state, self.settings)
+                    if pre and not post:
+                        return (
+                            f"{len(pre)} candidati scartati: slot coda "
+                            f"occupato (dorf1/dorf2 pieni)"
+                        )
+                    if pre:
+                        return "candidati non eseguibili in questo ciclo"
+                except Exception:  # noqa: BLE001
+                    pass
+                return "coda prioritaria vuota o disabilitata"
+            if name == "rule_culture_boost":
+                if not builder.culture_boost_active(state, self.settings):
+                    return "culture boost non attivo (ruolo/CP/residenza)"
+                return "riserva 3 coloni non coperta o nessun candidato"
+            if name == "rule_role_buildings":
+                return "nessun intent di ruolo applicabile o coda piena"
+            if name == "rule_upgrade_weakest_field":
+                return weakest_field_skip_reason(state, self.settings)
+        except Exception:  # noqa: BLE001
+            pass
+        return "condizioni non soddisfatte"
+
+    def _decision_trace(
+        self, state: GameState, evaluated: list[dict], action: Action | None
+    ) -> dict:
+        """Radiografia completa del ciclo decisionale (spec debug pipeline)."""
+        pool: dict = {}
+        try:
+            pre = builder.focus_candidates(state, self.settings)
+            post = builder.focus_intents(state, self.settings)
+            pre_slots = {f.slot_id for f in pre}
+            post_slots = {f.slot_id for f in post}
+            def _fld(f: Field) -> dict:
+                return {
+                    "slot": f.slot_id,
+                    "gid": f.gid,
+                    "name": builder.field_label(f),
+                    "level": f.level,
+                    "dorf": 1 if f.is_resource_field else 2,
+                }
+            pool = {
+                "focus_pre_filter": [_fld(f) for f in pre],
+                "focus_post_filter": [_fld(f) for f in post],
+                "dropped_by_queue": sorted(pre_slots - post_slots),
+                "queued_slot_ids": sorted(
+                    builder.queued_slot_ids(state)
+                ),
+            }
+        except Exception:  # noqa: BLE001
+            pool = {}
+        trace = {
+            "village": state.village_name,
+            "inputs_snapshot": debug_trace.inputs_snapshot(
+                state, self.settings
+            ),
+            "rules_evaluated": evaluated,
+            "candidates_pool": pool,
+            "final_action": (
+                {
+                    "type": action.type.value,
+                    "reason": action.reason,
+                    "rule": str((action.params or {}).get("rule") or ""),
+                }
+                if action is not None
+                else None
+            ),
+        }
+        if self.trace_tag:
+            trace["tag"] = self.trace_tag
+        return trace
 
     def decide(self, state: GameState) -> Action:
+        evaluated: list[dict] = []
         for rule in self.rules:
+            rule_name = getattr(rule, "__name__", str(rule))
             action = rule(state, self.settings)
             if action is not None:
                 # Decision Audit Log: la regola vincente viaggia nei
                 # params e viene registrata dall'orchestrator.
                 action.params = dict(action.params or {})
-                action.params["rule"] = getattr(
-                    rule, "__name__", str(rule)
+                action.params["rule"] = rule_name
+                evaluated.append(
+                    {
+                        "rule": rule_name,
+                        "result": "matched",
+                        "action": action.type.value,
+                        "reason": action.reason,
+                    }
+                )
+                self.last_trace = self._decision_trace(
+                    state, evaluated, action
+                )
+                debug_trace.append_trace(
+                    self.settings.account_id,
+                    "decision_simulated"
+                    if self.trace_tag == "simulate"
+                    else "decision",
+                    self.last_trace,
                 )
                 return action
-        return Action(type=ActionType.NOOP, reason="Nessuna regola ha prodotto azioni")
+            evaluated.append(
+                {
+                    "rule": rule_name,
+                    "result": "no_match",
+                    "reason": self._rule_skip_note(rule, state),
+                }
+            )
+        action = Action(
+            type=ActionType.NOOP,
+            reason="Nessuna regola ha prodotto azioni",
+        )
+        self.last_trace = self._decision_trace(state, evaluated, action)
+        debug_trace.append_trace(
+            self.settings.account_id,
+            "decision_simulated" if self.trace_tag == "simulate" else "decision",
+            self.last_trace,
+        )
+        return action
 
 
 class LLMBrain:

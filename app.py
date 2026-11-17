@@ -8,6 +8,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -15,7 +16,6 @@ import uuid
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 import ui_theme as ui
 from travian_agent import db, telemetry
@@ -694,8 +694,26 @@ if not _cc_html_path.exists():
     st.stop()
 
 _doc = _cc_html_path.read_text(encoding="utf-8")
+# URL pubblico del command server (porta 8610): su deploy remoti (Coolify)
+# il browser non puo' raggiungere 127.0.0.1 del container — va esposto un
+# secondo dominio/porta e impostato TRAVIAN_API_URL (es. https://api.example.com).
+_api_url = os.getenv("TRAVIAN_API_URL", "").rstrip("/")
+# Config serializzate per-account: la dashboard embedded le usa quando
+# l'API :8610 non e' raggiungibile (deploy remoto) per non mostrare
+# dati di un altro account dopo il cambio nel selettore.
+try:
+    from travian_agent.command_server import _account_config
+    _embedded_configs = {
+        a.account_id: _account_config(a) for a in accounts
+    }
+except Exception:
+    _embedded_configs = {}
 _inject = (
-    "<script>window.__EMBEDDED__=true;window.__EMBEDDED_ACCOUNTS__="
+    "<script>window.__EMBEDDED__=true;window.__EMBEDDED_API_URL__="
+    + json.dumps(_api_url)
+    + ";window.__EMBEDDED_CONFIGS__="
+    + json.dumps(_embedded_configs, ensure_ascii=False).replace("</", "<\\/")
+    + ";window.__EMBEDDED_ACCOUNTS__="
     + json.dumps(
         [{"id": a.account_id, "url": a.server_url} for a in accounts],
         ensure_ascii=False,
@@ -717,11 +735,25 @@ st.markdown(
     "</style>",
     unsafe_allow_html=True,
 )
-components.html(_doc, height=1000, scrolling=True)
+st.iframe(_doc, height=1000)
 
-# Auto-refresh telemetria: ricarica la pagina ogni 8s.
-time.sleep(8)
-st.rerun()
+# Auto-refresh telemetria.
+# Con API comandi raggiungibile (locale o TRAVIAN_API_URL) l'HUD fa polling
+# da solo: nessun rerun, cosi' il reload dell'iframe non resetta l'account
+# selezionato o i form di configurazione aperti.
+# Il rerun (8s) resta solo come fallback per deploy remoti senza API, dove
+# gli snapshot iniettati (__EMBEDDED_ALL_STATES__) sono l'unica fonte dati.
+def _command_api_reachable() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", 8610), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+if not _api_url and not _command_api_reachable():
+    time.sleep(8)
+    st.rerun()
 st.stop()
 
 # --- BARRA LATERALE ---
@@ -1102,7 +1134,7 @@ if page == "Command Center":
             + ";</script>"
         )
         _doc = _doc.replace("<script>", _inject + "\n<script>", 1)
-        components.html(_doc, height=1650, scrolling=True)
+        st.iframe(_doc, height=1650)
 
     _cc_auto = st.checkbox(
         "Auto-refresh telemetria (8s)", value=True, key="cc_auto_refresh"

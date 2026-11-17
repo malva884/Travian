@@ -25,7 +25,12 @@ COPY . .
 # Directory persistenti (montare un volume su /app/state su Coolify)
 RUN mkdir -p /app/state /app/debug
 
-EXPOSE 8501
+# 8501: dashboard Streamlit — 8610: command API (command_server, avviato da
+# app.py). Su Coolify esporre anche la 8610 con un secondo dominio (HTTPS) e
+# impostare la variabile d'ambiente TRAVIAN_API_URL su quell'URL, altrimenti
+# i comandi dalla dashboard embedded (aggiungi account, salvataggi, ecc.)
+# puntano a 127.0.0.1 del browser e falliscono.
+EXPOSE 8501 8610
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/healthz', timeout=5)" || exit 1

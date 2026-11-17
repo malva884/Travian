@@ -169,6 +169,62 @@ class ModulePauseRegistry:
                 del self._pauses[key]
 
 
+# --- Jitter sulle soglie decisionali (anti firma comportamentale) ---------
+#
+# Le soglie matematiche fisse (storage 90%, cura eroe 50%) sono una firma
+# rilevabile: ogni ciclo campiona valori leggermente diversi, conservati in
+# ``settings.cycle_jitter`` e letti dalle regole del brain/eroe.
+def sample_cycle_thresholds() -> dict:
+    """Soglie campionate per il ciclo corrente (una tantum per ciclo)."""
+    return {
+        "storage": random.uniform(0.82, 0.93),
+        "hero_heal": random.uniform(0.45, 0.62),
+    }
+
+
+# --- Resource-ETA Sleep ----------------------------------------------------
+#
+# Quando un upgrade fallisce per deficit di risorse, riprovare al ciclo dopo
+# e' polling a vuoto: la pausa del modulo viene invece calcolata sul tempo
+# reale necessario a produrre il deficit (con jitter e cap 45-60 min).
+def resource_eta_seconds(
+    deficit: dict, production_per_hour: dict
+) -> float | None:
+    """Secondi per colmare ``deficit`` data la produzione oraria per risorsa.
+
+    ``deficit``/``production_per_hour`` usano chiavi wood/clay/iron/crop.
+    Ritorna None se una risorsa in deficit ha produzione <= 0 (ETA non
+    stimabile), 0 se non c'e' deficit.
+    """
+    eta = 0.0
+    for res, need in (deficit or {}).items():
+        need_f = max(0.0, float(need or 0.0))
+        if need_f <= 0:
+            continue
+        prod = float((production_per_hour or {}).get(res) or 0.0)
+        if prod <= 0:
+            return None
+        eta = max(eta, need_f / (prod / 3600.0))
+    return eta
+
+
+def eta_pause_bounds(eta_seconds: float) -> tuple[float, float]:
+    """(min,max) della pausa modulo dal Resource-ETA.
+
+    Pausa = eta * uniform(0.95, 1.12), cap randomizzato a 45-60 minuti,
+    jitter asimmetrico fino a +120s / -120s. Pensata per
+    ``ModulePauseRegistry.register(min_seconds=lo, max_seconds=hi)``.
+    """
+    eta = max(0.0, float(eta_seconds))
+    if eta <= 0:
+        return 0.0, 0.0
+    cap = random.uniform(45.0 * 60.0, 60.0 * 60.0)
+    base = min(eta * random.uniform(0.95, 1.12), cap)
+    lo = max(30.0, base - random.uniform(0.0, 120.0))
+    hi = min(cap, base + random.uniform(30.0, 120.0))
+    return lo, max(lo + 30.0, hi)
+
+
 def human_cycle_interval(min_seconds: float, max_seconds: float) -> float:
     """Intervallo tra due cicli con distribuzione NON uniforme.
 

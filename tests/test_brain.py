@@ -150,7 +150,7 @@ class TestRulePriority:
 
     def test_resource_field_upgrade_when_storage_ok(self):
         state = _state(
-            wood=10, clay=200, iron=200, crop=100,
+            wood=50, clay=200, iron=200, crop=100,
             warehouse_capacity=2000, granary_capacity=2000,
         )
         state.fields = [
@@ -163,7 +163,7 @@ class TestRulePriority:
 
     def test_interior_building_in_queue_allows_resource_field_upgrade(self):
         state = _state(
-            wood=10, clay=200, iron=200, crop=100,
+            wood=50, clay=200, iron=200, crop=100,
             warehouse_capacity=2000, granary_capacity=2000,
         )
         state.fields = [
@@ -323,7 +323,7 @@ class TestVillageRoles:
         """Un villaggio croplog (via villages) potenzia i campi grano."""
         s = _settings()
         s.villages = {"Pizzo": VillageConfig(name="Pizzo", role="croplog")}
-        state = _state(wood=0, clay=0, iron=0, crop=100,
+        state = _state(wood=300, clay=300, iron=300, crop=300,
                        warehouse_capacity=5000, granary_capacity=5000)
         state.village_name = "Pizzo"
         state.fields = [

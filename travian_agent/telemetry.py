@@ -285,6 +285,7 @@ def _village_payload(
     village: Village,
     state: GameState | None,
     role: str,
+    freeze_active: bool = False,
 ) -> dict:
     res = state.resources if state is not None else None
     queue = []
@@ -322,6 +323,10 @@ def _village_payload(
                     "level": int(getattr(f, "level", 0) or 0),
                 }
             )
+    # I 18 campi risorsa del dorf1 (slot 1-18) come chiave dedicata:
+    # fonte primaria per la ricostruzione dello stato da snapshot
+    # (command_server._state_from_snapshot) e per la UI dei campi.
+    fields = [s for s in slots if 1 <= int(s.get("slot") or 0) <= 18]
     role_raw = getattr(village.role, "value", village.role)
     is_capital = str(role_raw).lower() == "capital" or any(
         f.gid == GID_PALACE for f in interiors
@@ -350,6 +355,7 @@ def _village_payload(
         "x": village.x,
         "y": village.y,
         "role": role,
+        "freeze_active": bool(freeze_active),
         "is_capital": bool(is_capital),
         "resources": {
             "wood": int(getattr(res, "wood", 0) or 0),
@@ -367,6 +373,7 @@ def _village_payload(
         "outgoing_attacks": [_mv(m) for m in moves_out],
         "building_queue": queue,
         "slots": slots,
+        "fields": fields,
         "settlers": {
             "trained": int(getattr(state, "settlers_home", 0) or 0),
             "in_queue": 0,
@@ -410,7 +417,20 @@ def export_dashboard_state(
                 role = str(cfg.role)
         except Exception:  # noqa: BLE001
             pass
-        village_items.append(_village_payload(v, state, role))
+        # Freeze Espansione reale per questo villaggio: la UI mostra il
+        # pill 'Freeze' solo quando la regola e' effettivamente attiva.
+        freeze_active = False
+        if state is not None:
+            try:
+                # import tardivo: evita cicli builder -> telemetry
+                from .builder import expansion_freeze
+
+                freeze_active = bool(expansion_freeze(state, settings))
+            except Exception:  # noqa: BLE001
+                freeze_active = False
+        village_items.append(
+            _village_payload(v, state, role, freeze_active)
+        )
 
     # Flag raid dal config farming (disponibile solo a livello account)
     farming_enabled = bool(getattr(settings.farming, "enabled", False))

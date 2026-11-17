@@ -346,44 +346,44 @@
             <div class="sub-card rounded-xl p-3 flex items-center justify-between">
               <div>
                 <div class="text-xs font-bold text-white">Builder (Costruzioni)</div>
-                <div class="text-[10px] text-emerald-400">ATTIVO · Slot check gid==0</div>
+                <div id="mx-builder-status" class="text-[10px] text-slate-500">—</div>
               </div>
-              <input type="checkbox" checked onchange="notify('Modulo Builder aggiornato', 'cyan')" class="w-4 h-4 accent-emerald-400">
+              <input id="mx-builder" type="checkbox" onchange="matrixToggle(this, 'account', 'builder_enabled')" class="w-4 h-4 accent-emerald-400">
             </div>
             <div class="sub-card rounded-xl p-3 flex items-center justify-between">
               <div>
                 <div class="text-xs font-bold text-white">Rule Anti-Raid</div>
-                <div class="text-[10px] text-emerald-400">ATTIVO · Target 4.200+</div>
+                <div id="mx-antiraid-status" class="text-[10px] text-slate-500">—</div>
               </div>
-              <input type="checkbox" checked onchange="notify('Modulo Anti-Raid aggiornato', 'cyan')" class="w-4 h-4 accent-emerald-400">
+              <input id="mx-antiraid" type="checkbox" onchange="matrixToggle(this, 'defense', 'enabled')" class="w-4 h-4 accent-emerald-400">
             </div>
             <div class="sub-card rounded-xl p-3 flex items-center justify-between">
               <div>
                 <div class="text-xs font-bold text-white">Freeze Espansione</div>
-                <div class="text-[10px] text-cyan-300">ATTIVO · Whitelist 7 GID</div>
+                <div id="mx-freeze-status" class="text-[10px] text-slate-500">Whitelist 7 GID</div>
               </div>
-              <input type="checkbox" checked onchange="notify('Freeze Espansione aggiornato', 'cyan')" class="w-4 h-4 accent-cyan-400">
+              <input id="mx-freeze" type="checkbox" onchange="matrixToggle(this, 'expansion', 'spending_freeze')" class="w-4 h-4 accent-cyan-400">
             </div>
             <div class="sub-card rounded-xl p-3 flex items-center justify-between">
               <div>
                 <div class="text-xs font-bold text-white">Replenishment Truppe</div>
-                <div class="text-[10px] text-amber-400">IN PAUSA (riserva coloni)</div>
+                <div id="mx-repl-status" class="text-[10px] text-slate-500">—</div>
               </div>
-              <input type="checkbox" onchange="notify('Replenishment Truppe aggiornato', 'amber')" class="w-4 h-4 accent-amber-400">
+              <input id="mx-repl" type="checkbox" onchange="matrixToggle(this, 'replenishment', 'enabled')" class="w-4 h-4 accent-amber-400">
             </div>
             <div class="sub-card rounded-xl p-3 flex items-center justify-between">
               <div>
                 <div class="text-xs font-bold text-white">Farming Raid</div>
-                <div class="text-[10px] text-slate-400">ESCLUSO su ruolo founder</div>
+                <div id="mx-farming-status" class="text-[10px] text-slate-500">—</div>
               </div>
-              <input type="checkbox" checked onchange="notify('Farming Raid aggiornato', 'cyan')" class="w-4 h-4 accent-cyan-400">
+              <input id="mx-farming" type="checkbox" onchange="matrixToggle(this, 'farming', 'enabled')" class="w-4 h-4 accent-cyan-400">
             </div>
             <div class="sub-card rounded-xl p-3 flex items-center justify-between">
               <div>
                 <div class="text-xs font-bold text-white">Auto-Eroe Avventure</div>
-                <div class="text-[10px] text-emerald-400">ATTIVO · Soglia HP 35%</div>
+                <div id="mx-hero-status" class="text-[10px] text-slate-500">—</div>
               </div>
-              <input type="checkbox" checked onchange="notify('Auto-Eroe Avventure aggiornato', 'cyan')" class="w-4 h-4 accent-emerald-400">
+              <input id="mx-hero" type="checkbox" onchange="matrixToggle(this, 'hero', 'enabled')" class="w-4 h-4 accent-emerald-400">
             </div>
           </div>
           <div class="sub-card rounded-xl p-3.5 space-y-2 font-mono">
@@ -1523,6 +1523,50 @@
           </div>
           <pre id="debug-json-preview" class="bg-slate-950 border border-slate-800 rounded-xl p-3 text-[11px] text-emerald-300 overflow-x-auto max-h-[340px]"></pre>
         </div>
+
+        <!-- DRY-RUN: Simula Ciclo (brain.decide in memoria, no browser) -->
+        <div class="xl:col-span-12 panel-card rounded-2xl p-4 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 class="text-xs uppercase tracking-wider text-emerald-400 font-bold">Decision Pipeline — Dry-Run "Simula Ciclo"</h2>
+            <div class="flex items-center gap-2">
+              <select id="debug-sim-village" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200"></select>
+              <button onclick="simulateCycle()" class="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 text-[11px] font-bold">
+                ▶ Simula Ciclo (no browser)
+              </button>
+            </div>
+          </div>
+          <p class="text-[10px] text-slate-500">Esegue brain.decide() sull'ultimo snapshot telemetria: stesso albero decisionale del ciclo reale, in ~0.1s, senza toccare il browser. Utile per testare modifiche a regole/config prima del tick vero.</p>
+          <div id="debug-sim-result" class="hidden space-y-3">
+            <div id="debug-sim-action" class="sub-card rounded-xl p-3 text-[12px] font-bold"></div>
+            <div class="grid grid-cols-1 xl:grid-cols-3 gap-3">
+              <div class="sub-card rounded-xl p-3 space-y-1.5">
+                <div class="text-[10px] uppercase text-cyan-400 font-bold">Inputs Snapshot</div>
+                <pre id="debug-sim-inputs" class="text-[10px] text-slate-300 overflow-x-auto max-h-[240px]"></pre>
+              </div>
+              <div class="sub-card rounded-xl p-3 space-y-1.5">
+                <div class="text-[10px] uppercase text-cyan-400 font-bold">Regole Valutate (ordine)</div>
+                <div id="debug-sim-rules" class="space-y-1 max-h-[240px] overflow-y-auto"></div>
+              </div>
+              <div class="sub-card rounded-xl p-3 space-y-1.5">
+                <div class="text-[10px] uppercase text-cyan-400 font-bold">Pool Candidati</div>
+                <pre id="debug-sim-pool" class="text-[10px] text-slate-300 overflow-x-auto max-h-[240px]"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- DECISION TRACE LOG (state/debug_trace_<acc>.jsonl) -->
+        <div class="xl:col-span-12 panel-card rounded-2xl p-4 space-y-3">
+          <div class="flex items-center justify-between">
+            <h2 class="text-xs uppercase tracking-wider text-amber-400 font-bold">Decision Trace Log (debug_trace_*.jsonl)</h2>
+            <button onclick="loadDebugTrace()" class="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 text-[11px] font-bold">
+              🔄 Aggiorna
+            </button>
+          </div>
+          <div id="debug-trace-list" class="space-y-1.5 max-h-[420px] overflow-y-auto text-[11px]">
+            <div class="text-slate-500">Carica il trace con il pulsante Aggiorna.</div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -1540,6 +1584,7 @@
     const EMBEDDED_STATE = window.__EMBEDDED_STATE__ || null;
     const EMBEDDED_ALL_STATES = window.__EMBEDDED_ALL_STATES__ || {};
     const EMBEDDED_ACCOUNTS = window.__EMBEDDED_ACCOUNTS__ || [];
+    const EMBEDDED_CONFIGS = window.__EMBEDDED_CONFIGS__ || {};
     const POLL_MS = 4000;
 
     const COMMAND_ALIAS = {
@@ -1550,10 +1595,13 @@
     };
 
     window.TravianOpsAPI = {
-      // In embedded l'iframe e' servito da Streamlit (origine diversa):
-      // il command server su :8610 ha CORS aperto, quindi i comandi
-      // funzionano anche qui. In standalone baseUrl '' = stessa origine.
-      baseUrl: EMBEDDED ? 'http://127.0.0.1:8610' : '',
+      // Priorita': __EMBEDDED_API_URL__ iniettato da app.py (env
+      // TRAVIAN_API_URL) per deploy remoti (Coolify), poi override manuale
+      // localStorage 'travianApiUrl'. In locale embedded -> 127.0.0.1:8610
+      // (CORS aperto), in standalone baseUrl '' = stessa origine.
+      baseUrl: (window.__EMBEDDED_API_URL__ || '')
+        || (localStorage.getItem('travianApiUrl') || '')
+        || (EMBEDDED ? 'http://127.0.0.1:8610' : ''),
       async fetchWorkers() {
         try {
           const res = await fetch(`${this.baseUrl}/api/workers`);
@@ -1564,10 +1612,16 @@
       },
       async fetchState(account = '') {
         if (EMBEDDED) {
-          if (account && EMBEDDED_ALL_STATES[account] && Object.keys(EMBEDDED_ALL_STATES[account]).length) {
-            return EMBEDDED_ALL_STATES[account];
+          const snap = account ? EMBEDDED_ALL_STATES[account] : null;
+          if (snap && Object.keys(snap).length) return snap;
+          // EMBEDDED_STATE e' lo snapshot dell'account selezionato al
+          // page-load: restituirlo per un altro account mostrerebbe
+          // dati altrui. Va bene solo se e' dell'account richiesto.
+          if (!account
+            || (EMBEDDED_STATE && EMBEDDED_STATE.account_id === account)) {
+            return EMBEDDED_STATE;
           }
-          return EMBEDDED_STATE;
+          return null;
         }
         try {
           const res = await fetch(`${this.baseUrl}/api/dashboard-state` +
@@ -1583,10 +1637,14 @@
         try {
           const res = await fetch(`${this.baseUrl}/api/config` +
             (account ? `?account=${encodeURIComponent(account)}` : ''));
-          return res.ok ? await res.json() : null;
-        } catch (_) {
-          return null;
+          if (res.ok) return await res.json();
+        } catch (_) { /* fallback embedded sotto */ }
+        // Embedded senza API raggiungibile (deploy remoto): usa la config
+        // per-account iniettata da app.py. Mai quella di un altro account.
+        if (EMBEDDED && account && EMBEDDED_CONFIGS[account]) {
+          return EMBEDDED_CONFIGS[account];
         }
+        return null;
       },
       async saveModuleConfig(section, patch, account = '') {
         try {
@@ -1615,8 +1673,15 @@
         const mf = configPayload.manual_focus || {};
         const queue = (configPayload.priority_queue || []).map((s, i) => ({
           ...(s.key ? { key: s.key } : { gid: s.gid }),
-          target_level: s.target, priority: i + 1,
+          target_level: s.target ?? s.target_level ?? 0,
+          priority: i + 1,
         }));
+        // Unica sorgente coda: plan e focus ricevono la STESSA lista
+        // (formato step {key|gid, target_level, priority}). Il Focus
+        // Manuale, quando attivo, precede la coda come step gid.
+        const plan = mf.enabled
+          ? [{ gid: mf.gid, target_level: 1, priority: 0 }, ...queue]
+          : queue;
         const troops = configPayload.allowed_troops || [];
         const patch = {
           ...(configPayload.extra || {}),
@@ -1626,12 +1691,8 @@
               ? '' : configPayload.feeder_target,
           allowed_units: troops,
           priority_units: troops,
-          building_queue_plan: queue,
-          // Focus Manuale: quando attivo la coda diventa il solo focus
-          // (legacy building_focus), preceduto dallo step gid/slot scelto.
-          building_focus: mf.enabled
-            ? [{ gid: mf.gid, slot: mf.slot, target_level: 1, priority: 0 }, ...queue]
-            : queue,
+          building_queue_plan: plan,
+          building_focus: plan,
           building_focus_enabled: !!mf.enabled,
         };
         try {
@@ -1978,6 +2039,7 @@
 
     function switchView(viewId) {
       appState.currentView = viewId;
+      try { localStorage.setItem('t_ops.view', viewId); } catch (_) {}
       document.querySelectorAll('.view-section').forEach(sec => sec.classList.add('hidden'));
       const target = document.getElementById(`view-${viewId}`);
       if (target) target.classList.remove('hidden');
@@ -2087,7 +2149,17 @@
 
     function applyVillageConfigToForm() {
       const cfg = _villageCfgEntry(appState.activeVillage);
-      if (!cfg) return;
+      if (!cfg) {
+        // Nessuna config per questo villaggio/account: azzera lo stato
+        // visibile invece di lasciare i valori dell'account precedente.
+        appState.priorityQueue = [];
+        appState.allowedTroops = [];
+        appState.manualFocus = { enabled: false, gid: 17, slot: 0 };
+        renderPriorityQueue();
+        renderBrainTroops();
+        renderDorf2Map();
+        return;
+      }
       const roleSel = document.getElementById('brain-role-select');
       if (roleSel && cfg.role) roleSel.value = cfg.role;
       const fs = document.getElementById('brain-feeder-select');
@@ -2136,8 +2208,14 @@
 
     async function loadConfig() {
       const cfg = await window.TravianOpsAPI.fetchConfig(appState.activeAccount);
-      if (!cfg) return;
-      appState.config = cfg;
+      appState.config = cfg || null;
+      if (!cfg) {
+        // Config non disponibile: svuota lo stato per non mostrare
+        // quello dell'account precedente.
+        applyVillageConfigToForm();
+        renderModuleForms();
+        return;
+      }
       applyVillageConfigToForm();
       renderModuleForms();
       loadFarmTargets();
@@ -2147,10 +2225,9 @@
     // Riempie i controlli dei moduli (farming/eroe/difesa/replenishment/espansione)
     // dai valori persistiti in accounts.json.
     function renderModuleForms() {
-      const c = appState.config;
-      if (!c) return;
+      const c = appState.config || {};
       const set = (id, val) => { const el = document.getElementById(id); if (el) el.checked = !!val; };
-      const setV = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
+      const setV = (id, val) => { const el = document.getElementById(id); if (el) el.value = (val == null ? '' : val); };
       const f = c.farming || {};
       set('mod-farming-enabled', f.enabled);
       setV('mod-farming-min', f.interval_min_minutes);
@@ -2211,6 +2288,21 @@
         const extra = (ex.target_slots || []).slice(1);
         setV('exp-targets-extra', extra.map(t => `${t.x}|${t.y}`).join(', '));
       }
+      // Matrice Moduli Automazione (vista Controllo): stato persistito
+      // su accounts.json — default coerenti col backend (builder/freeze
+      // default ON, moduli opzionali default OFF).
+      const mx = (id, on, suffix = '') => {
+        const el = document.getElementById(id);
+        if (el) el.checked = !!on;
+        _matrixStatus(id, !!on, suffix);
+      };
+      mx('mx-builder', c.builder_enabled !== false);
+      mx('mx-antiraid', d.enabled);
+      mx('mx-freeze', !c.expansion || c.expansion.spending_freeze !== false,
+        ' · Whitelist 7 GID');
+      mx('mx-repl', r.enabled);
+      mx('mx-farming', f.enabled);
+      mx('mx-hero', h.enabled);
     }
 
     function renderVillageCard() {
@@ -2356,6 +2448,20 @@
         .reduce((m, s) => Math.max(m, s.level || 0), 0);
     }
 
+    // Pill 'Freeze' solo quando la regola e' realmente attiva: flag da
+    // telemetria; fallback su snapshot vecchi -> toggle OFF o ruolo
+    // non-founder => freeze impossibile.
+    function _villageFreezeActive() {
+      const v = (appState.villages || [])
+        .find(x => x.name === appState.activeVillage);
+      if (v && typeof v.freeze_active === 'boolean') return v.freeze_active;
+      const c = appState.config || {};
+      if (c.expansion && c.expansion.spending_freeze === false) return false;
+      const vc = (c.villages || {})[appState.activeVillage] || {};
+      const role = (v && v.role) || vc.role || '';
+      return /founder|pioneer|early_cropper/i.test(String(role));
+    }
+
     function renderPriorityQueue() {
       const box = document.getElementById('brain-priority-queue');
       if (!box) return;
@@ -2370,7 +2476,8 @@
         const gids = _stepGids(step);
         const curLvl = _stepCurrentLevel(step);
         const completed = step.target > 0 && curLvl >= step.target;
-        const frozen = !completed && !gids.some(g => FREEZE_WHITELIST_GIDS.includes(g));
+        const frozen = _villageFreezeActive() && !completed
+          && !gids.some(g => FREEZE_WHITELIST_GIDS.includes(g));
         let badge = '';
         if (completed) {
           badge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">✓ Completato</span>`;
@@ -2939,6 +3046,120 @@
           priority_queue: appState.priorityQueue
         }, null, 2);
       }
+      // Selettore villaggio del dry-run: dai dati live del ciclo.
+      const simSel = document.getElementById('debug-sim-village');
+      if (simSel && !simSel.options.length) {
+        const villages = (appState.liveData && appState.liveData.villages) || [];
+        simSel.innerHTML = villages.length
+          ? villages.map(v => `<option value="${esc(v.name)}">${esc(v.name)}</option>`).join('')
+          : '<option value="">(auto: primo villaggio)</option>';
+      }
+    }
+
+    // =========================================================================
+    // DEBUG PIPELINE: Dry-Run "Simula Ciclo" + Decision Trace Log
+    // =========================================================================
+    async function simulateCycle() {
+      const sel = document.getElementById('debug-sim-village');
+      const village = sel ? sel.value : '';
+      const out = document.getElementById('debug-sim-result');
+      try {
+        const res = await fetch(`${window.TravianOpsAPI.baseUrl}/api/debug/simulate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            account_id: appState.activeAccount || '',
+            village: village || ''
+          })
+        });
+        const body = await res.json();
+        if (!res.ok || body.status !== 'ok') {
+          notify(`Simulazione rifiutata: ${body.reason || res.status}`, 'amber');
+          return;
+        }
+        if (out) out.classList.remove('hidden');
+        const actEl = document.getElementById('debug-sim-action');
+        const act = body.action || {};
+        if (actEl) {
+          const tone = act.type === 'wait' || act.type === 'noop'
+            ? 'text-slate-300'
+            : 'text-emerald-300';
+          actEl.innerHTML =
+            `<span class="${tone}">→ ${esc(act.type || '?')}</span>` +
+            `<span class="text-slate-400 font-normal"> — ${esc(act.reason || '')}</span>` +
+            `<span class="text-slate-500 font-normal"> (villaggio: ${esc(body.village || '')})</span>`;
+        }
+        const trace = body.trace || {};
+        const inpEl = document.getElementById('debug-sim-inputs');
+        if (inpEl) inpEl.textContent = JSON.stringify(trace.inputs_snapshot || {}, null, 2);
+        const rulesEl = document.getElementById('debug-sim-rules');
+        if (rulesEl) {
+          rulesEl.innerHTML = (trace.rules_evaluated || []).map(r => {
+            const hit = r.result === 'matched';
+            return `<div class="flex items-start gap-2 border-b border-slate-800/60 py-1">
+              <span class="w-2 h-2 mt-1 rounded-full shrink-0 ${hit ? 'bg-emerald-400' : 'bg-slate-600'}"></span>
+              <div class="min-w-0">
+                <div class="font-bold ${hit ? 'text-emerald-300' : 'text-slate-400'}">${esc(r.rule)}</div>
+                <div class="text-[10px] text-slate-500">${esc(r.reason || r.result)}</div>
+              </div>
+            </div>`;
+          }).join('') || '<div class="text-slate-500">nessuna regola</div>';
+        }
+        const poolEl = document.getElementById('debug-sim-pool');
+        if (poolEl) poolEl.textContent = JSON.stringify(trace.candidates_pool || {}, null, 2);
+        notify(`Simulazione completata: ${act.type || '?'}`, 'emerald');
+      } catch (_) {
+        notify('Server comandi offline (:8610) — simulazione impossibile', 'red');
+      }
+    }
+
+    async function loadDebugTrace() {
+      const list = document.getElementById('debug-trace-list');
+      if (!list) return;
+      try {
+        const res = await fetch(
+          `${window.TravianOpsAPI.baseUrl}/api/debug/trace?account=` +
+          encodeURIComponent(appState.activeAccount || '') + '&limit=40'
+        );
+        const body = await res.json();
+        const entries = (body.entries || []).slice().reverse();
+        if (!entries.length) {
+          list.innerHTML = '<div class="text-slate-500">Trace vuoto: nessun evento registrato ancora.</div>';
+          return;
+        }
+        const badge = {
+          decision: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40',
+          decision_simulated: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
+          config_patch: 'bg-amber-500/15 text-amber-300 border-amber-500/40',
+          sensor_anomaly: 'bg-red-500/15 text-red-300 border-red-500/40',
+        };
+        list.innerHTML = entries.map(e => {
+          const cls = badge[e.type] || 'bg-slate-700/40 text-slate-300 border-slate-600';
+          let summary = '';
+          if (e.type === 'decision' || e.type === 'decision_simulated') {
+            const fa = e.final_action || {};
+            summary = `${esc(e.village || '')} → ${esc(fa.type || '?')}: ${esc(fa.reason || '')}`;
+          } else if (e.type === 'config_patch') {
+            const keys = Object.keys(e.diff || {});
+            summary = `${esc(e.section || '')}${e.village ? ' / ' + esc(e.village) : ''}: ` +
+              (keys.length ? keys.map(k => `${esc(k)} ${JSON.stringify((e.diff||{})[k].old)}→${JSON.stringify((e.diff||{})[k].new)}`).join(', ') : 'nessun diff') +
+              ((e.warnings || []).length ? ` ⚠ ${e.warnings.length} warning` : '');
+          } else if (e.type === 'sensor_anomaly') {
+            summary = `${esc(e.village || '')}: ${(e.anomalies || []).map(esc).join('; ')}`;
+          } else {
+            summary = esc(JSON.stringify(e).slice(0, 160));
+          }
+          return `<div class="sub-card rounded-lg px-2.5 py-1.5 flex items-start gap-2">
+            <span class="px-1.5 py-0.5 rounded border text-[9px] font-bold shrink-0 ${cls}">${esc(e.type || '?')}</span>
+            <div class="min-w-0 flex-1">
+              <span class="text-slate-500 text-[10px]">${esc(e.iso || '')}</span>
+              <div class="text-slate-200 break-words">${summary}</div>
+            </div>
+          </div>`;
+        }).join('');
+      } catch (_) {
+        list.innerHTML = '<div class="text-red-400">Server comandi offline (:8610): trace non leggibile.</div>';
+      }
     }
 
     // =========================================================================
@@ -3036,7 +3257,12 @@
       const sel = document.getElementById('global-account-select');
       if (!sel) return;
       if (EMBEDDED_ACCOUNTS.length) {
-        const cur = appState.activeAccount;
+        // Priorita' all'ultimo account scelto (persistito): un reload
+        // dell'iframe non deve cambiare l'account in configurazione.
+        let saved = null;
+        try { saved = localStorage.getItem('t_ops.account'); } catch (_) {}
+        const cur = (saved && EMBEDDED_ACCOUNTS.some(a => a.id === saved))
+          ? saved : appState.activeAccount;
         sel.innerHTML = EMBEDDED_ACCOUNTS
           .map(a => `<option value="${esc(a.id)}">${esc(a.id)}</option>`)
           .join('');
@@ -3050,6 +3276,22 @@
 
     function changeActiveAccount(acc) {
       appState.activeAccount = acc;
+      try { localStorage.setItem('t_ops.account', acc); } catch (_) {}
+      // Azzera i dati dell'account precedente: finche' il refetch non
+      // completa, uno stato vuoto e' meglio che dati di un altro account.
+      appState.liveData = null;
+      appState.villages = [];
+      appState.activeVillage = '';
+      appState.config = null;
+      appState.dorf2Slots = [];
+      appState.dorf1Fields = [];
+      appState.priorityQueue = [];
+      appState.allowedTroops = [];
+      appState.manualFocus = { enabled: false, gid: 17, slot: 0 };
+      renderVillageTabs();
+      renderPriorityQueue();
+      renderBrainTroops();
+      renderDorf2Map();
       const urlEl = document.getElementById('global-account-url');
       if (urlEl) urlEl.textContent = accountUrlFor(acc);
       const cl = document.getElementById('controllo-account-label');
@@ -3139,7 +3381,9 @@
 
     async function toggleGlobalPause() {
       const action = appState.paused ? 'RESUME_ALL' : 'PAUSE_ALL';
-      await window.TravianOpsAPI.sendCommand(action);
+      // target 'all' esplicito: senza params il server userebbe
+      // account_id (attivo) pausando un solo worker.
+      await window.TravianOpsAPI.sendCommand(action, { params: { target: 'all' } });
       refreshWorkerPanel();
     }
 
@@ -3147,13 +3391,19 @@
       const res = await window.TravianOpsAPI.sendCommand(
         'STOP_PID', { params: { target } });
       if (res && res.status === 'queued') {
-        notify(`Stop richiesto: ${target}`, 'red');
+        const n = Array.isArray(res.targets) ? res.targets.length : 0;
+        if (n > 0) {
+          notify(`Stop richiesto: ${res.targets.join(', ')}`, 'red');
+        } else {
+          notify(`Stop: nessun agente da fermare (${target})`, 'amber');
+        }
       }
       setTimeout(refreshWorkerPanel, 800);
     }
 
     async function startWorkers() {
-      const res = await window.TravianOpsAPI.sendCommand('START_ALL');
+      const res = await window.TravianOpsAPI.sendCommand(
+        'START_ALL', { params: { target: 'all' } });
       if (res && res.status === 'queued') {
         notify(`Avvio worker: ${(res.targets || []).join(', ') || 'gia\' attivi'}`, 'emerald');
       }
@@ -3204,6 +3454,32 @@
     // =========================================================================
     function saveModuleToggle(section, field, value) {
       window.TravianOpsAPI.saveModuleConfig(section, { [field]: value });
+    }
+
+    // Matrice Moduli Automazione (vista Controllo): onchange dei toggle
+    // mx-*. Persiste su /api/config; se il backend rifiuta o e' offline
+    // il checkbox torna allo stato precedente (rollback).
+    function _matrixStatus(id, on, suffix = '') {
+      const st = document.getElementById(id + '-status');
+      if (!st) return;
+      st.textContent = (on ? 'ATTIVO' : 'DISATTIVO') + suffix;
+      st.className = 'text-[10px] ' + (on ? 'text-emerald-400' : 'text-slate-500');
+    }
+
+    async function matrixToggle(el, section, field) {
+      const res = await window.TravianOpsAPI.saveModuleConfig(
+        section, { [field]: el.checked });
+      if (res && res.status === 'saved') {
+        // Tieni il modello allineato (evita hydration stantia).
+        if (section === 'account') {
+          if (appState.config) appState.config[field] = el.checked;
+        } else if (appState.config && appState.config[section]) {
+          appState.config[section][field] = el.checked;
+        }
+        _matrixStatus(el.id, el.checked);
+      } else {
+        el.checked = !el.checked; // rollback: backend non ha persistito
+      }
     }
 
     function saveFarmingConfig() {
@@ -3642,6 +3918,10 @@
     // =========================================================================
     function applyLiveData(data) {
       if (!data || typeof data !== 'object') return;
+      // Guard anti-leak: scarta snapshot di un account diverso da quello
+      // selezionato (es. fetchState caduto su un fallback sbagliato).
+      if (data.account_id && appState.activeAccount
+        && data.account_id !== appState.activeAccount) return;
       appState.liveData = data;
       if (data.account_id && !appState.activeAccount) appState.activeAccount = data.account_id;
       if (Array.isArray(data.villages) && data.villages.length) {
@@ -3959,10 +4239,23 @@
       setTimeout(renderCommandCenterOps, 1500);
     }
 
+    // Snapshot iniettati gia' applicati: l'API non risponde e i dati
+    // embedded sono statici — riapplicarli a ogni poll ri-renderizzerebbe
+    // la UI senza portare dati nuovi (e disturberebbe i form aperti).
+    let _appliedInjectedSnap = null;
+
     async function syncLiveTelemetry() {
       const data = await window.TravianOpsAPI.fetchState(appState.activeAccount);
-      if (data) applyLiveData(data);
-      else if (!EMBEDDED) setConnBadge('off');
+      if (data && data !== _appliedInjectedSnap) {
+        applyLiveData(data);
+        // Dati live = JSON fresco a ogni fetch; gli snapshot iniettati
+        // mantengono lo stesso riferimento -> dedup solo per loro.
+        _appliedInjectedSnap = (EMBEDDED
+          && (data === EMBEDDED_STATE
+            || Object.values(EMBEDDED_ALL_STATES).includes(data)))
+          ? data : _appliedInjectedSnap;
+      }
+      else if (!EMBEDDED && !data) setConnBadge('off');
       refreshWorkerPanel();
       renderCommandCenterOps();
     }
@@ -4030,7 +4323,15 @@
       refreshWorkerPanel();
       loadConfig();
       renderAccountTable();
-      if (!EMBEDDED) setInterval(syncLiveTelemetry, POLL_MS);
+      // Ripristina la vista aperta prima di un eventuale reload dell'iframe.
+      let savedView = null;
+      try { savedView = localStorage.getItem('t_ops.view'); } catch (_) {}
+      if (savedView && document.getElementById(`view-${savedView}`)) {
+        switchView(savedView);
+      }
+      // Polling telemetria: in embedded fetchState prova l'API live e
+      // ricade sugli snapshot iniettati se offline — nessun reload pagina.
+      setInterval(syncLiveTelemetry, POLL_MS);
       syncLiveTelemetry();
     });
   </script>

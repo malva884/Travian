@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from . import selectors
-from .browser import TravianBrowser, sleep_human
+from .browser import TravianBrowser, human_click, sleep_human
 from .config import Settings
 from .models import (
     Action,
@@ -17,6 +17,7 @@ from .models import (
     ActionType,
     STATIC_TROOP_LABELS,
 )
+from .stealth import resource_eta_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +362,35 @@ class ActionExecutor:
                 f"(server ha risposto con newdid={after.group(1)})"
             )
 
+    async def _read_contract_cost(self, page) -> dict:
+        """Costo {wood,clay,iron,crop} del contratto mostrato ({} = non letto)."""
+        try:
+            cost = await page.evaluate(
+                """
+                () => {
+                    const out = {};
+                    for (const el of document.querySelectorAll(
+                        '#contract .resource, #build .resource, ' +
+                        '.contract .resource, .showCosts .resource, ' +
+                        '#contract [class*="resource"]'
+                    )) {
+                        const cls = el.className || '';
+                        const t = (el.innerText || el.textContent || '')
+                            .replace(/[^0-9]/g, '');
+                        const n = parseInt(t || '0', 10) || 0;
+                        if (/r1|wood|lumber|legno/i.test(cls)) out.wood = n;
+                        else if (/r2|clay|argilla/i.test(cls)) out.clay = n;
+                        else if (/r3|iron|ferro/i.test(cls)) out.iron = n;
+                        else if (/r4|crop|grano|wheat/i.test(cls)) out.crop = n;
+                    }
+                    return out;
+                }
+                """
+            )
+            return cost if isinstance(cost, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     async def _upgrade_field(self, action: Action, village_id: int = 0) -> ActionResult:
         """Apre build.php?id=<slot> e clicca 'migliora' mantenendo il newdid esplicito.
 
@@ -388,6 +418,20 @@ class ActionExecutor:
 
         page = self.browser.page
         assert page is not None
+
+        # Opportunistic Fallback (spec 2): stock/produzione per la
+        # valutazione pagabilita' dei candidati; il primo NON pagabile
+        # (C1) non congela la coda — se il suo ETA supera 15 min si cerca
+        # un candidato successivo pagabile che non lo ritardi oltre 30 min.
+        _res_keys = ("wood", "clay", "iron", "crop")
+        stock = {
+            k: int((action.params.get("stock") or {}).get(k) or 0)
+            for k in _res_keys
+        }
+        prod_h = dict(action.params.get("prod_h") or {})
+        blocker_cost: dict | None = None
+        blocker_eta: float | None = None
+        last_cost: dict = {}
 
         for slot_id in candidates:
             # Costruisce l'URL di build includendo il newdid per garantire l'isolamento del villaggio
@@ -467,6 +511,12 @@ class ActionExecutor:
                 )
                 continue
 
+            # Costo del contratto: serve sia per l'ETA di C1 sia per la
+            # verifica di non-interferenza dei fallback.
+            cost = await self._read_contract_cost(page)
+            if cost:
+                last_cost = cost
+
             button = None
             for sel in selectors.UPGRADE_BUTTON:
                 locator = page.locator(sel).first
@@ -483,19 +533,69 @@ class ActionExecutor:
 
             if button is None:
                 logger.debug("Slot %s non migliorabile nel villaggio %s, provo il prossimo", slot_id, village_id)
+                # Caso B spec: primo candidato non pagabile = bloccante C1.
+                if blocker_cost is None and cost:
+                    _def = {
+                        k: max(0, int(cost.get(k) or 0) - stock.get(k, 0))
+                        for k in _res_keys
+                    }
+                    if any(v > 0 for v in _def.values()):
+                        _eta = resource_eta_seconds(_def, prod_h)
+                        if _eta is not None and _eta <= 900.0:
+                            # ETA(C1) <= 15 min: attendi C1, niente fallback.
+                            return ActionResult(
+                                False,
+                                f"candidato prioritario pagabile tra "
+                                f"~{int(_eta)}s: attendo C1",
+                                data={"cost": cost},
+                            )
+                        blocker_cost, blocker_eta = cost, _eta
                 continue
+
+            # Candidato avviabile: se un bloccante C1 esiste, il fallback
+            # e' lecito solo se pagare Ck non ritarda C1 oltre 30 min.
+            if blocker_cost is not None:
+                if blocker_eta is None:
+                    continue  # ETA C1 non stimabile: niente spesa a vuoto
+                _res = {
+                    k: max(0, stock.get(k, 0) - int(cost.get(k) or 0))
+                    for k in _res_keys
+                }
+                _def1 = {
+                    k: max(0, int(blocker_cost.get(k) or 0) - _res.get(k, 0))
+                    for k in _res_keys
+                }
+                _eta_after = resource_eta_seconds(_def1, prod_h)
+                if _eta_after is None or _eta_after - blocker_eta > 1800.0:
+                    continue  # Ck ritarderebbe C1 oltre 30 minuti
+                logger.info(
+                    "Fallback opportunistico: C1 non pagabile "
+                    "(ETA %.0fmin) -> avvio slot %s "
+                    "(ETA C1 residuo %.0fmin)",
+                    blocker_eta / 60.0, slot_id, _eta_after / 60.0,
+                )
 
             await sleep_human(
                 self.settings.action_delay_min, self.settings.action_delay_max
             )
-            await button.click()
+            # Click 'umano' sul pulsante di conferma (cursore + punto
+            # casuale interno) invece del click DOM diretto.
+            await human_click(page, button)
             await sleep_human(1.0, 2.0)
             logger.info("Upgrade avviato sullo slot %s (Villaggio %s)", slot_id, village_id)
-            return ActionResult(True, f"upgrade avviato sullo slot {slot_id}")
+            return ActionResult(
+                True,
+                f"upgrade avviato sullo slot {slot_id}",
+                data={"slot_id": int(slot_id)},
+            )
 
+        # Resource-ETA Sleep: riporta il costo del BLOCCANTE (C1) per
+        # l'ETA corretta; se nessun bloccante, l'ultimo contratto letto.
+        final_cost = blocker_cost or last_cost
         return ActionResult(
             False,
             "nessun candidato migliorabile (risorse insufficienti o livello max)",
+            data={"cost": final_cost} if final_cost else {},
         )
 
     async def _claim_video_bonus(self, action: Action) -> ActionResult:
@@ -3153,7 +3253,10 @@ class ActionExecutor:
     # Task giornaliere / questmaster: riscossione premi per villaggio
     # ------------------------------------------------------------------
     async def claim_village_tasks(
-        self, village_id: int = 0, village_name: str = ""
+        self,
+        village_id: int = 0,
+        village_name: str = "",
+        claim_ctx: dict | None = None,
     ) -> int:
         """Apre il pannello task del villaggio attivo e riscuote i premi.
 
@@ -3162,11 +3265,18 @@ class ActionExecutor:
            e riscossione premi nel dialog;
         2. pagine dedicate UI moderna `/tasks?t=village` e
            `/tasks?t=general`, poi legacy `questmaster.php`: in ognuna si
-           cliccano i pulsanti verdi 'Raccogli'/'Collect'/'Claim' finche'
-           non ne restano;
+           scansionano i premi (contenuto [L,A,F,G] + XP/PC/truppe) e si
+           clicca 'Raccogli'/'Collect'/'Claim' solo su quelli che
+           passano la policy;
         3. bottoni disabilitati (magazzino pieno) vengono saltati senza
            errore: si riprova al ciclo successivo;
         4. chiusura del dialog.
+
+        ``claim_ctx`` attiva il riscatto ON-DEMAND (spec 4): i premi sono
+        una riserva non depredabile — ``task_reward_claimable`` li
+        incassa solo se sbloccano un obiettivo pendente senza overflow e
+        senza attacchi in arrivo. ``None`` = modalita' legacy (riscuote
+        tutto, per chiamanti storici).
 
         Ritorna il numero di premi effettivamente riscossi.
         """
@@ -3178,6 +3288,7 @@ class ActionExecutor:
 
         claimed = 0
         skipped = 0
+        held = 0
 
         # 0. Gate sul badge di notifica: se l'avatar del Questmaster non
         # segnala task completate (indicatore assente o azzerato) si evita
@@ -3206,13 +3317,10 @@ class ActionExecutor:
         )
         if opened:
             await sleep_human(1.0, 1.8)
-            for _ in range(8):
-                n, s = await self._claim_task_buttons(page)
-                claimed += n
-                skipped = max(skipped, s)
-                if n == 0:
-                    break
-                await sleep_human(0.5, 0.9)
+            n, h, s = await self._claim_task_rewards_on_page(page, claim_ctx)
+            claimed += n
+            held = max(held, h)
+            skipped = max(skipped, s)
 
         # 2. Pagine task dedicate (UI moderna) + legacy questmaster.php
         for path in (
@@ -3239,13 +3347,10 @@ class ActionExecutor:
                 await sleep_human(0.8, 1.2)
             except Exception:  # noqa: BLE001 — pagina assente su questo server
                 continue
-            for _ in range(8):
-                n, s = await self._claim_task_buttons(page)
-                claimed += n
-                skipped = max(skipped, s)
-                if n == 0:
-                    break
-                await sleep_human(0.5, 0.9)
+            n, h, s = await self._claim_task_rewards_on_page(page, claim_ctx)
+            claimed += n
+            held = max(held, h)
+            skipped = max(skipped, s)
 
         # 3. Chiudi l'eventuale dialog rimasto aperto
         if opened:
@@ -3272,58 +3377,267 @@ class ActionExecutor:
                 village_name or village_id or "attivo",
                 skipped,
             )
+        if held:
+            logger.info(
+                "Task villaggio '%s': %d premi trattenuti come riserva "
+                "protetta (on-demand: nessun obiettivo sbloccabile)",
+                village_name or village_id or "attivo",
+                held,
+            )
         return claimed
 
-    async def _claim_task_buttons(self, page) -> tuple[int, int]:
-        """Clicca un pulsante premio verde cliccabile nella finestra task.
+    async def _scan_task_rewards(self, page) -> dict:
+        """Inventario dei premi cliccabili nella vista task corrente.
 
-        Cerca in #tasks/.tasks (UI moderna) e nei contenitori legacy i
-        bottoni con testo 'Raccogli'/'Collect'/'Claim' (case-insensitive)
-        e ne clicca il primo abilitato; i premi possono sbloccare task a
-        catena, quindi va richiamato in loop finche' non ne restano.
-
-        Ritorna (clicked, skipped): clicked = 1 se un pulsante e' stato
-        cliccato; skipped = n. di pulsanti premio trovati ma disabilitati
-        (tooltip magazzino pieno) — da saltare senza errore.
+        Per ogni pulsante 'Raccogli'/'Collect'/'Claim' legge il contenuto
+        del premio SENZA cliccarlo: quantita' per risorsa, flag
+        non-risorsa (XP eroe, Punti Cultura, truppe) e stato
+        enabled/disabled. Legge anche stock e capienze dalla stock bar
+        globale, usate dai check di overflow della policy on-demand.
+        Ogni pulsante viene taggato con ``data-tk-reward`` per il click
+        selettivo di ``_click_task_reward``.
         """
         res = await page.evaluate(
             """
             () => {
-                const claimRx = /(raccogl|riscuot|collect|claim|récupér|belohnung)/i;
+                const toInt = (s) => {
+                    const m = String(s || '')
+                        .replace(/[\\u2212\\u2010-\\u2015]/g, '-')
+                        .match(/-?[\\d.\\s']+/);
+                    if (!m) return 0;
+                    return parseInt(m[0].replace(/[^0-9-]/g, ''), 10) || 0;
+                };
+                const capOf = (sels) => {
+                    for (const s of sels) {
+                        const el = document.querySelector(s);
+                        if (!el) continue;
+                        const blob = [
+                            el.getAttribute('title') || '',
+                            el.innerText || '',
+                        ].join(' ');
+                        const m = blob.match(
+                            /(\\d[\\d.\\s]*)[|/]{1,2}\\s*(\\d[\\d.\\s]*)/
+                        );
+                        if (m) return toInt(m[2]);
+                    }
+                    return 0;
+                };
+                const stock = {
+                    wood: toInt((document.querySelector('#l1 .value, #l1') || {}).innerText),
+                    clay: toInt((document.querySelector('#l2 .value, #l2') || {}).innerText),
+                    iron: toInt((document.querySelector('#l3 .value, #l3') || {}).innerText),
+                    crop: toInt((document.querySelector('#l4 .value, #l4') || {}).innerText),
+                };
+                const claimRx =
+                    /(raccogl|riscuot|collect|claim|récupér|belohnung)/i;
                 const skipRx = /(chiudi|close|cancel|annulla|abbrechen)/i;
+                const rowRx =
+                    /task|quest|reward|mission|achievement|objective/i;
+                const resCls = {
+                    wood: /\\br1\\b|wood|lumber|legno|holz|bois|madera/i,
+                    clay: /\\br2\\b|clay|argilla|lehm|arcilla/i,
+                    iron: /\\br3\\b|iron|ferro|eisen|hierro/i,
+                    crop: /\\br4\\b|crop|grain|grano|wheat|getreide|bl[eé]|trigo|cereal/i,
+                };
                 const scopes = ['#tasks', '.tasks', '#dialogContent',
                                 '.quest', '.task', '#content', 'body'];
-                let els = [];
+                document.querySelectorAll('[data-tk-reward]').forEach(
+                    (e) => e.removeAttribute('data-tk-reward')
+                );
+                const seen = new Set();
+                const buttons = [];
                 for (const scope of scopes) {
                     for (const root of document.querySelectorAll(scope)) {
-                        els.push(...root.querySelectorAll(
+                        root.querySelectorAll(
                             'button, a, input[type="submit"], input[type="button"]'
-                        ));
+                        ).forEach((el) => {
+                            if (seen.has(el)) return;
+                            const text = (el.innerText || el.value ||
+                                          el.textContent || '').trim();
+                            if (!text || !claimRx.test(text) ||
+                                skipRx.test(text)) return;
+                            seen.add(el);
+                            buttons.push(el);
+                        });
                     }
                 }
-                let disabledFound = 0;
-                for (const el of els) {
-                    const text = (el.innerText || el.value || el.textContent || '').trim();
-                    if (!text || !claimRx.test(text) || skipRx.test(text)) continue;
+                const rewards = [];
+                buttons.forEach((el, i) => {
+                    el.setAttribute('data-tk-reward', String(i));
                     const cls = (el.className || '').toLowerCase();
-                    const disabled = el.disabled ||
+                    const disabled = !!(
+                        el.disabled ||
                         el.getAttribute('aria-disabled') === 'true' ||
-                        cls.includes('disabled') || cls.includes('inactive') ||
-                        cls.includes('grey') || cls.includes('gray');
-                    if (disabled) { disabledFound++; continue; }
-                    if (el.offsetParent === null && el.offsetWidth === 0) continue;
-                    el.click();
-                    return { clicked: true, disabled: disabledFound };
-                }
-                return { clicked: false, disabled: disabledFound };
+                        cls.includes('disabled') ||
+                        cls.includes('inactive') ||
+                        cls.includes('grey') || cls.includes('gray')
+                    );
+                    // Riga premio: primo antenato con classe task/quest;
+                    // fallback sul genitore diretto del pulsante.
+                    let row = el.parentElement;
+                    let depth = 0;
+                    while (row && row !== document.body && depth < 7) {
+                        const rc = row.className;
+                        if (typeof rc === 'string' && rowRx.test(rc)) break;
+                        if (row.id === 'content') break;
+                        row = row.parentElement;
+                        depth++;
+                    }
+                    if (!row || row === document.body) row = el.parentElement;
+                    const rowText = (row && row.innerText) || '';
+                    const resources = {wood: 0, clay: 0, iron: 0, crop: 0};
+                    if (row && row.querySelectorAll) {
+                        for (const [res, rx] of Object.entries(resCls)) {
+                            for (const r of row.querySelectorAll(
+                                '[class], img[alt], [title]'
+                            )) {
+                                const marker = [
+                                    (typeof r.className === 'string'
+                                        ? r.className : ''),
+                                    r.getAttribute('alt') || '',
+                                    r.getAttribute('title') || '',
+                                ].join(' ');
+                                if (!rx.test(marker)) continue;
+                                const near = [
+                                    r.innerText || '',
+                                    (r.nextSibling &&
+                                        r.nextSibling.textContent) || '',
+                                    (r.parentElement &&
+                                        r.parentElement.innerText) || '',
+                                ];
+                                for (const t of near) {
+                                    if (t.length > 40) continue;
+                                    const n = toInt(t);
+                                    if (n > 0) {
+                                        resources[res] = Math.max(
+                                            resources[res], n
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Fallback testuale: '200 Legno' oppure 'Legno: 200'.
+                    const resTxt = {
+                        wood: /(legno|wood|lumber|holz|bois|madera)/i,
+                        clay: /(argilla|clay|lehm|arcilla)/i,
+                        iron: /(ferro|iron|eisen|hierro)/i,
+                        crop: /(grano|crop|grain|wheat|getreide|bl[eé]|trigo|cereal)/i,
+                    };
+                    for (const [res, rx] of Object.entries(resTxt)) {
+                        if (resources[res] > 0) continue;
+                        const m1 = rowText.match(new RegExp(
+                            "(\\d[\\d.\\s']*)\\s*" + rx.source));
+                        const m2 = rowText.match(new RegExp(
+                            rx.source + "[^0-9]{0,6}(\\d[\\d.\\s']*)"));
+                        const n = toInt(m1 && m1[1]) || toInt(m2 && m2[1]);
+                        if (n > 0) resources[res] = n;
+                    }
+                    const blob = rowText + ' ' + (
+                        (row && row.getAttribute &&
+                            row.getAttribute('title')) || '');
+                    rewards.push({
+                        idx: i,
+                        text: (el.innerText || el.value || '')
+                            .trim().slice(0, 40),
+                        disabled: disabled,
+                        resources: resources,
+                        xp: /xp|experien|esperienza|erfahrung|exp[ée]rience/i
+                            .test(blob),
+                        cp: /cultur|kultur/i.test(blob),
+                        troops: /truppe|troops|truppen|tropas|soldat/i
+                            .test(blob),
+                    });
+                });
+                return {
+                    rewards: rewards,
+                    stock: stock,
+                    wh_cap: capOf([
+                        '#stockBar .warehouse',
+                        '.stockBarButton.warehouse',
+                        'li.warehouse', '.warehouse']),
+                    gr_cap: capOf([
+                        '#stockBar .granary',
+                        '.stockBarButton.granary',
+                        'li.granary', '.granary']),
+                };
             }
             """
         )
-        clicked = 1 if isinstance(res, dict) and res.get("clicked") else 0
-        skipped = int(res.get("disabled", 0)) if isinstance(res, dict) else 0
-        if clicked:
+        return res if isinstance(res, dict) else {}
+
+    async def _click_task_reward(self, page, idx: int) -> bool:
+        """Clicca il pulsante premio taggato dall'ultima scansione."""
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    (i) => {
+                        const el = document.querySelector(
+                            '[data-tk-reward="' + i + '"]'
+                        );
+                        if (!el) return false;
+                        el.click();
+                        return true;
+                    }
+                    """,
+                    idx,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _claim_task_rewards_on_page(
+        self, page, claim_ctx: dict | None
+    ) -> tuple[int, int, int]:
+        """Riscuote i premi della vista corrente secondo la policy.
+
+        ``claim_ctx=None`` -> modalita' legacy: clicca ogni premio
+        abilitato (chiamanti storici). Con contesto il riscatto e'
+        on-demand: ``task_reward_claimable`` decide premio per premio e
+        dopo ogni riscatto la pagina viene ri-scansionata, perche' stock
+        e contenuti cambiano (catene di task incluse).
+
+        Ritorna (claimed, held, skipped): held = premi abilitati ma
+        trattenuti dalla policy, skipped = pulsanti disabilitati
+        (magazzino pieno).
+        """
+        claimed = 0
+        held = 0
+        skipped = 0
+        legacy = claim_ctx is None
+        for _ in range(8):
+            scan = await self._scan_task_rewards(page)
+            rewards = scan.get("rewards") or []
+            enabled = [r for r in rewards if not r.get("disabled")]
+            skipped = max(
+                skipped, sum(1 for r in rewards if r.get("disabled"))
+            )
+            if not enabled:
+                break
+            live_ctx = dict(claim_ctx or {})
+            live_ctx["stock"] = scan.get("stock") or {}
+            live_ctx["wh_cap"] = int(scan.get("wh_cap") or 0)
+            live_ctx["gr_cap"] = int(scan.get("gr_cap") or 0)
+            pick = next(
+                (
+                    r
+                    for r in enabled
+                    if legacy or task_reward_claimable(r, live_ctx)
+                ),
+                None,
+            )
+            if pick is None:
+                held = len(enabled)
+                break
+            if not await self._click_task_reward(
+                page, int(pick.get("idx") or 0)
+            ):
+                break
+            claimed += 1
             await sleep_human(0.5, 0.9)
-        return clicked, skipped
+        return claimed, held, skipped
 
     async def _tasks_pending_badge(self, page) -> bool | None:
         """Indicatore di task completate sull'avatar del Questmaster.
@@ -3429,3 +3743,77 @@ class ActionExecutor:
         free_wh = (wh_cap - used_wh) / wh_cap
         free_gr = (gr_cap - used_gr) / gr_cap
         return free_wh >= min_free_ratio and free_gr >= min_free_ratio
+
+
+# ---------------------------------------------------------------------------
+# Riscatto premi on-demand (spec 4): i premi task sono una riserva non
+# depredabile — si incassano solo quando sbloccano una spesa concreta.
+# ---------------------------------------------------------------------------
+
+# Margine anti-overflow: nessuna risorsa puo' superare il 92% della capienza.
+TASK_CLAIM_CAP_RATIO = 0.92
+
+_RES_KEYS = ("wood", "clay", "iron", "crop")
+
+
+def task_reward_claimable(reward: dict, ctx: dict) -> bool:
+    """True se il premio scansionato va riscosso ORA.
+
+    ``reward``: riga di ``_scan_task_rewards`` ({resources, xp, cp,
+    troops, disabled}). ``ctx``: contesto decisionale — ``stock``,
+    ``wh_cap`` e ``gr_cap`` (lettura live dalla pagina task),
+    ``target_costs`` (lista di costi {wood..crop} degli obiettivi
+    pendenti del villaggio), ``threat_incoming`` (attacco entro la
+    finestra anti-raid), ``crop_balance`` (bilancio grano netto,
+    None = non letto).
+
+    Regole:
+    1. Premi non-risorsa (XP, PC, oggetti): sempre liberi; premi-truppe
+       solo se il bilancio grano regge il nuovo upkeep;
+    2. Anti-raid: minaccia in arrivo -> i premi-risorse restano protetti
+       nell'interfaccia task fino a pericolo cessato;
+    3. Zero overflow: per ogni risorsa assegnata, stock+premio <= 92%
+       della capienza;
+    4. Trigger di utilita': un obiettivo NON pagabile con lo stock
+       diventa pagabile sommando il premio (spesa nello stesso ciclo,
+       subito dopo il riscatto).
+    """
+    res = reward.get("resources") or {}
+    res_total = sum(int(res.get(k) or 0) for k in _RES_KEYS)
+    if res_total <= 0:
+        if reward.get("troops"):
+            cb = ctx.get("crop_balance")
+            if cb is not None and int(cb) < 0:
+                return False
+        return True
+    if ctx.get("threat_incoming"):
+        return False
+    stock = ctx.get("stock") or {}
+    wh_cap = int(ctx.get("wh_cap") or 0)
+    gr_cap = int(ctx.get("gr_cap") or 0)
+    for r in _RES_KEYS:
+        add = int(res.get(r) or 0)
+        if add <= 0:
+            continue
+        cap = gr_cap if r == "crop" else wh_cap
+        # Capienza non verificabile su una risorsa che il premio
+        # assegna: fail-closed, non si rischia l'overflow della riserva.
+        if cap <= 0:
+            return False
+        if int(stock.get(r) or 0) + add > cap * TASK_CLAIM_CAP_RATIO:
+            return False
+    for cost in ctx.get("target_costs") or []:
+        if not cost:
+            continue
+        payable_now = all(
+            int(stock.get(r) or 0) >= int(cost.get(r) or 0)
+            for r in _RES_KEYS
+        )
+        payable_with = all(
+            int(stock.get(r) or 0) + int(res.get(r) or 0)
+            >= int(cost.get(r) or 0)
+            for r in _RES_KEYS
+        )
+        if not payable_now and payable_with:
+            return True
+    return False

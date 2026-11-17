@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 from playwright.async_api import Page
 
 from . import selectors
+from .building_prereqs import FIELD_GID_TYPES
 from .models import (
     BuildQueueItem,
     Field,
@@ -36,6 +37,10 @@ _TIMER = re.compile(r"(?:(\d+)\s*[-+]\s*)?(?:(\d+):)?(\d+):(\d{2})")
 _SLOT_ID = re.compile(r"build\.php\?[^#\s]*?\bid=(\d+)")
 _SLOT_CLASS = re.compile(r"\ba(\d+)\b")
 _NEWDID = re.compile(r"newdid=(\d+)")
+# Tooltip del tasto di annullamento lavori — non e' il nome edificio.
+_CANCEL_WORD = re.compile(
+    r"^(annulla|cancel|abbrechen|annuler|iptal|avbryt)\b", re.IGNORECASE
+)
 
 # parole chiave (multi-lingua) per mappare un campo al suo tipo di risorsa
 _RESOURCE_KEYWORDS: dict[ResourceType, tuple[str, ...]] = {
@@ -386,8 +391,26 @@ class TravianParser:
                     const queueElements = document.querySelectorAll('.buildingList li, #buildingContract .buildingRow, .buildingsOverview .buildingRow, table#building_contract tr');
 
                     queueElements.forEach(el => {
-                        const nameEl = el.querySelector('.name, .building, img[alt]');
-                        let name = nameEl?.innerText?.trim() || nameEl?.getAttribute('alt')?.trim() || '';
+                        // Nome dal div .name/.building: l'alt dell'icona
+                        // 'annulla' (tasto cancel) NON e' il nome edificio.
+                        const nameEl = el.querySelector('.name') || el.querySelector('.building');
+                        let name = nameEl?.innerText?.trim() || '';
+                        if (!name) {
+                            // Fallback img[alt] escludendo le icone di annullamento.
+                            const img = el.querySelector(
+                                'img[alt]:not(.del):not([class*="cancel"]):not([onclick*="cancel"])'
+                            );
+                            name = img?.getAttribute('alt')?.trim() || '';
+                        }
+                        // Scarta i tooltip di annullamento letti per errore.
+                        if (/^(annulla|cancel|abbrechen|annuler|iptal|avbryt)\b/i.test(name)) name = '';
+                        // Livello reale da .lvl/.level (fallback: nel nome).
+                        const lvlEl = el.querySelector('.lvl, .level');
+                        let level = null;
+                        if (lvlEl) {
+                            const lm = (lvlEl.innerText || '').match(/(\\d+)/);
+                            if (lm) level = parseInt(lm[1], 10);
+                        }
                         const durationEl = el.querySelector('.buildDuration, .timer, .dur, .clocks');
                         let duration = durationEl?.innerText?.trim() || '';
                         // Slot di origine dal link build.php?id=N (se la riga lo contiene)
@@ -398,7 +421,7 @@ class TravianParser:
                             if (m) slotId = parseInt(m[1], 10);
                         }
                         if (name) {
-                            items.push({ building: name, time_left: duration, slot_id: slotId });
+                            items.push({ building: name, level: level, time_left: duration, slot_id: slotId });
                         }
                     });
                     return items;
@@ -426,13 +449,26 @@ class TravianParser:
             for i in range(count):
                 try:
                     row = rows.nth(i)
-                    name_el = row.locator(".name, .building, img[alt]").first
+                    # Nome dal div .name/.building: l'alt dell'icona
+                    # 'annulla' (tasto cancel) NON e' il nome edificio.
                     name = ""
+                    name_el = row.locator(".name, .building").first
                     if await name_el.count() > 0:
-                        name = (
-                            (await name_el.inner_text()).strip()
-                            or (await name_el.get_attribute("alt") or "").strip()
-                        )
+                        name = (await name_el.inner_text()).strip()
+                    if not name:
+                        img_el = row.locator(
+                            "img[alt]:not(.del):not([class*='cancel'])"
+                        ).first
+                        if await img_el.count() > 0:
+                            name = (
+                                (await img_el.get_attribute("alt")) or ""
+                            ).strip()
+                    if _CANCEL_WORD.match(name or ""):
+                        name = ""
+                    level = 0
+                    lvl_el = row.locator(".lvl, .level").first
+                    if await lvl_el.count() > 0:
+                        level = parse_int((await lvl_el.inner_text()).strip())
                     dur_el = row.locator(".buildDuration, .timer, .dur, .clocks").first
                     duration = ""
                     if await dur_el.count() > 0:
@@ -445,7 +481,12 @@ class TravianParser:
                             slot_id = int(m.group(1))
                     if name:
                         items.append(
-                            {"building": name, "time_left": duration, "slot_id": slot_id}
+                            {
+                                "building": name,
+                                "level": level or None,
+                                "time_left": duration,
+                                "slot_id": slot_id,
+                            }
                         )
                 except Exception:
                     continue
@@ -761,7 +802,7 @@ class TravianParser:
         try:
             raw_fields: list = await self.page.evaluate("""
                 () => {
-                    const list = [];
+                    const seen = {};
                     const slots = document.querySelectorAll(
                         '#resourceFieldContainer .buildingSlot, #village_map .buildingSlot, #villageMap .buildingSlot, .buildingSlot, a[href*="build.php?id="], area'
                     );
@@ -776,27 +817,67 @@ class TravianParser:
                             const matchCls = cls.match(/\\ba(\\d+)\\b/);
                             if (matchCls) slotId = parseInt(matchCls[1], 10);
                         }
-                        const title = slot.getAttribute('title') || slot.getAttribute('alt') || slot.innerText || '';
-                        if (slotId !== null) {
-                            list.push({ slot_id: slotId, title: title.trim() });
+                        // Solo i 18 campi risorsa del dorf1: link build.php
+                        // verso slot dorf2 (19-40) non devono inquinare la
+                        // lista dei campi.
+                        if (slotId === null || slotId < 1 || slotId > 18) return;
+
+                        // gid risorsa dalla classe Travian (gid1..gid4 o gN):
+                        // legno=1, argilla=2, ferro=3, grano=4.
+                        let gid = -1;
+                        const gidMatch = cls.match(/\\bg(?:id)?(\\d+)\\b/);
+                        if (gidMatch) gid = parseInt(gidMatch[1], 10);
+
+                        const title = (slot.getAttribute('title') || slot.getAttribute('alt') || slot.innerText || '').trim();
+
+                        // Livello dal badge numerico dello slot quando il
+                        // title e' assente (es. <div class="level">3</div>).
+                        let level = -1;
+                        const lvlEl = slot.querySelector('.level, .lvl, .buildingLevel, [class*="level"]');
+                        const lvlSrc = lvlEl ? lvlEl.innerText : '';
+                        const lvlMatch = (lvlSrc || '').match(/\\d+/);
+                        if (lvlMatch) level = parseInt(lvlMatch[0], 10);
+
+                        // Dedup per slot: tieni la versione piu' ricca.
+                        const prev = seen[slotId];
+                        if (!prev || (prev.gid < 0 && gid >= 0) || (!prev.title && title) || (prev.level < 0 && level >= 0)) {
+                            seen[slotId] = {
+                                slot_id: slotId,
+                                gid: gid >= 0 ? gid : (prev ? prev.gid : -1),
+                                title: title || (prev ? prev.title : ''),
+                                level: level >= 0 ? level : (prev ? prev.level : -1),
+                            };
                         }
                     });
-                    return list;
+                    return Object.values(seen);
                 }
             """)
             if raw_fields and isinstance(raw_fields, list):
                 for item in raw_fields:
                     s_id = item.get("slot_id")
                     title = item.get("title", "")
-                    if s_id is not None:
-                        fields.append(
-                            Field(
-                                slot_id=s_id,
-                                name=title,
-                                level=parse_int(title),
-                                resource_type=guess_resource_type(title),
-                            )
+                    gid = safe_int(item.get("gid"), -1)
+                    if s_id is None or not (1 <= int(s_id) <= 18):
+                        continue
+                    # Livello: title localizzato prima (es. "Bosco livello 3"),
+                    # fallback sul badge numerico letto dal DOM.
+                    lvl = parse_int(title)
+                    if lvl <= 0:
+                        lvl = max(0, safe_int(item.get("level"), 0))
+                    fields.append(
+                        Field(
+                            slot_id=int(s_id),
+                            name=title,
+                            level=lvl,
+                            # Il gid del DOM e' piu' affidabile del titolo
+                            # localizzato; il guess resta come fallback.
+                            resource_type=(
+                                FIELD_GID_TYPES.get(gid)
+                                or guess_resource_type(title)
+                            ),
+                            gid=gid,
                         )
+                    )
                 if fields:
                     logger.debug("Campi letti tramite JS Injection: %d", len(fields))
                     return fields
@@ -1136,20 +1217,43 @@ class TravianParser:
         """Restituisce gli elementi in coda con timer in secondi."""
         items: list[BuildQueueItem] = []
         raw_queue = await self.extract_building_queue()
+        # Dedup: la stessa costruzione puo' essere renderizzata da due
+        # contenitori diversi (box coda + overview sidebar). Contarla due
+        # volte saturerebbe fintamente max_build_queue e bloccherebbe la
+        # coda parallela romana (dorf1+dorf2).
+        seen: set = set()
         for q in raw_queue:
-            name = q.get("building", "")
+            name = str(q.get("building", "") or "").strip()
+            # Rete di sicurezza: il tooltip del tasto annulla non e' un
+            # edificio (il fix dei selettori lo esclude gia' a monte).
+            if _CANCEL_WORD.match(name):
+                continue
             duration_str = q.get("time_left", "")
             slot_id = q.get("slot_id")
+            if isinstance(slot_id, int) and slot_id > 0:
+                key = ("slot", slot_id)
+            else:
+                key = ("name", name.lower())
+            if key in seen:
+                continue
+            seen.add(key)
             if isinstance(slot_id, int):
                 # classificazione affidabile via build.php?id=N
                 is_res = 1 <= slot_id <= 18
             else:
                 # fallback: deduzione dal nome (multi-lingua)
                 is_res = guess_resource_type(name) is not None
+            # Livello esplicito da .lvl/.level; fallback sul testo nome.
+            q_level = q.get("level")
+            level = (
+                int(q_level)
+                if isinstance(q_level, int) and q_level > 0
+                else parse_int(name)
+            )
             items.append(
                 BuildQueueItem(
                     name=name,
-                    level=parse_int(name),
+                    level=level,
                     remaining_seconds=parse_timer(duration_str),
                     is_resource_field=is_res,
                     slot_id=slot_id if isinstance(slot_id, int) else 0,
@@ -2275,3 +2379,92 @@ class TravianParser:
 
 # Alias per retrocompatibilità e interoperabilità
 GameObserver = TravianParser
+
+
+# ---------------------------------------------------------------------------
+# DOM & Sensor Health Check (spec debug pipeline)
+# ---------------------------------------------------------------------------
+# Dedup: stessa combinazione di anomalie -> un solo alert per ciclo
+# (altrimenti il JSONL si riempirebbe a ogni tick).
+_last_health_signature: dict[tuple[str, str], tuple[str, ...]] = {}
+
+
+def check_state_health(state: GameState, account_id: str = "") -> list[str]:
+    """Rileva letture incoerenti del GameState -> alert SENSOR_ANOMALY.
+
+    Chiamata dall'orchestrator dopo l'assemblaggio dello stato. Copre i
+    casi tipici di regressione dei selettori/layout Travian:
+
+    - 0 campi dorf1 o 0 edifici dorf2 rilevati;
+    - ``gid == -1`` su slot dorf2 occupati (edificio esiste ma il gid
+      non e' stato letto dal DOM);
+    - risorse tutte a 0 e capacita' magazzini a 0 (stockbar non parsata);
+    - coda costruzioni con item senza nome (parser coda degradato).
+
+    Ritorna la lista delle anomalie correnti. L'alert (logger WARNING +
+    evento trace JSONL) viene emesso solo quando la firma cambia, per
+    non spammare a ogni ciclo.
+    """
+    anomalies: list[str] = []
+    try:
+        res_fields = state.resource_fields()
+        interiors = state.interior_fields()
+        if not res_fields:
+            anomalies.append("dorf1: 0 campi risorsa rilevati")
+        if not interiors:
+            anomalies.append("dorf2: 0 edifici interni rilevati")
+        unread = [
+            f.slot_id
+            for f in interiors
+            if f.gid is not None and int(f.gid) < 0
+            and (f.level or 0) > 0
+        ]
+        if unread:
+            anomalies.append(
+                f"dorf2: gid non letto su slot occupati {sorted(unread)}"
+            )
+        res = state.resources
+        if (
+            not any([res.wood, res.clay, res.iron, res.crop])
+            and not res.warehouse_capacity
+            and not res.granary_capacity
+        ):
+            anomalies.append("stockbar: risorse e capacita' tutte a 0")
+        unnamed = sum(
+            1 for q in state.build_queue if not (q.name or "").strip()
+        )
+        if unnamed:
+            anomalies.append(
+                f"coda costruzioni: {unnamed} item senza nome"
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("check_state_health fallito", exc_info=True)
+        return []
+
+    key = (str(account_id or ""), str(state.village_name or ""))
+    signature = tuple(sorted(anomalies))
+    if _last_health_signature.get(key) != signature:
+        prev = _last_health_signature.get(key)
+        _last_health_signature[key] = signature
+        if anomalies:
+            try:
+                from . import debug_trace
+
+                debug_trace.sensor_anomaly(
+                    account_id,
+                    state.village_name,
+                    anomalies,
+                    context={
+                        "fields": len(state.fields),
+                        "queue": len(state.build_queue),
+                        "prev_signature": list(prev or ()),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "SENSOR_ANOMALY [%s][%s] %s",
+                    account_id or "?",
+                    state.village_name or "?",
+                    "; ".join(anomalies),
+                )
+    return anomalies

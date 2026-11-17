@@ -466,8 +466,15 @@ class HeroManager:
                 "updated_at": now,
             }
 
-            # 2. Auto-cura con unguenti se HP sotto soglia (eroe fermo)
-            if state["health"] < cfg.heal_threshold and state["status"] in (
+            # 2. Auto-cura con unguenti se HP sotto soglia (eroe fermo).
+            # Jitter anti-detection: soglia campionata per ciclo
+            # (uniform 45-62%) anziche' la percentuale fissa configurata.
+            _jit = getattr(settings, "cycle_jitter", None) or {}
+            _heal_pct = int(
+                float(_jit.get("hero_heal", cfg.heal_threshold / 100.0))
+                * 100
+            )
+            if state["health"] < _heal_pct and state["status"] in (
                 "home", "away", "dead",
             ):
                 healed = await self._apply_healing(browser, prefix)

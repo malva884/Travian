@@ -65,6 +65,37 @@ _RE_NEWDID = re.compile(r"newdid=(\d+)")
 _RE_BUILD_ID = re.compile(r"build\.php\?[^#\s]*?\bid=(\d+)")
 
 
+async def human_click(page: Page, locator, timeout: float = 5000) -> bool:
+    """Click 'umano' su un locator.
+
+    Il cursore parte da un offset laterale casuale, si muove con una
+    traiettoria spezzata in piu' step verso un punto casuale INTERNO
+    all'elemento (mai il centro esatto) e clicca li'. In assenza di
+    bounding box ricade sul click diretto: la resilienza prima del
+    realismo.
+    """
+    try:
+        box = await locator.bounding_box(timeout=timeout)
+    except Exception:
+        box = None
+    if not box:
+        await locator.click(timeout=timeout)
+        return True
+    tx = box["x"] + box["width"] * random.uniform(0.2, 0.8)
+    ty = box["y"] + box["height"] * random.uniform(0.25, 0.75)
+    sx = tx + random.uniform(-160, 160)
+    sy = ty + random.uniform(-90, 90)
+    try:
+        await page.mouse.move(sx, sy)
+        await page.mouse.move(tx, ty, steps=random.randint(6, 18))
+        await asyncio.sleep(random.uniform(0.05, 0.22))
+        await page.mouse.click(tx, ty)
+        return True
+    except Exception:
+        await locator.click(timeout=timeout)
+        return True
+
+
 async def _click_first(page: Page, selectors_list: list[str]) -> bool:
     """Click sul primo elemento visibile fra le alternative di selettore."""
     for sel in selectors_list:
@@ -72,7 +103,7 @@ async def _click_first(page: Page, selectors_list: list[str]) -> bool:
         try:
             if await locator.count() == 0 or not await locator.is_visible():
                 continue
-            await locator.click(timeout=5000)
+            await human_click(page, locator)
             await page.wait_for_load_state("domcontentloaded", timeout=15000)
             return True
         except Exception:
@@ -117,7 +148,8 @@ async def navigate_via_dom(page: Page, path: str) -> bool:
                 ],
             ):
                 return False
-            await sleep_human(0.4, 1.0)
+            # Ritardo di 'lettura' dopo il cambio villaggio (spec anti-bot).
+            await sleep_human(1.4, 3.8)
         base = path.split("?", 1)[0]
         # Il link sidebar punta a dorf1: se il target e' solo dorf1 basta.
         if base == selectors.PATH_DORF1 or path == "":
@@ -130,7 +162,7 @@ async def navigate_via_dom(page: Page, path: str) -> bool:
         if selectors.PATH_DORF2 not in (page.url or ""):
             if not await _click_first(page, [f'a[href*="{selectors.PATH_DORF2}"]']):
                 return False
-            await sleep_human(0.5, 1.2)
+            await sleep_human(1.0, 2.0)
         if not await _click_first(
             page,
             [
@@ -141,7 +173,8 @@ async def navigate_via_dom(page: Page, path: str) -> bool:
             ],
         ):
             return False
-        await sleep_human(0.5, 1.2)
+        # Attesa caricamento scheda edificio (spec anti-bot).
+        await sleep_human(1.0, 2.5)
         # Catalogo costruzioni: click sulla scheda dell'edificio scelto
         return await _click_first(
             page,
@@ -164,7 +197,7 @@ async def navigate_via_dom(page: Page, path: str) -> bool:
             if dorf not in cur_url:
                 if not await _click_first(page, [f'a[href*="{dorf}"]']):
                     return False
-                await sleep_human(0.5, 1.2)
+                await sleep_human(1.0, 2.0)
             slot_ok = False
             for sel in (
                 f'a[href*="build.php?id={slot}&"]',
@@ -182,7 +215,7 @@ async def navigate_via_dom(page: Page, path: str) -> bool:
                     loc = page.locator(sel).first
                     if await loc.count() == 0 or not await loc.is_visible():
                         continue
-                    await loc.click(timeout=5000)
+                    await human_click(page, loc)
                     await page.wait_for_load_state(
                         "domcontentloaded", timeout=15000
                     )
@@ -192,6 +225,8 @@ async def navigate_via_dom(page: Page, path: str) -> bool:
                     continue
             if not slot_ok:
                 return False
+            # Attesa 'lettura' scheda edificio (spec anti-bot).
+            await sleep_human(1.0, 2.5)
         # Sub-tab (es. rally point tt=99) e nuova costruzione (a=GID):
         # la pagina e' gia' sullo slot, resta da cliccare la tab/scheda.
         tt = re.search(r"[?&]tt=(\d+)", path)

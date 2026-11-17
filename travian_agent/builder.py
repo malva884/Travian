@@ -32,9 +32,13 @@ from .building_prereqs import (
     FIELD_GID_TYPES,
     GID_ACADEMY,
     GID_BAKERY,
+    GID_CLAY_PIT,
     GID_CRANNY,
+    GID_CROPLAND,
     GID_EMBASSY,
     GID_GRAIN_MILL,
+    GID_IRON_MINE,
+    GID_WOODCUTTER,
     GID_LABELS,
     GID_MAIN_BUILDING,
     GID_TOWN_HALL,
@@ -165,9 +169,113 @@ def field_max_level(state: GameState, f: Field) -> int:
     return _BUILDING_MAX_LEVEL
 
 
+def field_label(f: Field) -> str:
+    """Etichetta leggibile dello slot per log/audit/dashboard.
+
+    I sensori possono riportare ``name`` vuoto o numerico (id/indice
+    DOM): in quel caso la label si risolve dal dizionario ``GID_LABELS``
+    via ``gid``, con fallback sul generico "slot N".
+    """
+    name = str(f.name or "").strip()
+    if name and not name.isdigit():
+        return name
+    if f.gid > 0:
+        label = GID_LABELS.get(f.gid)
+        if label:
+            return label
+    return name or f"slot {f.slot_id}"
+
+
 def queued_slot_ids(state: GameState) -> set[int]:
     """Slot gia' occupati da una costruzione in coda."""
     return {q.slot_id for q in state.build_queue if q.slot_id > 0}
+
+
+def parallel_build_enabled(settings: Settings) -> bool:
+    """Costruzione parallela dorf1+dorf2 attiva.
+
+    Priorita' al flag ``allow_parallel_build`` (Travian Plus, True su
+    tutti gli account): la doppia coda e' abilitata a prescindere dalla
+    tribu', anche se ``settings.tribe`` e' vuoto. Solo con il flag
+    spento vale il perk razziale romano (doppia coda senza Plus).
+    """
+    if bool(getattr(settings, "allow_parallel_build", True)):
+        return True
+    return (
+        str(getattr(settings, "tribe", "") or "").strip().lower()
+        == "romans"
+    )
+
+
+def queue_slots_free(
+    state: GameState, settings: Settings
+) -> tuple[bool, bool]:
+    """(can_build_outer, can_build_inner): slot coda liberi per vista.
+
+    Con costruzione parallela (tribu' romana / Plus,
+    ``allow_parallel_build``) dorf1 (slot 1-18) e dorf2 (slot 19-40)
+    hanno code indipendenti con i propri limiti
+    (``max_resource_queue``/``max_interior_queue`` + tetto
+    ``max_build_queue``). Senza parallelismo condividono un unico slot
+    coda: entrambi i flag dipendono dalla sola coda totale.
+    """
+    total = len(state.build_queue)
+    max_q = max(1, int(getattr(settings, "max_build_queue", 1) or 1))
+    if parallel_build_enabled(settings):
+        outer = (
+            len(state.resource_queue())
+            < max(1, int(getattr(settings, "max_resource_queue", 1) or 1))
+            and total < max_q
+        )
+        inner = (
+            len(state.interior_queue())
+            < max(1, int(getattr(settings, "max_interior_queue", 1) or 1))
+            and total < max_q
+        )
+        return outer, inner
+    free = total < max_q
+    return free, free
+
+
+# Costi base upgrade campo (livello 1 -> 2) per gid risorsa T4.x; la
+# crescita e' esponenziale ~1.67/livello con arrotondamento a multipli
+# di 5. Stima +-5%: serve a diagnostica e filtro economico — il costo
+# reale resta quello letto dall'esecutore su build.php.
+_FIELD_COST_BASE: dict[int, tuple[int, int, int, int]] = {
+    GID_WOODCUTTER: (40, 10, 5, 6),
+    GID_CLAY_PIT: (80, 40, 80, 50),
+    GID_IRON_MINE: (100, 80, 30, 60),
+    GID_CROPLAND: (70, 90, 70, 20),
+}
+_FIELD_COST_GROWTH = 1.67
+
+_RES_TYPE_GID: dict[str, int] = {
+    rt.value: gid for gid, rt in FIELD_GID_TYPES.items()
+}
+
+
+def field_gid(f: Field) -> int:
+    """gid 1-4 di un campo risorsa (dal gid letto o dal resource_type)."""
+    gid = int(getattr(f, "gid", 0) or 0)
+    if gid > 0:
+        return gid
+    rtype = str(
+        getattr(getattr(f, "resource_type", None), "value", "") or ""
+    )
+    return _RES_TYPE_GID.get(rtype, 0)
+
+
+def field_upgrade_cost(
+    gid: int, target_level: int
+) -> tuple[int, int, int, int] | None:
+    """Costo stimato (legno, argilla, ferro, grano) upgrade a target_level."""
+    base = _FIELD_COST_BASE.get(gid)
+    if base is None or target_level < 2:
+        return None
+    mult = _FIELD_COST_GROWTH ** (target_level - 2)
+    return tuple(
+        max(1, int(round(c * mult / 5.0) * 5)) for c in base
+    )
 
 
 def upgradeable_fields(
@@ -364,7 +472,12 @@ def _focus_steps(focus_list: list) -> list[tuple[tuple[int, ...], int]]:
         target = 0
         if isinstance(item, dict):
             try:
-                target = max(0, int(item.get("target_level") or 0))
+                # Compatibilita' nuova UI: 'target' (nuovo) con fallback
+                # su 'target_level' (legacy); 0 = fino al massimo.
+                target = max(
+                    0,
+                    int(item.get("target") or item.get("target_level") or 0),
+                )
             except (TypeError, ValueError):
                 target = 0
             try:
@@ -435,14 +548,13 @@ def _pick_group_gid(state: GameState, gids: tuple[int, ...]) -> int:
     return gids[0]
 
 
-def focus_intents(state: GameState, settings: Settings) -> list[Field]:
-    """Field candidati dalla coda prioritaria building_queue_plan.
+def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
+    """Pool candidati della Coda Prioritaria PRIMA del filtro slot-coda.
 
-    Ogni step e' (gruppo gid, target_level): il builder lo salta quando
-    il target e' raggiunto — campi risorsa: nessun campo sotto target;
-    edifici: almeno un'istanza al target. Edificio assente -> nuova
-    costruzione se i prerequisiti reggono. I gruppi multi-gid (mura,
-    Residenza/Palazzo) sono alternative: basta UNA delle varianti.
+    Stessa logica di ``focus_intents`` ma senza il vincolo
+    ``queue_slots_free``: il Decision Tracer la usa per mostrare quali
+    candidati vengono poi scartati perche' il lato coda pertinente e'
+    occupato.
     """
     vcfg = settings.village_config_for(state.village_name, state.village_id)
     plan = []
@@ -493,6 +605,27 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
             seen.add(f.slot_id)
             unique.append(f)
     return unique
+
+
+def focus_intents(state: GameState, settings: Settings) -> list[Field]:
+    """Field candidati dalla coda prioritaria building_queue_plan.
+
+    Ogni step e' (gruppo gid, target_level): il builder lo salta quando
+    il target e' raggiunto — campi risorsa: nessun campo sotto target;
+    edifici: almeno un'istanza al target. Edificio assente -> nuova
+    costruzione se i prerequisiti reggono. I gruppi multi-gid (mura,
+    Residenza/Palazzo) sono alternative: basta UNA delle varianti.
+    """
+    unique = focus_candidates(state, settings)
+    # Doppia coda (spec): un cantiere occupato non congela la coda
+    # manuale — i candidati restano solo quelli compatibili con gli
+    # slot coda effettivamente liberi (dorf1/dorf2 disaccoppiati su
+    # tribu' romana/Plus, slot unico condiviso altrimenti).
+    can_out, can_in = queue_slots_free(state, settings)
+    return [
+        f for f in unique
+        if (can_out if f.is_resource_field else can_in)
+    ]
 
 
 # Gruppi di edifici mutuamente esclusivi: la presenza di uno rende lo
@@ -921,16 +1054,65 @@ def is_founder_village(state: GameState, settings: Settings) -> bool:
     return resolve_role(role) == FOUNDER_ROLE
 
 
+# Gate di maturita' economica del Freeze Espansione: sul founder appena
+# creato i PC del 2° villaggio sono gia' pronti, ma bloccare le spese
+# con campi al liv. 1-2 strozzerebbe la crescita. Il freeze scatta solo
+# quando il villaggio regge l'accumulo coloni.
+FREEZE_MIN_AVG_FIELD_LEVEL = 4.0
+# Chiavi normalizzate di production_per_hour (ResourceType.value o str).
+_RESOURCE_KEYS = frozenset(rt.value for rt in ResourceType)
+
+
+def _freeze_economic_base(state: GameState, settings: Settings) -> bool:
+    """True se il villaggio ha una base produttiva sufficiente al freeze.
+
+    Alternativa (basta UNA condizione):
+    1. produzione oraria lorda totale (wood+clay+iron+crop) sopra la
+       soglia configurabile ``expansion.min_freeze_hourly_prod``
+       (default 900/h su server 1x, da scalare ~ speed * 900);
+    2. media dei livelli dei campi risorsa >= 4.0;
+    3. Residenza o Palazzo gia' al livello >= 8.
+    """
+    # 1. Produzione oraria lorda totale (chiavi ResourceType o str).
+    prod = getattr(state.resources, "production_per_hour", None) or {}
+    hourly = sum(
+        int(v or 0)
+        for k, v in prod.items()
+        if str(getattr(k, "value", k)) in _RESOURCE_KEYS
+    )
+    if hourly > int(getattr(settings.expansion, "min_freeze_hourly_prod", 900) or 0):
+        return True
+
+    # 2. Media livelli dei 18 campi risorsa >= soglia.
+    fields = state.resource_fields()
+    if fields and sum(f.level for f in fields) / len(fields) >= FREEZE_MIN_AVG_FIELD_LEVEL:
+        return True
+
+    # 3. Residenza/Palazzo >= 8.
+    return max(
+        (
+            f.level
+            for f in state.interior_fields()
+            if f.gid in (GID_RESIDENCE, GID_PALACE)
+        ),
+        default=0,
+    ) >= 8
+
+
 def expansion_freeze(state: GameState, settings: Settings) -> bool:
     """True se sul founder vige il congelamento delle spese extra.
 
-    Attivo finche' mancano coloni (<3 a casa) e i Punti Cultura sono
+    Attivo finche' mancano coloni (<3 a casa), il villaggio ha una base
+    economica matura (``_freeze_economic_base``) e i Punti Cultura sono
     pronti oppure la Residenza/Reggia e' gia' alta (>= 8): ogni risorsa
     deve coprire i coloni e i soli passi critici dell'espansione.
     Condiviso tra brain (salta le regole campi-risorse) e orchestrator
-    (declassa a WAIT le spese fuori whitelist).
+    (declassa a WAIT le spese fuori whitelist). Il toggle dashboard
+    `expansion_settings.spending_freeze` spegne del tutto la regola.
     """
     try:
+        if not getattr(settings.expansion, "spending_freeze", True):
+            return False
         if not is_founder_village(state, settings):
             return False
         if int(getattr(state, "settlers_home", 0) or 0) >= 3:
@@ -948,7 +1130,10 @@ def expansion_freeze(state: GameState, settings: Settings) -> bool:
             and int(getattr(state, "culture_points", 0) or 0)
             >= int(state.culture_points_required)
         )
-        return bool(cp_ready or res_lvl >= 8)
+        return bool(
+            _freeze_economic_base(state, settings)
+            and (cp_ready or res_lvl >= 8)
+        )
     except Exception:
         return False
 
@@ -1195,7 +1380,7 @@ def select_upgrade(
         return UpgradeIntent(
             kind=kind,
             slot_id=head.slot_id,
-            name=head.name or f"slot {head.slot_id}",
+            name=field_label(head),
             gid=head.gid,
             target_level=head.level + 1,
             is_resource_field=head.is_resource_field,
