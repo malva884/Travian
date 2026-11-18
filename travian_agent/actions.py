@@ -391,17 +391,76 @@ class ActionExecutor:
         except Exception:  # noqa: BLE001
             return {}
 
-    async def _upgrade_field(self, action: Action, village_id: int = 0) -> ActionResult:
-        """Apre build.php?id=<slot> e clicca 'migliora' mantenendo il newdid esplicito.
+    async def _build_queue_count(self, page) -> int | None:
+        """Numero di elementi nella coda di costruzione in sidebar.
 
-        Funziona sia per i campi risorsa (slot 1-18, dorf1) sia per gli
-        edifici interni (slot 19-40, dorf2): build.php?id=N apre
-        direttamente il contratto di upgrade dell'edificio esistente.
-        Su un'area vuota la pagina mostra invece il catalogo edifici e
-        UPGRADE_BUTTON non e' presente: per le NUOVE costruzioni il brain
-        passa params['construct'] = {slot_id: gid} e si apre il contratto
-        diretto dorf2.php?a=<gid>&id=<slot> (T4.x), dove il pulsante di
-        avvio costruzione e' lo stesso UPGRADE_BUTTON.
+        Copre markup vecchia e nuova UI; ritorna None se nessun container
+        di coda e' riconoscibile nella pagina corrente.
+        """
+        try:
+            count = await page.evaluate(
+                """
+                () => {
+                    const containers = document.querySelectorAll(
+                        '#buildingContract, .buildingList, ' +
+                        '.buildingsOverview, table#building_contract, ' +
+                        '[class*="buildQueue" i], [class*="construction" i]'
+                    );
+                    if (!containers.length) return null;
+                    const rowSels = [
+                        '.buildingRow', 'li', 'tr',
+                        '[class*="queueElement" i]', '[class*="entry" i]',
+                    ];
+                    let best = 0;
+                    for (const c of containers) {
+                        for (const s of rowSels) {
+                            const n = c.querySelectorAll(s).length;
+                            if (n > best) best = n;
+                        }
+                    }
+                    return best;
+                }
+                """
+            )
+            return int(count) if count is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _detect_page_gid(self, page) -> int | None:
+        try:
+            return await page.evaluate(
+                """
+                () => {
+                    const grab = (el) => {
+                        if (!el) return null;
+                        const m = (el.className || '').match(/\\bgid(\\d+)\\b|\\bg(\\d+)\\b/);
+                        return m ? parseInt(m[1] || m[2], 10) : null;
+                    };
+                    for (const el of [
+                        document.getElementById('build'),
+                        document.getElementById('contract'),
+                        document.querySelector('.contractLink'),
+                        document.querySelector('#content .building, #content .buildingImage'),
+                    ]) {
+                        const g = grab(el);
+                        if (g !== null) return g;
+                    }
+                    return null;
+                }
+                """
+            )
+        except Exception:
+            return None
+
+    async def _upgrade_field(self, action: Action, village_id: int = 0) -> ActionResult:
+        """Esegue costruzione iniziale (Flusso A) o ampliamento (Flusso B).
+
+        Flusso A (current_level == 0, gid > 0): navigazione al tab di categoria su
+        build.php?id=<slot>&category=<cat>, individuazione blocco #contract_building<gid>,
+        click sul pulsante primario (button.green.new) e post-check su .buildingList.
+
+        Flusso B (current_level >= 1, gid == 0): navigazione allo slot, click su
+        upgradeButtonsContainer button.green.build e post-check su .buildingList.
         """
         candidates: list[int] = action.params.get("candidates") or []
         if not candidates:
@@ -419,10 +478,6 @@ class ActionExecutor:
         page = self.browser.page
         assert page is not None
 
-        # Opportunistic Fallback (spec 2): stock/produzione per la
-        # valutazione pagabilita' dei candidati; il primo NON pagabile
-        # (C1) non congela la coda — se il suo ETA supera 15 min si cerca
-        # un candidato successivo pagabile che non lo ritardi oltre 30 min.
         _res_keys = ("wood", "clay", "iron", "crop")
         stock = {
             k: int((action.params.get("stock") or {}).get(k) or 0)
@@ -434,129 +489,240 @@ class ActionExecutor:
         last_cost: dict = {}
 
         for slot_id in candidates:
-            # Costruisce l'URL di build includendo il newdid per garantire l'isolamento del villaggio
             gid = construct.get(int(slot_id), 0)
-            if gid > 0:
-                # Nuova costruzione su area vuota: contratto diretto del gid
-                build_url = f"{selectors.PATH_DORF2}?a={gid}&id={slot_id}"
-            else:
-                build_url = f"{selectors.PATH_BUILD}?id={slot_id}"
-            if village_id > 0:
-                build_url += f"&newdid={village_id}"
 
-            await self.browser.goto(build_url)
-
-            # Guard anti "edificio sbagliato": se lo slot e' occupato il
-            # server ignora ?a=<gid> e apre il contratto dell'edificio
-            # ESISTENTE — cliccando 'migliora' si upgrada quello (caso
-            # osservato: pianificata Ambasciata, partita Caserma lv7).
-            # Il contratto T4.x marca l'edificio con class 'gid<N>' su
-            # #build/#contract oppure 'g<N>' sull'immagine: se il gid
-            # mostrato non coincide con quello richiesto, salta il
-            # candidato. Marker assente = skin non riconosciuta -> si
-            # procede come prima.
             if gid > 0:
-                try:
-                    page_gid = await page.evaluate(
-                        """
-                        () => {
-                            const grab = (el) => {
-                                if (!el) return null;
-                                const m = (el.className || '').match(
-                                    /\\bgid(\\d+)\\b|\\bg(\\d+)\\b/
-                                );
-                                return m ? parseInt(m[1] || m[2], 10) : null;
-                            };
-                            for (const el of [
-                                document.getElementById('build'),
-                                document.getElementById('contract'),
-                                document.querySelector('.contractLink'),
-                                document.querySelector(
-                                    '#content .building, #content .buildingImage'
-                                ),
-                            ]) {
-                                const g = grab(el);
-                                if (g !== null) return g;
-                            }
-                            return null;
-                        }
-                        """
+                # =============================================================
+                # FLUSSO A: Costruzione iniziale (current_level == 0)
+                # =============================================================
+                cat_id = builder.building_category(gid)
+                build_url = f"{selectors.PATH_BUILD}?id={int(slot_id)}&category={cat_id}"
+                if village_id > 0:
+                    build_url += f"&newdid={village_id}"
+                await self.browser.goto(build_url)
+
+                slot_check = re.compile(
+                    rf"(?:/slot|build\.php)\?[^#]*\bid={int(slot_id)}\b"
+                )
+                if not slot_check.search(page.url or ""):
+                    logger.debug(
+                        "Slot %s: vista costruzione non aperta (url=%s)",
+                        slot_id,
+                        page.url,
                     )
-                except Exception:  # noqa: BLE001
-                    page_gid = None
+                    continue
+
+                page_gid = await self._detect_page_gid(page)
                 if page_gid is not None and page_gid != gid:
                     logger.warning(
-                        "Contratto gid=%s ma la pagina mostra gid=%s "
-                        "(slot %s occupato? candidato saltato)",
-                        gid, page_gid, slot_id,
+                        "Slot %s occupato da gid=%s (atteso vuoto per gid=%s): INVALID_SLOT_OCCUPIED",
+                        slot_id,
+                        page_gid,
+                        gid,
                     )
                     continue
 
-            # Verifica preventiva: la pagina segnala livello massimo raggiunto?
-            try:
-                is_max_level = await page.evaluate(
-                    """
-                    () => /livello massimo|fully upgraded|max(imal)?(imum)?\\s*level|
-                           completamente migliorato|maximale stufe|niveau max/i
-                        .test(document.body.innerText || '')
-                    """
-                )
-            except Exception:  # noqa: BLE001
-                is_max_level = False
-            if is_max_level:
-                logger.info(
-                    "Slot %s gia' al livello massimo nel villaggio %s: cerco alternativa",
-                    slot_id,
-                    village_id,
-                )
-                continue
-
-            # Costo del contratto: serve sia per l'ETA di C1 sia per la
-            # verifica di non-interferenza dei fallback.
-            cost = await self._read_contract_cost(page)
-            if cost:
-                last_cost = cost
-
-            button = None
-            for sel in selectors.UPGRADE_BUTTON:
-                locator = page.locator(sel).first
+                # Individuare il blocco #contract_building{gid}
+                contract_block = page.locator(
+                    f"#contract_building{gid}, .buildingWrapper.gid{gid}"
+                ).first
+                block_count = 0
                 try:
-                    if await locator.count() == 0:
-                        continue
-                    disabled = await locator.get_attribute("disabled")
-                    css_class = (await locator.get_attribute("class")) or ""
-                    if disabled is None and "disabled" not in css_class:
-                        button = locator
-                        break
-                except Exception:  # noqa: BLE001
+                    block_count = await contract_block.count()
+                except Exception:
+                    block_count = 0
+
+                if block_count == 0:
+                    # Tab non attivo: click sul tab di categoria
+                    tab_loc = page.locator(
+                        f".tabItem[data-tab-id='{cat_id}'], a[href*='category={cat_id}']"
+                    ).first
+                    try:
+                        if await tab_loc.count() > 0:
+                            await human_click(page, tab_loc)
+                            await sleep_human(0.8, 1.5)
+                            contract_block = page.locator(
+                                f"#contract_building{gid}, .buildingWrapper.gid{gid}"
+                            ).first
+                            block_count = await contract_block.count()
+                    except Exception:
+                        pass
+
+                if block_count == 0:
+                    try:
+                        prereq_missing = await page.evaluate(
+                            """
+                            (gid) => {
+                                const body = document.body ? document.body.innerText : '';
+                                return /prerequisit|voraussetzung|prerequisite/i.test(body);
+                            }
+                            """,
+                            gid,
+                        )
+                    except Exception:
+                        prereq_missing = False
+                    err = "PREREQUISITES_MISSING" if prereq_missing else "BTN_NOT_FOUND"
+                    logger.warning(
+                        "Contratto building gid=%s non trovato su slot %s: %s",
+                        gid,
+                        slot_id,
+                        err,
+                    )
                     continue
 
-            if button is None:
-                logger.debug("Slot %s non migliorabile nel villaggio %s, provo il prossimo", slot_id, village_id)
-                # Caso B spec: primo candidato non pagabile = bloccante C1.
-                if blocker_cost is None and cost:
-                    _def = {
-                        k: max(0, int(cost.get(k) or 0) - stock.get(k, 0))
-                        for k in _res_keys
-                    }
-                    if any(v > 0 for v in _def.values()):
-                        _eta = resource_eta_seconds(_def, prod_h)
-                        if _eta is not None and _eta <= 900.0:
-                            # ETA(C1) <= 15 min: attendi C1, niente fallback.
-                            return ActionResult(
-                                False,
-                                f"candidato prioritario pagabile tra "
-                                f"~{int(_eta)}s: attendo C1",
-                                data={"cost": cost},
-                            )
-                        blocker_cost, blocker_eta = cost, _eta
-                continue
+                button = None
+                new_btn_selectors = [
+                    f"#contract_building{gid} button.green.new",
+                    f"#contract_building{gid} button.textButtonV1.green",
+                    f"#contract_building{gid} button.green",
+                    f"#contract_building{gid} .contractLink button.green",
+                    f".buildingWrapper.gid{gid} button.green.new",
+                    f".buildingWrapper.gid{gid} button.textButtonV1.green",
+                    f"#contract_building{gid} button[type='button'].green",
+                ]
+                for sel in new_btn_selectors:
+                    loc = page.locator(sel).first
+                    try:
+                        if await loc.count() == 0:
+                            continue
+                        if await loc.is_disabled():
+                            continue
+                        css = (await loc.get_attribute("class")) or ""
+                        if "disabled" not in css and "gold" not in css:
+                            button = loc
+                            break
+                    except Exception:
+                        continue
 
-            # Candidato avviabile: se un bloccante C1 esiste, il fallback
-            # e' lecito solo se pagare Ck non ritarda C1 oltre 30 min.
+                cost = await self._read_contract_cost(page)
+                if cost:
+                    last_cost = cost
+
+                if button is None:
+                    try:
+                        is_none = await page.evaluate(
+                            """
+                            (gid) => {
+                                const el = document.querySelector('#contract_building' + gid + ' .none') ||
+                                           document.querySelector('.buildingWrapper.gid' + gid + ' .none');
+                                return !!el;
+                            }
+                            """,
+                            gid,
+                        )
+                    except Exception:
+                        is_none = False
+                    err = "INSUFFICIENT_RESOURCES" if is_none else "BTN_NOT_FOUND"
+                    logger.warning(
+                        "Pulsante costruzione non disponibile per gid=%s su slot %s: %s",
+                        gid,
+                        slot_id,
+                        err,
+                    )
+                    if blocker_cost is None and cost:
+                        _def = {
+                            k: max(0, int(cost.get(k) or 0) - stock.get(k, 0))
+                            for k in _res_keys
+                        }
+                        if any(v > 0 for v in _def.values()):
+                            _eta = resource_eta_seconds(_def, prod_h)
+                            if _eta is not None and _eta <= 900.0:
+                                return ActionResult(
+                                    False,
+                                    f"candidato prioritario pagabile tra ~{int(_eta)}s: attendo C1",
+                                    data={"cost": cost, "error": err},
+                                )
+                            blocker_cost, blocker_eta = cost, _eta
+                    continue
+
+            else:
+                # =============================================================
+                # FLUSSO B: Ampliamento (current_level >= 1)
+                # =============================================================
+                build_url = f"slot?id={int(slot_id)}"
+                slot_check = re.compile(
+                    rf"(?:/slot|build\.php)\?[^#]*\bid={int(slot_id)}\b"
+                )
+                if village_id > 0:
+                    build_url += f"&newdid={village_id}"
+                await self.browser.goto(build_url)
+
+                if not slot_check.search(page.url or ""):
+                    build_url = f"{selectors.PATH_BUILD}?id={int(slot_id)}"
+                    if village_id > 0:
+                        build_url += f"&newdid={village_id}"
+                    await self.browser.goto(build_url)
+                    if not slot_check.search(page.url or ""):
+                        logger.debug(
+                            "Slot %s: contratto non aperto (url=%s), provo il prossimo",
+                            slot_id,
+                            page.url,
+                        )
+                        continue
+
+                try:
+                    is_max_level = await page.evaluate(
+                        """
+                        () => /livello massimo|fully upgraded|max(imal)?(imum)?\\s*level|
+                               completamente migliorato|maximale stufe|niveau max/i
+                            .test(document.body.innerText || '')
+                        """
+                    )
+                except Exception:
+                    is_max_level = False
+                if is_max_level:
+                    logger.info(
+                        "Slot %s gia' al livello massimo nel villaggio %s",
+                        slot_id,
+                        village_id,
+                    )
+                    continue
+
+                cost = await self._read_contract_cost(page)
+                if cost:
+                    last_cost = cost
+
+                button = None
+                for sel in selectors.UPGRADE_BUTTON:
+                    locator = page.locator(sel).first
+                    try:
+                        if await locator.count() == 0:
+                            continue
+                        if await locator.is_disabled():
+                            continue
+                        css_class = (await locator.get_attribute("class")) or ""
+                        if "disabled" not in css_class and "gold" not in css_class:
+                            button = locator
+                            break
+                    except Exception:
+                        continue
+
+                if button is None:
+                    logger.debug(
+                        "Slot %s non migliorabile nel villaggio %s",
+                        slot_id,
+                        village_id,
+                    )
+                    if blocker_cost is None and cost:
+                        _def = {
+                            k: max(0, int(cost.get(k) or 0) - stock.get(k, 0))
+                            for k in _res_keys
+                        }
+                        if any(v > 0 for v in _def.values()):
+                            _eta = resource_eta_seconds(_def, prod_h)
+                            if _eta is not None and _eta <= 900.0:
+                                return ActionResult(
+                                    False,
+                                    f"candidato prioritario pagabile tra ~{int(_eta)}s: attendo C1",
+                                    data={"cost": cost},
+                                )
+                            blocker_cost, blocker_eta = cost, _eta
+                    continue
+
+            # Fallback opportunistico se blocker C1 attivo
             if blocker_cost is not None:
                 if blocker_eta is None:
-                    continue  # ETA C1 non stimabile: niente spesa a vuoto
+                    continue
                 _res = {
                     k: max(0, stock.get(k, 0) - int(cost.get(k) or 0))
                     for k in _res_keys
@@ -567,26 +733,85 @@ class ActionExecutor:
                 }
                 _eta_after = resource_eta_seconds(_def1, prod_h)
                 if _eta_after is None or _eta_after - blocker_eta > 1800.0:
-                    continue  # Ck ritarderebbe C1 oltre 30 minuti
+                    continue
                 logger.info(
                     "Fallback opportunistico: C1 non pagabile "
                     "(ETA %.0fmin) -> avvio slot %s "
                     "(ETA C1 residuo %.0fmin)",
-                    blocker_eta / 60.0, slot_id, _eta_after / 60.0,
+                    blocker_eta / 60.0,
+                    slot_id,
+                    _eta_after / 60.0,
                 )
 
             await sleep_human(
                 self.settings.action_delay_min, self.settings.action_delay_max
             )
-            # Click 'umano' sul pulsante di conferma (cursore + punto
-            # casuale interno) invece del click DOM diretto.
+            # Post-check: snapshot della coda PRIMA del click
+            queue_before = await self._build_queue_count(page)
             await human_click(page, button)
+
+            try:
+                await page.wait_for_url(
+                    re.compile(r"/(resources|village|dorf[12]\.php)"),
+                    timeout=5000,
+                )
+            except Exception:
+                pass
             await sleep_human(1.0, 2.0)
-            logger.info("Upgrade avviato sullo slot %s (Villaggio %s)", slot_id, village_id)
+
+            # Verifica reale nel DOM: coda cresciuta, underConstruction o timer in .buildingList
+            queue_after = await self._build_queue_count(page)
+            try:
+                under_construction = await page.evaluate(
+                    """
+                    (sid) => Array.from(document.querySelectorAll(
+                        '#resourceFieldContainer a[data-aid], ' +
+                        '#village_map [data-aid], .buildingSlot, .buildingList'
+                    )).some(el =>
+                        (el.getAttribute('data-aid') === String(sid) ||
+                         /\\ba(\\d+)\\b/.exec(el.className || '')?.[1] === String(sid)
+                        ) && /underconstruction|inconstruction|build/i.test(
+                            el.className || ''
+                        )
+                    )
+                    """,
+                    int(slot_id),
+                )
+            except Exception:
+                under_construction = False
+
+            if queue_after is not None and queue_before is not None:
+                confirmed = queue_after > queue_before
+            elif queue_after is not None:
+                confirmed = queue_after > 0
+            else:
+                confirmed = bool(under_construction)
+
+            if not confirmed:
+                logger.warning(
+                    "Click su costruisci/migliora senza effetto osservabile sullo "
+                    "slot %s (coda %s->%s, underConstruction=%s, url=%s): QUEUE_UNCONFIRMED",
+                    slot_id,
+                    queue_before,
+                    queue_after,
+                    under_construction,
+                    page.url,
+                )
+                continue
+
+            action_name = "costruzione iniziale" if gid > 0 else "upgrade"
+            logger.info(
+                "%s avviata sullo slot %s (Villaggio %s, coda %s->%s)",
+                action_name.capitalize(),
+                slot_id,
+                village_id,
+                queue_before,
+                queue_after,
+            )
             return ActionResult(
                 True,
-                f"upgrade avviato sullo slot {slot_id}",
-                data={"slot_id": int(slot_id)},
+                f"{action_name} avviata sullo slot {slot_id}",
+                data={"slot_id": int(slot_id), "gid": gid},
             )
 
         # Resource-ETA Sleep: riporta il costo del BLOCCANTE (C1) per

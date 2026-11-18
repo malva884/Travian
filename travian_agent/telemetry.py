@@ -24,6 +24,7 @@ from typing import Any
 from .building_prereqs import GID_TOWN_HALL
 from .config import BASE_DIR, Settings
 from .models import GID_PALACE, GameState, ResourceType, Village
+from .version import get_agent_version
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +287,10 @@ def _village_payload(
     state: GameState | None,
     role: str,
     freeze_active: bool = False,
+    prev_fields: list | None = None,
+    settings: Settings | None = None,
 ) -> dict:
+    prev_fields = prev_fields or []
     res = state.resources if state is not None else None
     queue = []
     if state is not None:
@@ -296,6 +300,14 @@ def _village_payload(
                     "name": item.name,
                     "target_level": item.level,
                     "seconds_remaining": item.remaining_seconds,
+                    # Binario coda (dorf1 campi / dorf2 edifici): serve a
+                    # _state_from_snapshot per non riclassificare tutto
+                    # come edificio interno.
+                    "slot_id": int(getattr(item, "slot_id", 0) or 0),
+                    "gid": int(getattr(item, "gid", 0) or 0),
+                    "is_resource_field": bool(
+                        getattr(item, "is_resource_field", False)
+                    ),
                 }
             )
     interiors = state.interior_fields() if state is not None else []
@@ -327,6 +339,11 @@ def _village_payload(
     # fonte primaria per la ricostruzione dello stato da snapshot
     # (command_server._state_from_snapshot) e per la UI dei campi.
     fields = [s for s in slots if 1 <= int(s.get("slot") or 0) <= 18]
+    if not fields and prev_fields:
+        # Doppia rete di sicurezza: se il ciclo non ha letto dorf1
+        # (azione su dorf2.php / lettura vuota) lo snapshot precedente
+        # conserva i suoi 18 campi invece di tornare a fields_count=0.
+        fields = [dict(f) for f in prev_fields if isinstance(f, dict)]
     role_raw = getattr(village.role, "value", village.role)
     is_capital = str(role_raw).lower() == "capital" or any(
         f.gid == GID_PALACE for f in interiors
@@ -349,6 +366,24 @@ def _village_payload(
     if not incoming_payload:
         # Fallback: conteggio sidebar senza dettagli Piazza d'Armi.
         incoming_payload = [{"type": "attack"} for _ in range(attacks)]
+    # Scaletta Costruzioni (spec Timeline & Previsione Code): proiezione
+    # in memoria sui candidati del builder — nessuna chiamata browser.
+    timeline_payload: dict = {}
+    can_out, can_in = True, True
+    if state is not None and settings is not None:
+        try:
+            # import tardivo: evita cicli builder/config_engine -> telemetry
+            from .timeline import project_timeline
+            from .builder import queue_slots_free
+
+            can_out, can_in = queue_slots_free(state, settings)
+            timeline_payload = project_timeline(state, settings)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "project_timeline fallita per %s",
+                getattr(village, "name", "?"),
+                exc_info=True,
+            )
     return {
         "id": str(village.village_id or village.name),
         "name": village.name,
@@ -357,6 +392,8 @@ def _village_payload(
         "role": role,
         "freeze_active": bool(freeze_active),
         "is_capital": bool(is_capital),
+        "outer_free": bool(can_out),
+        "inner_free": bool(can_in),
         "resources": {
             "wood": int(getattr(res, "wood", 0) or 0),
             "clay": int(getattr(res, "clay", 0) or 0),
@@ -372,6 +409,7 @@ def _village_payload(
         "incoming_attacks": incoming_payload,
         "outgoing_attacks": [_mv(m) for m in moves_out],
         "building_queue": queue,
+        "projected_timeline": timeline_payload,
         "slots": slots,
         "fields": fields,
         "settlers": {
@@ -405,6 +443,25 @@ def export_dashboard_state(
     snapshot viene solo loggato (la telemetria non deve mai bloccare
     il ciclo dell'agente).
     """
+    # Snapshot precedente: i 18 campi dorf1 gia' persistiti fanno da
+    # rete di sicurezza quando il ciclo corrente non li ha riletti
+    # (ciclo su dorf2.php / lettura vuota) — mai riscrivere "fields": [].
+    prev_fields_by_village: dict[str, list] = {}
+    try:
+        prev_raw = json.loads(
+            telemetry_path(settings.account_id).read_text(encoding="utf-8")
+        )
+        for pv in (prev_raw.get("villages") or []):
+            if not isinstance(pv, dict):
+                continue
+            pf = pv.get("fields")
+            if pf:
+                prev_fields_by_village[str(pv.get("id") or "")] = list(pf)
+                if pv.get("name"):
+                    prev_fields_by_village[str(pv["name"])] = list(pf)
+    except (OSError, ValueError):
+        pass
+
     village_items: list[dict] = []
     for v in villages:
         key = v.name or str(v.village_id)
@@ -428,8 +485,15 @@ def export_dashboard_state(
                 freeze_active = bool(expansion_freeze(state, settings))
             except Exception:  # noqa: BLE001
                 freeze_active = False
+        # Lookup per village_id (chiave "id" del payload), fallback nome.
+        _vid = str(v.village_id or "")
+        prev_fields = prev_fields_by_village.get(_vid) or (
+            prev_fields_by_village.get(str(v.name)) if v.name else None
+        )
         village_items.append(
-            _village_payload(v, state, role, freeze_active)
+            _village_payload(
+                v, state, role, freeze_active, prev_fields, settings
+            )
         )
 
     # Flag raid dal config farming (disponibile solo a livello account)
@@ -479,6 +543,9 @@ def export_dashboard_state(
     cp_current = int(getattr(expansion_mgr, "cp_current", 0) or 0)
     cp_required = int(getattr(expansion_mgr, "cp_required", 0) or 0)
     cp_daily = int(getattr(expansion_mgr, "cp_daily", 0) or 0)
+    cp_slots_used = int(getattr(expansion_mgr, "cp_slots_used", 0) or 0)
+    cp_slots_total = int(getattr(expansion_mgr, "cp_slots_total", 0) or 0)
+    cp_next_slot = str(getattr(expansion_mgr, "cp_next_slot", "") or "")
     feed_target = str(getattr(expansion_mgr, "feed_target", "") or "")
     for st in states_by_village.values():
         if not cp_current:
@@ -497,11 +564,16 @@ def export_dashboard_state(
         "timestamp": datetime.now(timezone.utc).isoformat(
             timespec="seconds"
         ),
+        "agent_version": get_agent_version(),
         "account_id": settings.account_id,
         "account": {
+            "server_speed": float(getattr(settings, "server_speed", 1.0) or 1.0),
             "cp_current": cp_current,
             "cp_required": cp_required,
             "cp_daily_production": cp_daily,
+            "cp_slots_used": cp_slots_used,
+            "cp_slots_total": cp_slots_total,
+            "cp_next_slot": cp_next_slot,
             "founder_village": founder,
             "feed_target": feed_target,
             "expansion_targets": targets,

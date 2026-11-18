@@ -108,8 +108,15 @@ class TestRuleUpgradeStorage:
         state.fields = [
             Field(slot_id=25, name="Magazzino", level=5, gid=GID_WAREHOUSE),
         ]
-        # Edificio interno gia' in coda: blocca l'ulteriore upgrade interno
-        state.build_queue = [BuildQueueItem(name="Magazzino", remaining_seconds=60, is_resource_field=False)]
+        # Coda satura (3 item = tetto Plus): blocca l'ulteriore upgrade interno
+        state.build_queue = [
+            BuildQueueItem(name="Magazzino", remaining_seconds=60,
+                           is_resource_field=False, gid=GID_WAREHOUSE),
+            BuildQueueItem(name="Granaio", remaining_seconds=120,
+                           is_resource_field=False, gid=GID_GRANARY),
+            BuildQueueItem(name="Mercato", remaining_seconds=180,
+                           is_resource_field=False, gid=GID_MARKETPLACE),
+        ]
         assert rule_upgrade_storage(state, _settings()) is None
 
     def test_resource_in_queue_allows_interior_upgrade(self):
@@ -200,9 +207,15 @@ class TestEmergencyOverflow:
             wood=2000, clay=1800, iron=2000, crop=2000,
             warehouse_capacity=2000, granary_capacity=2000,
         )
-        # Coda interna occupata: rule_upgrade_storage non puo' agire
+        # Coda satura (3 item = tetto parallelo Plus): ne' upgrade
+        # storage ne' spesa locale possono partire.
         state.build_queue = [
-            BuildQueueItem(name="Magazzino", remaining_seconds=3600, is_resource_field=False)
+            BuildQueueItem(name="Magazzino", remaining_seconds=3600,
+                           is_resource_field=False, gid=GID_WAREHOUSE),
+            BuildQueueItem(name="Granaio", remaining_seconds=3600,
+                           is_resource_field=False, gid=GID_GRANARY),
+            BuildQueueItem(name="Residenza", remaining_seconds=3600,
+                           is_resource_field=False, gid=25),
         ]
         return state
 

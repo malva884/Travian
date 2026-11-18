@@ -211,6 +211,7 @@
           <span id="header-conn-badge" class="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-slate-700/40 text-slate-300 border border-slate-600">
             OFFLINE
           </span>
+          <span id="header-version-badge" class="hidden px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-slate-700/40 text-slate-300 border border-slate-600" title=""></span>
         </div>
         <p id="header-view-subtitle" class="text-xs text-slate-400 mt-0.5">
           Gestione villaggi, mappa slot Dorf2 con validazione GID statica e coda prioritaria in tempo reale.
@@ -816,6 +817,32 @@
                 <button onclick="setAllTroops('off')" class="px-2 py-1 rounded-lg bg-slate-900 hover:bg-red-500/15 text-red-300 border border-slate-700">Solo offensive</button>
                 <button onclick="setAllTroops('def')" class="px-2 py-1 rounded-lg bg-slate-900 hover:bg-cyan-500/15 text-cyan-300 border border-slate-700">Solo difensive</button>
               </div>
+            </div>
+          </div>
+
+          <!-- SCALETTA COSTRUZIONI: lavori attivi + proiezione code (spec Timeline & Previsione Code) -->
+          <div class="space-y-2">
+            <div class="flex items-center justify-between font-mono text-[11px]">
+              <span class="text-slate-300 font-bold">Scaletta Costruzioni <span class="text-slate-500">(Attive &amp; Prossime)</span></span>
+              <span id="build-timeline-meta" class="text-[10px] text-slate-500"></span>
+            </div>
+            <div class="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/60">
+              <table class="w-full text-left font-mono text-[11px]">
+                <thead>
+                  <tr class="text-[10px] uppercase text-slate-500 border-b border-slate-800">
+                    <th class="py-1.5 px-2">Coda</th>
+                    <th class="py-1.5 px-2">Edificio / Campo</th>
+                    <th class="py-1.5 px-2">Liv.</th>
+                    <th class="py-1.5 px-2">Inizio</th>
+                    <th class="py-1.5 px-2">Fine</th>
+                    <th class="py-1.5 px-2">Durata</th>
+                    <th class="py-1.5 px-2">Stato</th>
+                  </tr>
+                </thead>
+                <tbody id="build-timeline-body">
+                  <tr><td colspan="7" class="py-2 px-2 text-slate-500">In attesa del primo snapshot…</td></tr>
+                </tbody>
+              </table>
             </div>
           </div>
 
@@ -1529,6 +1556,7 @@
           <div class="flex flex-wrap items-center justify-between gap-2">
             <h2 class="text-xs uppercase tracking-wider text-emerald-400 font-bold">Decision Pipeline — Dry-Run "Simula Ciclo"</h2>
             <div class="flex items-center gap-2">
+              <span id="debug-version-badge" class="hidden px-2 py-0.5 rounded-lg text-[10px] font-mono font-semibold bg-slate-700/40 text-slate-300 border border-slate-600" title=""></span>
               <select id="debug-sim-village" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200"></select>
               <button onclick="simulateCycle()" class="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 text-[11px] font-bold">
                 ▶ Simula Ciclo (no browser)
@@ -1569,6 +1597,41 @@
         </div>
       </div>
     </section>
+
+    <!-- Modal Costruisci / Riassegna su Slot Dorf2 -->
+    <div id="slot-modal" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm hidden flex items-center justify-center p-4">
+      <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-5 space-y-4 shadow-2xl font-mono text-xs">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+          <div class="text-sm font-bold text-cyan-400" id="slot-modal-title">Slot #19 (Libero)</div>
+          <button onclick="closeSlotModal()" class="text-slate-400 hover:text-slate-200 text-lg">✕</button>
+        </div>
+        
+        <!-- Sezione 1: Costruisci qui -->
+        <div class="space-y-2">
+          <div class="text-[11px] font-semibold text-slate-200">Costruisci nuovo edificio su questo slot:</div>
+          <div class="flex gap-2">
+            <select id="slot-modal-key" class="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-200 flex-1 truncate">
+            </select>
+            <input id="slot-modal-target" type="number" min="1" max="20" value="10" class="w-16 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-center text-slate-200" title="Target Level" />
+          </div>
+          <button onclick="confirmSlotModalBuild()" class="w-full py-1.5 px-3 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/50 font-semibold text-[11px]">
+            + Aggiungi a Coda su questo Slot
+          </button>
+        </div>
+
+        <!-- Sezione 2: Riassegna voce lv.0 esistente in coda -->
+        <div id="slot-modal-reassign-sec" class="space-y-2 border-t border-slate-800 pt-3 hidden">
+          <div class="text-[11px] font-semibold text-slate-200">Oppure riassegna voce in coda (lv. 0):</div>
+          <div id="slot-modal-reassign-list" class="space-y-1.5 max-h-36 overflow-y-auto pr-1"></div>
+        </div>
+        
+        <!-- Azione opzionale: Focus Manuale -->
+        <div class="border-t border-slate-800 pt-2 flex justify-between items-center text-[10px] text-slate-400">
+          <button onclick="setManualFocusFromModal()" class="hover:text-cyan-400 underline">Imposta come Target Focus Manuale</button>
+          <button onclick="closeSlotModal()" class="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">Chiudi</button>
+        </div>
+      </div>
+    </div>
 
   </main>
   <script>
@@ -1673,14 +1736,24 @@
         const mf = configPayload.manual_focus || {};
         const queue = (configPayload.priority_queue || []).map((s, i) => ({
           ...(s.key ? { key: s.key } : { gid: s.gid }),
+          ...(s.gid ? { gid: Number(s.gid) } : {}),
+          slot_id: (s.slot_id !== undefined && s.slot_id !== null && Number(s.slot_id) > 0) ? Number(s.slot_id) : null,
           target_level: s.target ?? s.target_level ?? 0,
           priority: i + 1,
+          allow_duplicate_building: !!s.allow_duplicate_building,
         }));
         // Unica sorgente coda: plan e focus ricevono la STESSA lista
         // (formato step {key|gid, target_level, priority}). Il Focus
-        // Manuale, quando attivo, precede la coda come step gid.
+        // Manuale, quando attivo, precede la coda come step gid e viene
+        // marcato 'manual_focus' per non essere caricato come riga coda.
         const plan = mf.enabled
-          ? [{ gid: mf.gid, target_level: 1, priority: 0 }, ...queue]
+          ? [{
+              gid: mf.gid,
+              target_level: 1,
+              priority: 0,
+              slot_id: (Number(mf.slot) > 0 ? Number(mf.slot) : null),
+              manual_focus: true,
+            }, ...queue]
           : queue;
         const troops = configPayload.allowed_troops || [];
         const patch = {
@@ -1810,7 +1883,7 @@
       { key: 'iron_foundry', label: 'Fonderia', group: 'Moltiplicatori' },
       { key: 'grain_mill', label: 'Mulino', group: 'Moltiplicatori' },
       { key: 'bakery', label: 'Forno', group: 'Moltiplicatori' },
-      { key: 'main_building', label: 'Palazzo Pubblico', group: 'Infrastrutture' },
+      { key: 'main_building', label: 'Centro del Villaggio', group: 'Infrastrutture' },
       { key: 'warehouse', label: 'Magazzino', group: 'Infrastrutture' },
       { key: 'granary', label: 'Granaio', group: 'Infrastrutture' },
       { key: 'cranny', label: 'Deposito Segreto', group: 'Infrastrutture' },
@@ -2167,14 +2240,26 @@
       appState.allowedTroops = Array.isArray(cfg.allowed_units)
         ? [...cfg.allowed_units] : [];
       appState.priorityQueue = (cfg.building_queue_plan || cfg.building_focus || [])
-        .map(s => ({ key: s.key || null, gid: s.gid ?? 0, target: s.target_level ?? 0 }))
+        // Lo step iniettato dal Focus Manuale (flag manual_focus; sui
+        // salvataggi piu' vecchi priority === 0 senza key) non e' una
+        // voce di coda: senza filtro verrebbe ricaricato come riga e
+        // ri-prepeso a ogni save, duplicandosi e azzerando lo slot.
+        .filter(s => s && s.manual_focus !== true
+          && !(s.priority === 0 && !s.key))
+        .map(s => ({
+          key: s.key || null,
+          gid: s.gid ?? 0,
+          slot_id: (s.slot_id !== undefined && s.slot_id !== null && Number(s.slot_id) > 0) ? Number(s.slot_id) : null,
+          target: s.target_level ?? s.target ?? 0,
+          allow_duplicate_building: !!s.allow_duplicate_building,
+        }))
         .filter(s => s.key || s.gid);
       const focus = Array.isArray(cfg.building_focus) && cfg.building_focus.length
         ? cfg.building_focus[0] : null;
       appState.manualFocus = {
         enabled: !!(cfg.building_focus_enabled && focus),
         gid: focus ? (focus.gid ?? 17) : 17,
-        slot: focus ? (focus.slot ?? 0) : 0,
+        slot: focus ? (focus.slot ?? focus.slot_id ?? 0) : 0,
       };
       const fchk = document.getElementById('brain-focus-enabled');
       if (fchk) fchk.checked = appState.manualFocus.enabled;
@@ -2209,6 +2294,7 @@
     async function loadConfig() {
       const cfg = await window.TravianOpsAPI.fetchConfig(appState.activeAccount);
       appState.config = cfg || null;
+      renderCommandCenterLive();
       if (!cfg) {
         // Config non disponibile: svuota lo stato per non mostrare
         // quello dell'account precedente.
@@ -2352,8 +2438,9 @@
         `${st.trained || 0} / 3 Coloni`;
 
       const q = (v.building_queue || [])[0];
+      const qSec = q ? (q.seconds_remaining || 0) : 0;
       document.getElementById('villo-last-decision').textContent = q
-        ? `Coda: ${q.name} → lv.${q.target_level} (${fmtSecs(q.seconds_remaining)})`
+        ? `Coda: ${q.name} → lv.${q.target_level} ${qSec > 0 ? `(${fmtSecs(qSec)})` : '(In completamento)'}`
         : 'Coda libera · builder in attesa';
     }
 
@@ -2385,13 +2472,17 @@
         card.type = 'button';
         if (isFree) {
           card.onclick = () => {
-            appState.manualFocus.enabled = true;
-            appState.manualFocus.slot = item.slot;
-            document.getElementById('brain-focus-enabled').checked = true;
-            document.getElementById('brain-focus-pill').textContent = `Attivo su Slot #${item.slot}`;
-            renderDorf2Map();
-            notify(`Slot vuoto #${item.slot} selezionato per il Focus Manuale`, 'cyan');
-            saveMicroBrainConfig();
+            if (item.slot >= 19 && item.slot <= 38) {
+              openSlotModal(item.slot);
+            } else {
+              appState.manualFocus.enabled = true;
+              appState.manualFocus.slot = item.slot;
+              document.getElementById('brain-focus-enabled').checked = true;
+              document.getElementById('brain-focus-pill').textContent = `Attivo su Slot #${item.slot}`;
+              renderDorf2Map();
+              notify(`Slot vuoto #${item.slot} selezionato per il Focus Manuale`, 'cyan');
+              saveMicroBrainConfig();
+            }
           };
           card.className = isSelected
             ? 'p-2 rounded-xl bg-cyan-500/20 border border-cyan-400 text-left flex flex-col justify-between min-h-[54px]'
@@ -2401,7 +2492,7 @@
               <span class="text-emerald-400 font-bold">#${item.slot}</span>
               <span class="text-emerald-300">VUOTO</span>
             </div>
-            <div class="text-[10px] text-slate-400 truncate mt-1">${isSelected ? '★ Target' : '+ Libero'}</div>`;
+            <div class="text-[10px] text-slate-400 truncate mt-1">${isSelected ? '★ Target' : '+ Costruisci'}</div>`;
         } else {
           const name = GID_LABELS[item.gid] || `GID ${item.gid}`;
           card.onclick = () => notify(`Slot #${item.slot} occupato da ${name} lv.${item.level} [GID ${item.gid}]`, 'amber');
@@ -2489,12 +2580,38 @@
         } else {
           badge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400">In coda</span>`;
         }
+
+        const isResField = gids.length === 1 && [1, 2, 3, 4].includes(gids[0]);
+        let slotSelect = '';
+        if (!isResField) {
+          const slotOpts = [`<option value="0" ${!step.slot_id ? 'selected' : ''}>Slot: Auto</option>`];
+          for (let s = 19; s <= 38; s++) {
+            const occ = (appState.dorf2Slots || []).find(item => item.slot === s);
+            const isMatch = occ && occ.gid > 0 && gids.includes(occ.gid);
+            const isFree = !occ || occ.gid === 0;
+            const isSelected = Number(step.slot_id) === s;
+            if (isFree) {
+              slotOpts.push(`<option value="${s}" ${isSelected ? 'selected' : ''}>#${s} (Libero)</option>`);
+            } else if (isMatch) {
+              slotOpts.push(`<option value="${s}" ${isSelected ? 'selected' : ''}>#${s} (${GID_LABELS[occ.gid] || 'G' + occ.gid} lv.${occ.level})</option>`);
+            } else {
+              slotOpts.push(`<option value="${s}" disabled>#${s} (${GID_LABELS[occ.gid] || 'G' + occ.gid} lv.${occ.level}) [Occupato]</option>`);
+            }
+          }
+          slotSelect = `<select onchange="updateQueueStepSlot(${idx}, this.value)" class="bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-[9px] text-slate-300 max-w-[130px] truncate" title="Seleziona slot Dorf2">
+            ${slotOpts.join('')}
+          </select>`;
+        }
+
         const row = document.createElement('div');
         row.className = 'sub-card rounded-xl px-2.5 py-2 flex items-center justify-between gap-2 font-mono text-[11px]';
         row.innerHTML = `
-          <div class="min-w-0">
+          <div class="min-w-0 flex-1">
             <div class="text-slate-200 font-semibold truncate">${idx + 1}. ${esc(name)} <span class="text-cyan-400">[${esc(_stepTag(step))}]</span></div>
-            <div class="text-[10px] text-slate-400">lv.${curLvl} → Target lv.${step.target}</div>
+            <div class="text-[10px] text-slate-400 flex items-center gap-2 mt-0.5">
+              <span>lv.${curLvl} → Target lv.${step.target}</span>
+              ${slotSelect}
+            </div>
           </div>
           <div class="flex items-center gap-1 shrink-0">
             ${badge}
@@ -2504,6 +2621,109 @@
           </div>`;
         box.appendChild(row);
       });
+    }
+
+    function updateQueueStepSlot(idx, val) {
+      const step = appState.priorityQueue[idx];
+      if (!step) return;
+      const num = Number(val);
+      step.slot_id = num > 0 ? num : null;
+      renderPriorityQueue();
+      saveMicroBrainConfig();
+      notify(`Slot per ${_stepLabel(step)}: ${step.slot_id ? '#' + step.slot_id : 'Auto'}`, 'cyan');
+    }
+
+    let _activeModalSlot = null;
+
+    function openSlotModal(slotId) {
+      _activeModalSlot = slotId;
+      const modal = document.getElementById('slot-modal');
+      const title = document.getElementById('slot-modal-title');
+      const select = document.getElementById('slot-modal-key');
+      const reassignSec = document.getElementById('slot-modal-reassign-sec');
+      const reassignList = document.getElementById('slot-modal-reassign-list');
+      if (!modal) return;
+      
+      title.textContent = `Slot #${slotId} — Costruisci qui`;
+      
+      select.innerHTML = '';
+      const allowed = QUEUE_CATALOG.filter(c => c.group !== 'Campi Risorsa' && !['rally_point', 'city_wall'].includes(c.key));
+      allowed.forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c.key;
+        opt.textContent = `${c.label} [${c.group}]`;
+        select.appendChild(opt);
+      });
+
+      reassignList.innerHTML = '';
+      const lv0Items = [];
+      appState.priorityQueue.forEach((step, idx) => {
+        const curLvl = _stepCurrentLevel(step);
+        const gids = _stepGids(step);
+        const isRes = gids.length === 1 && [1, 2, 3, 4].includes(gids[0]);
+        if (!isRes && curLvl === 0) {
+          lv0Items.push({ step, idx });
+        }
+      });
+      if (lv0Items.length > 0) {
+        reassignSec.classList.remove('hidden');
+        lv0Items.forEach(({ step, idx }) => {
+          const row = document.createElement('div');
+          row.className = 'flex items-center justify-between gap-2 p-1.5 rounded bg-slate-950 border border-slate-800 text-[10px]';
+          row.innerHTML = `
+            <span class="truncate">${idx + 1}. ${_stepLabel(step)} (Target lv.${step.target}) ${step.slot_id ? '[#' + step.slot_id + ']' : '[Auto]'}</span>
+            <button onclick="reassignStepToSlot(${idx}, ${slotId})" class="px-2 py-0.5 rounded bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-300 border border-cyan-500/40 shrink-0">
+              Assegna a #${slotId}
+            </button>`;
+          reassignList.appendChild(row);
+        });
+      } else {
+        reassignSec.classList.add('hidden');
+      }
+
+      modal.classList.remove('hidden');
+    }
+
+    function closeSlotModal() {
+      const modal = document.getElementById('slot-modal');
+      if (modal) modal.classList.add('hidden');
+      _activeModalSlot = null;
+    }
+
+    function confirmSlotModalBuild() {
+      if (!_activeModalSlot) return;
+      const key = document.getElementById('slot-modal-key').value;
+      const target = Math.max(1, Math.min(20, Number(document.getElementById('slot-modal-target').value) || 10));
+      const step = { key, target, slot_id: _activeModalSlot };
+      appState.priorityQueue.push(step);
+      closeSlotModal();
+      renderPriorityQueue();
+      saveMicroBrainConfig();
+      notify(`Step aggiunto: ${_stepLabel(step)} lv.${target} su Slot #${_activeModalSlot}`, 'emerald');
+    }
+
+    function reassignStepToSlot(idx, slotId) {
+      const step = appState.priorityQueue[idx];
+      if (!step) return;
+      step.slot_id = slotId;
+      closeSlotModal();
+      renderPriorityQueue();
+      saveMicroBrainConfig();
+      notify(`Riassegnato ${_stepLabel(step)} allo Slot #${slotId}`, 'cyan');
+    }
+
+    function setManualFocusFromModal() {
+      if (!_activeModalSlot) return;
+      appState.manualFocus.enabled = true;
+      appState.manualFocus.slot = _activeModalSlot;
+      const chk = document.getElementById('brain-focus-enabled');
+      if (chk) chk.checked = true;
+      const pill = document.getElementById('brain-focus-pill');
+      if (pill) pill.textContent = `Attivo su Slot #${_activeModalSlot}`;
+      closeSlotModal();
+      renderDorf2Map();
+      notify(`Slot vuoto #${_activeModalSlot} impostato come Focus Manuale`, 'cyan');
+      saveMicroBrainConfig();
     }
 
     function moveQueueItem(idx, dir) {
@@ -3916,6 +4136,36 @@
     // =========================================================================
     // LIVE SYNC: snapshot -> appState -> renderers
     // =========================================================================
+    // Badge build agente/server: se i due hash divergono l'agente sta
+    // girando codice diverso dal command server (restart dimenticato).
+    function updateVersionBadge(agentV, serverV) {
+      const av = agentV || {};
+      const sv = serverV || {};
+      if (!av.build && !sv.build) return;
+      // Mismatch anche quando lo snapshot non porta agent_version
+      // affatto: l'agente gira una build pre-versioning (non riavviato).
+      const mismatch = !!(sv.build && (!av.build || av.build !== sv.build));
+      const text =
+        `Agent: ${av.build || 'n/d'} (${av.started_at || '—'})` +
+        ` · Server: ${sv.build || 'n/d'} (${sv.started_at || '—'})`;
+      const cls = mismatch
+        ? 'px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/50'
+        : 'px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-slate-700/40 text-slate-300 border border-slate-600';
+      const tip = mismatch
+        ? (!av.build
+            ? 'Snapshot senza agent_version: l\'agente non è stato riavviato dopo l\'ultima modifica. Riavvia l\'agente.'
+            : 'Processo agente non riavviato dopo l\'ultima modifica: il codice agente e quello del server divergono. Riavvia l\'agente.')
+        : `Agent avviato ${av.started_at || '—'} · Server avviato ${sv.started_at || '—'}`;
+      for (const id of ['header-version-badge', 'debug-version-badge']) {
+        const b = document.getElementById(id);
+        if (!b) continue;
+        b.textContent = text;
+        b.className = cls;
+        b.title = tip;
+        b.classList.remove('hidden');
+      }
+    }
+
     function applyLiveData(data) {
       if (!data || typeof data !== 'object') return;
       // Guard anti-leak: scarta snapshot di un account diverso da quello
@@ -3923,6 +4173,7 @@
       if (data.account_id && appState.activeAccount
         && data.account_id !== appState.activeAccount) return;
       appState.liveData = data;
+      updateVersionBadge(data.agent_version, data.server_version);
       if (data.account_id && !appState.activeAccount) appState.activeAccount = data.account_id;
       if (Array.isArray(data.villages) && data.villages.length) {
         appState.villages = data.villages;
@@ -3967,6 +4218,97 @@
       renderExpansion();
       renderHero();
       renderCommandCenterLive();
+      renderConstructionTimeline();
+    }
+
+    // =========================================================================
+    // SCALETTA COSTRUZIONI — timeline attiva + proiezione code
+    // =========================================================================
+    const TL_RES_LABELS = { wood: 'legno', clay: 'argilla', iron: 'ferro', crop: 'grano' };
+
+    function _tlTime(ts) {
+      if (!ts) return '—';
+      return new Date(ts * 1000).toTimeString().split(' ')[0].slice(0, 5);
+    }
+
+    function renderConstructionTimeline() {
+      const tbody = document.getElementById('build-timeline-body');
+      if (!tbody) return;
+      const v = activeVillage();
+      const tl = (v && v.projected_timeline) || null;
+      const meta = document.getElementById('build-timeline-meta');
+      const items = (tl && Array.isArray(tl.timeline)) ? tl.timeline : [];
+      if (meta) {
+        const bits = [];
+        if (tl && tl.server_speed) bits.push(`x${tl.server_speed}`);
+        if (tl && tl.main_building_level) bits.push(`Centro del Villaggio lv.${tl.main_building_level}`);
+        bits.push(tl && tl.parallel_build ? 'doppia coda' : 'coda singola');
+        meta.textContent = bits.join(' · ');
+      }
+      if (!items.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="py-2 px-2 text-slate-500">Nessuna costruzione attiva o pianificata</td></tr>';
+        return;
+      }
+      const nowSec = Date.now() / 1000;
+      tbody.innerHTML = items.map(it => {
+        const badge = it.queue === 'dorf1'
+          ? '<span class="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[10px]">DORF1</span>'
+          : '<span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[10px]">DORF2</span>';
+        const sysBadge = it.source === 'system'
+          ? ' <span class="px-1 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[9px]">SISTEMA</span>' : '';
+        const name = esc(it.name || `slot ${it.slot || '?'}`)
+          + (it.slot ? ` <span class="text-slate-500">#${it.slot}</span>` : '');
+        const isExpired = it.status === 'in_progress' && it.end_ts && it.end_ts <= nowSec;
+        const eta = (it.end_ts && !isExpired)
+          ? ` <span class="tl-eta text-slate-500" data-end="${it.end_ts}"></span>` : '';
+        let st;
+        if (isExpired) {
+          st = '<span class="text-amber-300 tl-status-text">In completamento (attesa sync)</span>';
+        } else if (it.status === 'in_progress') {
+          st = '<span class="text-cyan-300 tl-status-text">In corso</span>';
+        } else if (it.wait_reason === 'storage_cap_exceeded') {
+          st = '<span class="text-red-400">Cap. insufficiente</span>';
+        } else if (it.wait_reason === 'waiting_resources') {
+          const miss = it.missing
+            ? Object.keys(it.missing).map(r => TL_RES_LABELS[r] || r).join(', ') : '';
+          st = `<span class="text-amber-300">Attesa risorse${miss ? ` (${esc(miss)})` : ''}</span>`;
+        } else {
+          st = '<span class="text-emerald-300">Pronto</span>';
+        }
+        return `<tr class="border-b border-slate-900/60 last:border-0">
+          <td class="py-1.5 px-2 whitespace-nowrap">${badge}</td>
+          <td class="py-1.5 px-2 text-slate-200">${name}${sysBadge}</td>
+          <td class="py-1.5 px-2 text-slate-300 whitespace-nowrap">${it.from_level}&rarr;${it.to_level}</td>
+          <td class="py-1.5 px-2 text-slate-400">${_tlTime(it.start_ts)}</td>
+          <td class="py-1.5 px-2 text-slate-400 whitespace-nowrap">${_tlTime(it.end_ts)}${eta}</td>
+          <td class="py-1.5 px-2 text-slate-400">${it.duration_s ? fmtSecs(it.duration_s) : '—'}</td>
+          <td class="py-1.5 px-2 whitespace-nowrap">${st}</td>
+        </tr>`;
+      }).join('');
+      updateTimelineEtas();
+    }
+
+    // Countdown live: decrementa gli ETA (-mm:ss) a ogni tick da 1s
+    // senza ri-renderizzare la tabella.
+    function updateTimelineEtas() {
+      const now = Date.now() / 1000;
+      document.querySelectorAll('.tl-eta[data-end]').forEach(el => {
+        const end = parseFloat(el.dataset.end || '0');
+        const rem = end - now;
+        if (rem <= 0) {
+          el.textContent = '';
+          const row = el.closest('tr');
+          if (row) {
+            const stEl = row.querySelector('.tl-status-text');
+            if (stEl && stEl.textContent.includes('In corso')) {
+              stEl.className = 'text-amber-300 tl-status-text';
+              stEl.textContent = 'In completamento (attesa sync)';
+            }
+          }
+        } else {
+          el.textContent = ` (-${fmtSecs(rem)})`;
+        }
+      });
     }
 
     // =========================================================================
@@ -3989,6 +4331,10 @@
         ]);
         const workers = (workRes && workRes.workers) || [];
         appState.workers = workers;
+        // Il pannello Account dipende da appState.workers/config:
+        // ri-renderizzalo subito — non aspettare un nuovo snapshot
+        // (in embedded applyLiveData e' deduplicato per riferimento).
+        renderCommandCenterLive();
         const accounts = (accRes && accRes.accounts) || [];
         const accInfo = {};
         accounts.forEach(a => { accInfo[a.account_id] = a; });
@@ -4127,8 +4473,20 @@
           statusEl.className = 'px-2 py-0.5 rounded text-[10px] bg-slate-700/40 text-slate-300';
         }
       }
-      const cpCur = acc.cp_current || 0, cpReq = acc.cp_required || 0;
-      setTxt('cc-acc-cp-label', cpReq ? `${fmtNum(cpCur)} / ${fmtNum(cpReq)} PC` : '—');
+      const cpCur = acc.cp_current || 0, cpReq = acc.cp_required || 0,
+            cpDay = acc.cp_daily_production || 0,
+            cpSlU = acc.cp_slots_used, cpSlT = acc.cp_slots_total,
+            cpNext = acc.cp_next_slot || '';
+      const cpSlotTxt = (cpSlU != null && cpSlT != null)
+        ? ` · Slot ${cpSlU}/${cpSlT}` : '';
+      setTxt('cc-acc-cp-label',
+        cpReq ? `${fmtNum(cpCur)} / ${fmtNum(cpReq)} PC`
+              : (cpCur ? `${fmtNum(cpCur)} PC`
+                : (cpDay ? `${fmtNum(cpDay)} PC/g${cpSlotTxt}` : '—')));
+      const cpLblEl = document.getElementById('cc-acc-cp-label');
+      if (cpLblEl) cpLblEl.title = cpNext
+        ? `Prossimo slot insediamento: ${cpNext}`
+        : (cpDay ? 'Produzione punti cultura giornaliera' : '');
       const cpBar = document.getElementById('cc-acc-cp-bar');
       if (cpBar) cpBar.style.width = (cpReq ? Math.min(100, Math.round(cpCur / cpReq * 100)) : 0) + '%';
 
@@ -4258,6 +4616,9 @@
       else if (!EMBEDDED && !data) setConnBadge('off');
       refreshWorkerPanel();
       renderCommandCenterOps();
+      // Retry config se il fetch iniziale e' fallito: senza di essa il
+      // pannello Account resta su '—'/'Missing' per tutta la sessione.
+      if (!appState.config) loadConfig();
     }
 
     // =========================================================================
@@ -4298,6 +4659,7 @@
           document.getElementById('villo-crop').textContent = fmtNum(r.crop);
         }
       }
+      updateTimelineEtas();
     }, 1000);
 
     // =========================================================================
@@ -4323,6 +4685,7 @@
       refreshWorkerPanel();
       loadConfig();
       renderAccountTable();
+      renderConstructionTimeline();
       // Ripristina la vista aperta prima di un eventuale reload dell'iframe.
       let savedView = null;
       try { savedView = localStorage.getItem('t_ops.view'); } catch (_) {}

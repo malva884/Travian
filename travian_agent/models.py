@@ -220,6 +220,7 @@ class BuildQueueItem:
     remaining_seconds: int = 0
     is_resource_field: bool = False
     slot_id: int = 0  # slot dorf1/dorf2 da build.php?id=N, 0 = non letto
+    gid: int = 0  # gid dell'edificio in coda (1-4 campi, >=5 dorf2), 0 = non letto
 
 
 @dataclass
@@ -412,3 +413,79 @@ class ActionResult:
     # Dati strutturati opzionali (es. anti-ghost raid: coordinate per
     # cui il browser ha confermato visivamente l'invio truppe).
     data: dict = field(default_factory=dict)
+
+
+@dataclass
+class PriorityQueueItem:
+    """Elemento della Coda Prioritaria Edifici."""
+
+    gid: int = 0
+    key: str = ""
+    slot_id: int | None = None
+    target_level: int = 0
+    priority: int = 1
+    allow_duplicate_building: bool = False
+    id: str = ""
+    status: str = "PENDING"  # PENDING, IN_PROGRESS, COMPLETED, INVALID_SLOT_OCCUPIED, NO_FREE_SLOTS
+
+    @classmethod
+    def from_dict(cls, data: dict | "PriorityQueueItem" | str) -> "PriorityQueueItem":
+        if isinstance(data, PriorityQueueItem):
+            return data
+        if not isinstance(data, dict):
+            return cls(key=str(data))
+        raw_slot = data.get("slot_id") if "slot_id" in data else data.get("slot")
+        slot_id = None
+        if raw_slot is not None:
+            try:
+                slot_id = int(raw_slot)
+                if slot_id <= 0:
+                    slot_id = None
+            except (ValueError, TypeError):
+                slot_id = None
+        raw_target = (
+            data.get("target_level")
+            if "target_level" in data
+            else data.get("target")
+        )
+        target_level = 0
+        if raw_target is not None:
+            try:
+                target_level = max(0, int(raw_target))
+            except (ValueError, TypeError):
+                target_level = 0
+        raw_prio = data.get("priority", 1)
+        try:
+            priority = int(raw_prio or 1)
+        except (ValueError, TypeError):
+            priority = 1
+        raw_gid = data.get("gid", 0)
+        try:
+            gid = int(raw_gid or 0)
+        except (ValueError, TypeError):
+            gid = 0
+        return cls(
+            gid=gid,
+            key=str(data.get("key", "") or ""),
+            slot_id=slot_id,
+            target_level=target_level,
+            priority=priority,
+            allow_duplicate_building=bool(
+                data.get("allow_duplicate_building", False)
+            ),
+            id=str(data.get("id", "") or ""),
+            status=str(data.get("status", "PENDING") or "PENDING"),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "gid": self.gid,
+            "key": self.key,
+            "slot_id": self.slot_id,
+            "target_level": self.target_level,
+            "priority": self.priority,
+            "allow_duplicate_building": self.allow_duplicate_building,
+            "status": self.status,
+        }
+

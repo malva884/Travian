@@ -39,6 +39,7 @@ from .telemetry import (
     latest_telemetry_path,
     telemetry_path,
 )
+from .version import get_agent_version
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,7 @@ def _account_config(acc) -> dict:
         "server_url": acc.server_url,
         "username": acc.username,
         "tribe": acc.tribe,
+        "server_speed": float(getattr(acc, "server_speed", 1.0) or 1.0),
         "headless": acc.headless,
         "strategy_profile": acc.strategy_profile,
         "loop_interval_min": acc.loop_interval_min,
@@ -852,11 +854,24 @@ def _state_from_snapshot(snap: dict, village_name: str = ""):
         )
 
     for q in target.get("building_queue") or []:
+        q_slot = int(q.get("slot_id") or q.get("slot") or 0)
+        q_gid = int(q.get("gid") or 0)
+        q_outer = q.get("is_resource_field")
+        if q_outer is None:
+            # Snapshot vecchi senza il flag: binario da gid/slot,
+            # mai dalla posizione nell'array.
+            if q_gid > 0:
+                q_outer = q_gid <= 4
+            else:
+                q_outer = 1 <= q_slot <= 18
         state.build_queue.append(
             BuildQueueItem(
                 name=str(q.get("name") or ""),
                 level=int(q.get("target_level") or 0),
                 remaining_seconds=int(q.get("seconds_remaining") or 0),
+                is_resource_field=bool(q_outer),
+                slot_id=q_slot,
+                gid=q_gid,
             )
         )
 
@@ -956,6 +971,7 @@ def _handle_debug_simulate(body: dict) -> tuple[dict, int]:
             "account_id": account_id,
             "village": state.village_name,
             "simulated": True,
+            "server_version": get_agent_version(),
             "action": {
                 "type": action.type.value,
                 "reason": action.reason,
@@ -1102,6 +1118,7 @@ class _CommandCenterHandler(BaseHTTPRequestHandler):
                     status=status,
                 )
             else:
+                payload["server_version"] = get_agent_version()
                 self._send_json(payload)
             return
         if route in ("", "/", "/command-center"):

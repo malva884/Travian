@@ -305,6 +305,10 @@ class Settings:
     # Tribu' dell'account: 'romans'|'teutons'|'gauls' (vuoto = auto,
     # rilevata a runtime dalle icone unita'/truppe a casa).
     tribe: str = ""
+    # Velocita' del server di gioco (1.0 = x1, 3.0 = x3): divisore dei
+    # tempi di costruzione stimati nella proiezione "Scaletta
+    # Costruzioni" della dashboard.
+    server_speed: float = 1.0
     # Profili per-villaggio: chiave = newdid o nome -> VillageConfig
     villages: dict[str, "VillageConfig"] = field(default_factory=dict)
     # DEPRECATO: mappa nome_villaggio -> ruolo, mantenuta per back-compat.
@@ -394,6 +398,7 @@ def _parse_account_item(item: dict) -> Settings:
                             min_net_crop_threshold=float(item.get("min_net_crop_threshold", 10.0)),
                             strategy_profile=str(item.get("strategy_profile", "balanced")),
                             tribe=str(item.get("tribe", "") or "").strip().lower(),
+                            server_speed=float(item.get("server_speed", 1.0)),
                             farming=FarmingConfig(
                                 **{
                                     k: v
@@ -607,6 +612,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
             "min_net_crop_threshold": acc.min_net_crop_threshold,
             "strategy_profile": acc.strategy_profile,
             "tribe": acc.tribe,
+            "server_speed": acc.server_speed,
             "farming_settings": {
                 "enabled": acc.farming.enabled,
                 "interval_min_minutes": acc.farming.interval_min_minutes,

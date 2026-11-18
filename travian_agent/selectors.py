@@ -451,8 +451,11 @@ INCOMING_ATTACK_ROWS: list[str] = [
     "img.att1",
 ]
 
-# Pagina costruzione (build.php?id=N)
+# Pagina costruzione (/slot?id=N nuova UI, build.php?id=N vecchia UI)
 UPGRADE_BUTTON: list[str] = [
+    ".upgradeButtonsContainer .section1 button.textButtonV1.green.build",
+    "#contract button.green.build",
+    "button.textButtonV1.green.build",
     ".section1 button.green.build",
     "button.green.build",
     "button.green.upgrade",

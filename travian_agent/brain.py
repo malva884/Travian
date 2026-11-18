@@ -121,15 +121,8 @@ def _field_upgrade_deficit(state: GameState, f: Field) -> str:
 def _queue_free(state: GameState, settings: Settings, resource_field: bool) -> bool:
     """True se la coda pertinente (campi o interni) puo' accettare un upgrade."""
     if builder.parallel_build_enabled(settings):
-        if resource_field:
-            return (
-                len(state.resource_queue()) < settings.max_resource_queue
-                and len(state.build_queue) < settings.max_build_queue
-            )
-        return (
-            len(state.interior_queue()) < settings.max_interior_queue
-            and len(state.build_queue) < settings.max_build_queue
-        )
+        can_out, can_in = builder.queue_slots_free(state, settings)
+        return can_out if resource_field else can_in
     return not state.build_queue
 
 
@@ -304,10 +297,8 @@ def rule_upgrade_storage(state: GameState, settings: Settings) -> Action | None:
     in corso ma nessun edificio interno, lo storage puo' essere avviato.
     """
     if builder.parallel_build_enabled(settings):
-        if (
-            len(state.interior_queue()) >= settings.max_interior_queue
-            or len(state.build_queue) >= settings.max_build_queue
-        ):
+        _can_out, can_in = builder.queue_slots_free(state, settings)
+        if not can_in:
             return None
     elif state.build_queue:
         return None

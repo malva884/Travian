@@ -80,6 +80,11 @@ CELEBRATION_COOLDOWN_SECONDS = 6.0 * 3600.0
 # il cooldown pieno di 3h si applica solo a scansioni andate a buon fine.
 MAP_SCAN_RETRY_SECONDS = 600.0
 
+# Snapshot Punti Cultura per la dashboard: cooldown tra letture
+# (valore quasi statico — niente navigazioni extra a ogni ciclo).
+CP_SNAPSHOT_SECONDS = 1800.0
+CP_SNAPSHOT_RETRY = 900.0
+
 # Livello minimo Residenza/Palazzo per addestrare i 3 coloni.
 SETTLER_RESIDENCE_MIN_LEVEL = 10
 # Ruoli che non possono MAI ospitare la base di fondazione: un hammer
@@ -273,7 +278,11 @@ class ExpansionManager:
     cp_current: int = 0
     cp_required: int = 0
     cp_daily: int = 0
+    cp_slots_used: int = 0
+    cp_slots_total: int = 0
+    cp_next_slot: str = ""          # ETA testuale prossimo slot (nuova UI)
     next_celebration_attempt: float = 0.0
+    next_cp_read: float = 0.0        # cooldown snapshot CP dashboard
     # Buffer Decision Audit Log: eventi decisionali del ciclo in corso,
     # svuotato dall'orchestrator via drain_audit() (non persistito).
     _audit: list[dict] = field(default_factory=list)
@@ -332,9 +341,13 @@ class ExpansionManager:
                 self.cp_current = int(data.get("cp_current") or 0)
                 self.cp_required = int(data.get("cp_required") or 0)
                 self.cp_daily = int(data.get("cp_daily") or 0)
+                self.cp_slots_used = int(data.get("cp_slots_used") or 0)
+                self.cp_slots_total = int(data.get("cp_slots_total") or 0)
+                self.cp_next_slot = str(data.get("cp_next_slot") or "")
                 self.next_celebration_attempt = float(
                     data.get("next_celebration_attempt") or 0.0
                 )
+                self.next_cp_read = float(data.get("next_cp_read") or 0.0)
         except Exception:
             pass
 
@@ -350,7 +363,11 @@ class ExpansionManager:
                     "cp_current": self.cp_current,
                     "cp_required": self.cp_required,
                     "cp_daily": self.cp_daily,
+                    "cp_slots_used": self.cp_slots_used,
+                    "cp_slots_total": self.cp_slots_total,
+                    "cp_next_slot": self.cp_next_slot,
                     "next_celebration_attempt": self.next_celebration_attempt,
+                    "next_cp_read": self.next_cp_read,
                 },
                 indent=2,
             )
@@ -698,6 +715,48 @@ class ExpansionManager:
             )
             self._save()
 
+        # 0.1 Snapshot Punti Cultura per la dashboard: gira anche con
+        # auto_expand disattivo — la barra 'Punti Cultura' e il CP
+        # Booster si nutrono di questo valore. Con Residenza/Palazzo
+        # legge la tab CP; senza ricade sulle pagine profilo/panoramica.
+        if now >= self.next_cp_read:
+            cp_village = cp_res = None
+            for v in villages:
+                res = find_residence(
+                    interior_map.get(v.name or str(v.village_id), [])
+                )
+                if res is not None:
+                    cp_village, cp_res = v, res
+                    break
+            if cp_res is not None and cp_village is not None:
+                cp_have, cp_need, cp_daily = (
+                    await observer.read_culture_points(
+                        cp_res.slot_id, cp_village.village_id
+                    )
+                )
+            else:
+                overview = getattr(
+                    observer, "read_culture_points_overview", None
+                )
+                cp_have = cp_need = cp_daily = 0
+                if overview is not None:
+                    cp_have, cp_need, cp_daily = await overview()
+            if cp_have or cp_need or cp_daily:
+                self.cp_current = cp_have
+                self.cp_required = cp_need
+                self.cp_daily = cp_daily
+                extra = getattr(observer, "cp_extra", None) or {}
+                self.cp_slots_used = int(extra.get("slots_used") or 0)
+                self.cp_slots_total = int(extra.get("slots_total") or 0)
+                self.cp_next_slot = str(extra.get("next_slot") or "")
+                save_culture_points(
+                    self.account_id, cp_have, cp_need, cp_daily
+                )
+                self.next_cp_read = now + CP_SNAPSHOT_SECONDS
+            else:
+                self.next_cp_read = now + CP_SNAPSHOT_RETRY
+            self._save()
+
         if not cfg.auto_expand:
             return
         has_approved = bool(store.approved_targets(self.account_id))
@@ -727,15 +786,29 @@ class ExpansionManager:
             return
 
         # 1. Punti cultura (spec CP Booster: snapshot persistito per
-        #    il booster del builder e la barra di progresso dashboard)
-        cp_have, cp_need, cp_daily = await observer.read_culture_points(
-            residence.slot_id, founder.village_id
-        )
+        #    il booster del builder e la barra di progresso dashboard).
+        #    Se il blocco 0.1 ha gia' letto un valore fresco lo
+        #    riutilizza invece di navigare di nuovo sulla Residenza.
+        if now < self.next_cp_read and (
+            self.cp_current or self.cp_required or self.cp_daily
+        ):
+            cp_have = self.cp_current
+            cp_need = self.cp_required
+            cp_daily = self.cp_daily
+        else:
+            cp_have, cp_need, cp_daily = await observer.read_culture_points(
+                residence.slot_id, founder.village_id
+            )
         if cp_have or cp_need or cp_daily:
             self.cp_current, self.cp_required, self.cp_daily = (
                 cp_have, cp_need, cp_daily
             )
+            extra = getattr(observer, "cp_extra", None) or {}
+            self.cp_slots_used = int(extra.get("slots_used") or 0)
+            self.cp_slots_total = int(extra.get("slots_total") or 0)
+            self.cp_next_slot = str(extra.get("next_slot") or "")
             save_culture_points(self.account_id, cp_have, cp_need, cp_daily)
+            self.next_cp_read = now + CP_SNAPSHOT_SECONDS
             self._save()
         if cp_need > 0 and cp_have < cp_need + cfg.min_culture_margin:
             logger.info(

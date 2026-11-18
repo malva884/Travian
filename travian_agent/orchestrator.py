@@ -33,6 +33,7 @@ from .builder import (
     save_build_plan,
 )
 from .building_prereqs import (
+    FIELD_GID_TYPES,
     GID_CRANNY,
     GID_MAIN_BUILDING,
     GID_SMITHY,
@@ -115,11 +116,12 @@ _hero_managers: dict[str, HeroManager] = {}
 _defense_managers: dict[str, DefenseManager] = {}
 _replenish_managers: dict[str, TroopReplenishmentManager] = {}
 _war_stores: dict[str, WarStore] = {}
-# Cache dei 18 campi dorf1 per villaggio (chiave account:newdid):
-# mantiene state.fields completo anche nei cicli in cui l'agente
-# visita solo dorf2.php o la lettura dorf1 torna vuota, cosi'
-# fields_count=18 non blocca Coda Prioritaria e weakest_field.
-_last_dorf1_fields: dict[str, list[Field]] = {}
+# Ultimi 18 campi dorf1 noti per villaggio (chiave account:newdid):
+# persistono per tutta la vita del processo, cosi' state.fields resta
+# completo anche nei cicli in cui l'agente visita solo dorf2.php o la
+# lettura dorf1 torna vuota (fields_count=18 non blocca Coda
+# Prioritaria e rule_upgrade_weakest_field).
+_last_known_fields: dict[str, list[Field]] = {}
 # Throttle del ciclo Fucina auto (villaggio -> ts ultimo tentativo).
 _last_smithy_try: dict[str, float] = {}
 SMITHY_RETRY_SECONDS = 1800.0  # un tentativo ogni ~30 min per villaggio
@@ -175,6 +177,68 @@ def _record_module_paused(
             f"riprovo tra {int(remaining)}s"
         ),
     )
+
+
+def _snapshot_dorf1_fields(
+    settings: Settings, village: Village
+) -> list[Field]:
+    """Ricostruisce i 18 campi dorf1 dall'ultimo snapshot su disco.
+
+    Seed di ``_last_known_fields`` al riavvio del processo: la cache
+    in-memory riparte vuota, ma ``dashboard_state_<acc>.json`` conserva
+    i campi dell'ultimo ciclo valido (chiave "fields", slot 1-18) —
+    stessa convenzione di ``command_server._state_from_snapshot``.
+    """
+    try:
+        raw = json.loads(
+            telemetry.telemetry_path(settings.account_id).read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError):
+        return []
+    rows = raw.get("villages") or []
+    if not isinstance(rows, list):
+        return []
+    vid = str(village.village_id or "")
+    vname = str(village.name or "")
+    target = next(
+        (
+            v for v in rows
+            if isinstance(v, dict)
+            and (
+                (vid and str(v.get("id") or "") == vid)
+                or (vname and str(v.get("name") or "") == vname)
+            )
+        ),
+        None,
+    )
+    if target is None:
+        return []
+    out: list[Field] = []
+    for row in target.get("fields") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            slot_id = int(row.get("slot") or row.get("slot_id") or 0)
+            gid = int(
+                row.get("gid") if row.get("gid") is not None else -1
+            )
+            level = int(row.get("level") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= slot_id <= 18:
+            continue
+        out.append(
+            Field(
+                slot_id=slot_id,
+                name=str(row.get("name") or ""),
+                level=level,
+                resource_type=FIELD_GID_TYPES.get(gid),
+                gid=gid,
+            )
+        )
+    return out
 
 
 def _persist_village_coords(
@@ -1847,24 +1911,39 @@ async def monitor_all_villages(
             state.fields = await observer.read_fields()
             state.build_queue = await observer.read_build_queue()
 
-            # Cache campi dorf1: se il ciclo ha visitato solo dorf2 o la
-            # lettura dei 18 campi e' tornata vuota, ripristina l'ultima
-            # lettura valida invece di propagare fields_count=0 a brain
-            # e telemetry (bloccherebbe Coda Prioritaria e weakest_field).
+            # Cache persistente dei campi dorf1 per village_id: ogni
+            # lettura non vuota aggiorna l'ultimo stato noto; se il ciclo
+            # ha visitato solo dorf2 (o la lettura e' tornata vuota) i
+            # 18 campi vengono ripopolati da _last_known_fields — con
+            # seed dall'ultimo dashboard_state_<acc>.json su disco al
+            # primo accesso dopo un riavvio — prima di brain.decide() e
+            # della telemetria, cosi' fields_count non torna mai a 0
+            # dopo un'azione su dorf2.php.
             _fkey = (
                 f"{settings.account_id}:"
                 f"{village.village_id or village.name or '0'}"
             )
             _res_fields = [f for f in state.fields if f.is_resource_field]
             if _res_fields:
-                _last_dorf1_fields[_fkey] = _res_fields
-            elif _fkey in _last_dorf1_fields:
-                state.fields = list(_last_dorf1_fields[_fkey])
-                logger.debug(
-                    "%s Campi dorf1 da cache (%d): lettura corrente vuota.",
-                    vprefix,
-                    len(state.fields),
-                )
+                _last_known_fields[_fkey] = _res_fields
+            else:
+                if _fkey not in _last_known_fields:
+                    _seed = _snapshot_dorf1_fields(settings, village)
+                    if _seed:
+                        _last_known_fields[_fkey] = _seed
+                        logger.debug(
+                            "%s Campi dorf1 seedati da snapshot (%d).",
+                            vprefix,
+                            len(_seed),
+                        )
+                if _fkey in _last_known_fields:
+                    state.fields = list(_last_known_fields.get(_fkey, []))
+                    logger.debug(
+                        "%s Campi dorf1 ripopolati da stato noto (%d): "
+                        "lettura corrente vuota.",
+                        vprefix,
+                        len(state.fields),
+                    )
 
             # Edifici interni del dorf2 (slot 19-40): fusi in state.fields
             interior = await observer.read_interior_fields()
@@ -2386,6 +2465,16 @@ async def monitor_all_villages(
                             is_resource_field=_done_slot <= 18,
                         )
                     )
+                    # Upgrade dorf1 avviato: il livello dello slot nello
+                    # stato noto sale subito, cosi' la cache resta
+                    # coerente anche se il prossimo ciclo non rilegge
+                    # dorf1 (gli oggetti Field sono condivisi con
+                    # state.fields).
+                    if _done_slot <= 18:
+                        for _cf in _last_known_fields.get(_fkey, []):
+                            if _cf.slot_id == _done_slot:
+                                _cf.level += 1
+                                break
                 _can_out, _can_in = queue_slots_free(state, settings)
                 if _can_out or _can_in:
                     action2 = brain.decide(state)

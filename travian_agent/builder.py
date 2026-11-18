@@ -58,8 +58,10 @@ from .models import (
     GID_STABLE,
     GID_WAREHOUSE,
     GID_WORKSHOP,
+    BuildQueueItem,
     Field,
     GameState,
+    PriorityQueueItem,
     ResourceType,
 )
 
@@ -207,32 +209,50 @@ def parallel_build_enabled(settings: Settings) -> bool:
     )
 
 
+def _queue_item_is_outer(item: BuildQueueItem) -> bool:
+    """True se l'item in coda occupa il binario campi (dorf1).
+
+    Fonte autorevole: il gid estratto dal parser (1-4 = campi risorsa,
+    >=5 = edifici dorf2). Senza gid si ripiega sul flag
+    ``is_resource_field``. Mai dedurre il binario dalla posizione
+    dell'item nell'array (items[0]/items[1]).
+    """
+    gid = int(getattr(item, "gid", 0) or 0)
+    if gid > 0:
+        return gid <= 4
+    return bool(getattr(item, "is_resource_field", False))
+
+
 def queue_slots_free(
     state: GameState, settings: Settings
 ) -> tuple[bool, bool]:
     """(can_build_outer, can_build_inner): slot coda liberi per vista.
 
     Con costruzione parallela (tribu' romana / Plus,
-    ``allow_parallel_build``) dorf1 (slot 1-18) e dorf2 (slot 19-40)
-    hanno code indipendenti con i propri limiti
-    (``max_resource_queue``/``max_interior_queue`` + tetto
-    ``max_build_queue``). Senza parallelismo condividono un unico slot
-    coda: entrambi i flag dipendono dalla sola coda totale.
+    ``allow_parallel_build``) i due binari dorf1/dorf2 condividono il
+    tetto ``max_parallel`` (3 con Plus — flag ``allow_parallel_build`` —
+    2 altrimenti, perk razziale romano). I conteggi outer/inner si
+    calcolano sul gid degli item in coda, non sulla loro posizione:
+    con un campo in coda (outer_count=1, inner_count=0, total=1)
+    ``inner_free`` resta True e la Coda Prioritaria dorf2 parte.
+    Senza parallelismo condividono un unico slot coda.
     """
     total = len(state.build_queue)
     max_q = max(1, int(getattr(settings, "max_build_queue", 1) or 1))
     if parallel_build_enabled(settings):
-        outer = (
-            len(state.resource_queue())
-            < max(1, int(getattr(settings, "max_resource_queue", 1) or 1))
-            and total < max_q
+        has_plus = bool(getattr(settings, "allow_parallel_build", False))
+        max_parallel = 3 if has_plus else 2
+        outer_count = sum(
+            1 for q in state.build_queue if _queue_item_is_outer(q)
         )
-        inner = (
-            len(state.interior_queue())
-            < max(1, int(getattr(settings, "max_interior_queue", 1) or 1))
-            and total < max_q
+        inner_count = total - outer_count
+        outer_free = (
+            total < max_parallel and outer_count < max_parallel
         )
-        return outer, inner
+        inner_free = (
+            total < max_parallel and inner_count < max_parallel
+        )
+        return outer_free, inner_free
     free = total < max_q
     return free, free
 
@@ -407,10 +427,10 @@ def new_building_intents(
 
 
 def construct_gids(state: GameState, fields: list[Field]) -> dict[int, int]:
-    """Mappa slot_id -> gid per i candidati che sono nuove costruzioni.
+    """Mappa slot_id -> gid per i candidati che sono nuove costruzioni (level 0).
 
-    Riconosce i pseudo-field di `new_building_intents`: gid>0 su uno
-    slot che nel dorf2 reale e' ancora vuoto (gid 0).
+    Riconosce i pseudo-field di nuove costruzioni su slot_id dove l'edificio
+    non esiste ancora o ha level 0.
     """
     real = {f.slot_id: f for f in state.interior_fields()}
     return {
@@ -418,8 +438,10 @@ def construct_gids(state: GameState, fields: list[Field]) -> dict[int, int]:
         for f in fields
         if not f.is_resource_field
         and f.gid > 0
-        and real.get(f.slot_id) is not None
-        and real[f.slot_id].is_empty_site
+        and (
+            f.level == 0
+            or (real.get(f.slot_id) is not None and real[f.slot_id].is_empty_site)
+        )
     }
 
 
@@ -495,6 +517,221 @@ def _focus_steps(focus_list: list) -> list[tuple[tuple[int, ...], int]]:
     return steps
 
 
+BUILD_SLOTS_DORF2: list[int] = list(range(19, 39))  # 19..38 inclusi
+MULTI_INSTANCE_GIDS: set[int] = {GID_WAREHOUSE, GID_GRANARY, GID_CRANNY, 36, 38, 39}
+
+
+def building_category(gid: int) -> int:
+    """Categoria tab su build.php per la costruzione iniziale di un edificio.
+    1 = Infrastrutture
+    2 = Militari
+    3 = Risorse
+    """
+    if gid in (13, 14, 16, 19, 20, 21, 22, 29, 30, 31, 32, 33, 35, 36, 41):
+        return 2  # Militari
+    if gid in (5, 6, 7, 8, 9, 42):
+        return 3  # Risorse
+    return 1  # Infrastrutture
+
+
+def _focus_items(focus_list: list) -> list[PriorityQueueItem]:
+    """Normalizza building_queue_plan in lista di PriorityQueueItem ordinata per priorita'."""
+    indexed: list[tuple[int, PriorityQueueItem]] = []
+    for pos, item in enumerate(focus_list or []):
+        it = (
+            PriorityQueueItem.from_dict(item)
+            if not isinstance(item, PriorityQueueItem)
+            else item
+        )
+        prio = pos
+        if it.priority:
+            prio = it.priority - 1
+        indexed.append((prio, it))
+    indexed.sort(key=lambda t: t[0])
+    return [it for _prio, it in indexed]
+
+
+def resolve_target_slot(
+    item: PriorityQueueItem | dict,
+    state_or_snapshot: GameState | dict,
+    reserved_slots: set[int] | None = None,
+) -> tuple[int | None, int, str]:
+    """Risoluzione deterministica dello slot per un item della Coda Prioritaria.
+
+    Ritorna: (slot_id, current_level, status)
+    status: 'OK', 'INVALID_SLOT_OCCUPIED', 'TARGET_REACHED', 'NO_FREE_SLOTS', 'INVALID_ITEM'
+    """
+    item_obj = (
+        PriorityQueueItem.from_dict(item)
+        if not isinstance(item, PriorityQueueItem)
+        else item
+    )
+    reserved = reserved_slots if reserved_slots is not None else set()
+
+    # Estrai gids dallo step (key o gid diretto)
+    if item_obj.gid > 0:
+        gids = (item_obj.gid,)
+    elif item_obj.key:
+        gids = tuple(gids_for_focus_key(item_obj.key))
+    else:
+        return None, 0, "INVALID_ITEM"
+
+    if not gids:
+        return None, 0, "INVALID_ITEM"
+
+    # Campi risorsa dorf1 (slot 1-18)
+    if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
+        rtype = FIELD_GID_TYPES[gids[0]]
+        if isinstance(state_or_snapshot, GameState):
+            res_fields = [
+                f for f in state_or_snapshot.resource_fields()
+                if f.resource_type is rtype
+            ]
+        else:
+            slots = (
+                state_or_snapshot.get("slots")
+                or state_or_snapshot.get("fields")
+                or []
+            )
+            res_fields = [
+                Field(
+                    slot_id=s["slot"],
+                    level=s.get("level", 0),
+                    resource_type=rtype,
+                )
+                for s in slots
+                if 1 <= s.get("slot", 0) <= 18 and s.get("gid") == gids[0]
+            ]
+        if item_obj.slot_id is not None and 1 <= item_obj.slot_id <= 18:
+            f = next((x for x in res_fields if x.slot_id == item_obj.slot_id), None)
+            if f is not None:
+                if item_obj.target_level > 0 and f.level >= item_obj.target_level:
+                    return f.slot_id, f.level, "TARGET_REACHED"
+                if f.slot_id in reserved:
+                    return None, f.level, "INVALID_SLOT_OCCUPIED"
+                reserved.add(f.slot_id)
+                return f.slot_id, f.level, "OK"
+            return None, 0, "INVALID_SLOT_OCCUPIED"
+
+        # Auto dorf1: campo piu' basso non al target e non riservato
+        cands = [
+            f for f in res_fields
+            if f.slot_id not in reserved
+            and (item_obj.target_level <= 0 or f.level < item_obj.target_level)
+        ]
+        if not cands:
+            return None, 0, "TARGET_REACHED"
+        best = min(cands, key=lambda x: (x.level, x.slot_id))
+        reserved.add(best.slot_id)
+        return best.slot_id, best.level, "OK"
+
+    # Edifici dorf2 (slot 19-40)
+    if isinstance(state_or_snapshot, GameState):
+        interiors = state_or_snapshot.interior_fields()
+        queued = queued_slot_ids(state_or_snapshot)
+    else:
+        slots = state_or_snapshot.get("slots") or []
+        interiors = [
+            Field(
+                slot_id=s["slot"],
+                gid=s.get("gid", 0),
+                level=s.get("level", 0),
+                name=s.get("name", ""),
+            )
+            for s in slots
+            if s.get("slot", 0) >= 19
+        ]
+        queued = {
+            q.get("slot_id")
+            for q in state_or_snapshot.get("building_queue", [])
+            if q.get("slot_id")
+        }
+
+    # Slot fissi speciali: Punto di Raduno (39) e Mura (40)
+    if any(g == GID_RALLY_POINT for g in gids):
+        f39 = next((f for f in interiors if f.slot_id == 39), None)
+        cur_lvl = f39.level if f39 and f39.gid == GID_RALLY_POINT else 0
+        if item_obj.target_level > 0 and cur_lvl >= item_obj.target_level:
+            return 39, cur_lvl, "TARGET_REACHED"
+        if 39 in reserved:
+            return None, cur_lvl, "INVALID_SLOT_OCCUPIED"
+        reserved.add(39)
+        return 39, cur_lvl, "OK"
+
+    if any(g in WALL_GIDS for g in gids):
+        f40 = next((f for f in interiors if f.slot_id == 40), None)
+        cur_lvl = f40.level if f40 and f40.gid in WALL_GIDS else 0
+        if item_obj.target_level > 0 and cur_lvl >= item_obj.target_level:
+            return 40, cur_lvl, "TARGET_REACHED"
+        if 40 in reserved:
+            return None, cur_lvl, "INVALID_SLOT_OCCUPIED"
+        reserved.add(40)
+        return 40, cur_lvl, "OK"
+
+    # Edifici normali dorf2: BUILD_SLOTS_DORF2 [19..38]
+    existing = [f for f in interiors if f.gid in gids and f.gid > 0]
+
+    # --- Caso 1: Edificio gia' esistente nel villaggio ---
+    if item_obj.slot_id is not None and item_obj.slot_id > 0:
+        target_f = next((f for f in interiors if f.slot_id == item_obj.slot_id), None)
+        if target_f is not None and target_f.gid in gids:
+            if item_obj.target_level > 0 and target_f.level >= item_obj.target_level:
+                return item_obj.slot_id, target_f.level, "TARGET_REACHED"
+            if item_obj.slot_id in reserved:
+                return None, target_f.level, "INVALID_SLOT_OCCUPIED"
+            reserved.add(item_obj.slot_id)
+            return item_obj.slot_id, target_f.level, "OK"
+        elif target_f is not None and (target_f.gid <= 0 or target_f.is_empty_site):
+            if item_obj.slot_id not in BUILD_SLOTS_DORF2 or item_obj.slot_id in reserved:
+                return None, 0, "INVALID_SLOT_OCCUPIED"
+            reserved.add(item_obj.slot_id)
+            return item_obj.slot_id, 0, "OK"
+        else:
+            return None, 0, "INVALID_SLOT_OCCUPIED"
+
+    # item.slot_id e' null (auto)
+    under_target = [
+        f for f in existing
+        if f.slot_id not in reserved
+        and (item_obj.target_level <= 0 or f.level < item_obj.target_level)
+    ]
+    if under_target:
+        best = min(under_target, key=lambda x: (x.level, x.slot_id))
+        reserved.add(best.slot_id)
+        return best.slot_id, best.level, "OK"
+
+    if existing:
+        is_multi = (
+            any(g in MULTI_INSTANCE_GIDS for g in gids)
+            or item_obj.allow_duplicate_building
+        )
+        if not is_multi:
+            top = max(existing, key=lambda x: x.level)
+            return top.slot_id, top.level, "TARGET_REACHED"
+
+    # --- Caso 2: Edificio non ancora costruito (level == 0) o nuova istanza multi-building ---
+    if item_obj.slot_id is not None and item_obj.slot_id > 0:
+        if item_obj.slot_id not in BUILD_SLOTS_DORF2 or item_obj.slot_id in reserved:
+            return None, 0, "INVALID_SLOT_OCCUPIED"
+        target_f = next((f for f in interiors if f.slot_id == item_obj.slot_id), None)
+        if target_f is None or not target_f.is_empty_site:
+            return None, 0, "INVALID_SLOT_OCCUPIED"
+        reserved.add(item_obj.slot_id)
+        return item_obj.slot_id, 0, "OK"
+
+    # auto slot: primo slot in BUILD_SLOTS_DORF2 vuoto e non in reserved/queued
+    for s in BUILD_SLOTS_DORF2:
+        if s in reserved or s in queued:
+            continue
+        f = next((x for x in interiors if x.slot_id == s), None)
+        if f is None or not f.is_empty_site:
+            continue
+        reserved.add(s)
+        return s, 0, "OK"
+
+    return None, 0, "NO_FREE_SLOTS"
+
+
 def _detect_tribe(state: GameState) -> str:
     """Deduce la tribu' del villaggio ('romans'|'teutons'|'gauls'|'').
 
@@ -563,40 +800,67 @@ def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
     if not plan:
         return []
     queued = queued_slot_ids(state)
+    reserved_slots: set[int] = set()
     out: list[Field] = []
-    for gids, target in _focus_steps(plan):
+    items = _focus_items(plan)
+    for it in items:
+        slot_id, cur_lvl, status = resolve_target_slot(it, state, reserved_slots)
+        if status in (
+            "TARGET_REACHED",
+            "INVALID_SLOT_OCCUPIED",
+            "NO_FREE_SLOTS",
+            "INVALID_ITEM",
+        ):
+            continue
+        if slot_id is None:
+            continue
+        gids = (it.gid,) if it.gid > 0 else tuple(gids_for_focus_key(it.key))
         if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
             rtype = FIELD_GID_TYPES[gids[0]]
-            matches = [
-                f for f in upgradeable_fields(state, state.resource_fields())
-                if f.resource_type is rtype
-                and (target <= 0 or f.level < target)
-            ]
+            if it.slot_id is not None and 1 <= it.slot_id <= 18:
+                matches = [
+                    f
+                    for f in upgradeable_fields(state, state.resource_fields())
+                    if f.slot_id == slot_id
+                    and (it.target_level <= 0 or f.level < it.target_level)
+                ]
+            else:
+                matches = [
+                    f
+                    for f in upgradeable_fields(state, state.resource_fields())
+                    if f.resource_type is rtype
+                    and (it.target_level <= 0 or f.level < it.target_level)
+                ]
             out.extend(sorted(matches, key=lambda f: (f.level, f.slot_id)))
         else:
-            interiors = [
-                f for f in state.interior_fields()
-                if f.gid in gids and f.gid > 0
-            ]
-            # Step raggiunto: un'istanza qualsiasi del gruppo e' al target.
-            if target > 0 and any(f.level >= target for f in interiors):
-                continue
-            matches = [
-                f for f in interiors
-                if f.slot_id not in queued
-                and f.level < field_max_level(state, f)
-                and (target <= 0 or f.level < target)
-            ]
-            out.extend(sorted(matches, key=lambda f: (f.level, f.slot_id)))
-            if not interiors:
-                # Nessuna variante presente: costruisci quella adatta
-                # alla tribu'/capitale (o la prima costruibile).
-                gid = _pick_group_gid(state, gids)
-                out.extend(
-                    new_building_intents(
-                        state, (gid,), {f.slot_id for f in out}
+            gid = it.gid if it.gid > 0 else _pick_group_gid(state, gids)
+            if cur_lvl == 0:
+                ok, why = prereqs_met(state.fields, gid, is_capital(state))
+                if not ok:
+                    logger.debug(
+                        "[%s] Nuovo edificio gid %d bloccato: %s",
+                        state.village_name,
+                        gid,
+                        why,
+                    )
+                    continue
+                out.append(
+                    Field(
+                        slot_id=slot_id,
+                        name=GID_LABELS.get(gid, f"slot {slot_id}"),
+                        level=0,
+                        resource_type=None,
+                        gid=gid,
                     )
                 )
+            else:
+                f = next(
+                    (x for x in state.interior_fields() if x.slot_id == slot_id),
+                    None,
+                )
+                if f and f.slot_id not in queued and f.level < field_max_level(state, f):
+                    out.append(f)
+
     # Dedup preservando l'ordine
     seen: set[int] = set()
     unique: list[Field] = []
@@ -662,104 +926,71 @@ def focus_skip_reasons(
     if not plan:
         return []
     queued = queued_slot_ids(state)
+    reserved_slots: set[int] = set()
     reasons: list[str] = []
-    for gids, target in _focus_steps(plan):
+    items = _focus_items(plan)
+    for it in items:
         if len(reasons) >= 3:
             break
+        gids = (it.gid,) if it.gid > 0 else tuple(gids_for_focus_key(it.key))
         label = (
-            GID_LABELS.get(gids[0], str(gids[0])) if gids else "?"
+            GID_LABELS.get(gids[0], str(gids[0])) if gids else (it.key or "?")
         )
+        slot_id, cur_lvl, status = resolve_target_slot(
+            it, state, reserved_slots
+        )
+        if status == "TARGET_REACHED":
+            continue
+        if status == "INVALID_SLOT_OCCUPIED":
+            reasons.append(
+                f"'{label}' slot #{it.slot_id} occupato da altro edificio (INVALID_SLOT_OCCUPIED)"
+            )
+            continue
+        if status == "NO_FREE_SLOTS":
+            reasons.append(f"'{label}' nessun slot dorf2 libero (19-38)")
+            continue
+        if status != "OK" or slot_id is None:
+            continue
+
         if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
             rtype = FIELD_GID_TYPES[gids[0]]
             below = [
-                f for f in state.resource_fields()
+                f
+                for f in state.resource_fields()
                 if f.resource_type is rtype
-                and (target <= 0 or f.level < target)
+                and (it.target_level <= 0 or f.level < it.target_level)
             ]
             if not below:
-                continue  # step completato
+                continue
             if upgradeable_fields(state, below):
-                break  # step applicabile
+                break
             reasons.append(
-                f"'{label}' liv. {target}: tutti i campi sotto "
-                "target sono in coda o al livello massimo"
+                f"'{label}' liv. {it.target_level}: tutti i campi sotto target sono in coda o al livello massimo"
             )
             continue
-        interiors = [
-            f for f in state.interior_fields()
-            if f.gid in gids and f.gid > 0
-        ]
-        if target > 0 and any(
-            f.level >= target for f in interiors
-        ):
-            continue  # step completato
-        if not interiors:
-            # Mutua esclusione: es. Castello presente -> Reggia
-            # mai costruibile (e viceversa).
-            exclusive = False
-            for group in _MUTUALLY_EXCLUSIVE_GIDS:
-                # Il check vale solo se lo step stesso fa parte del
-                # gruppo esclusivo: una Residenza presente non deve
-                # saltare Mercato/Accademia (fix falso positivo).
-                if not (set(gids) & set(group)):
-                    continue
-                others = [g for g in group if g not in gids]
-                hit = next(
-                    (
-                        f for f in state.interior_fields()
-                        if f.gid in others
-                    ),
-                    None,
-                )
-                if hit is not None:
-                    reasons.append(
-                        f"'{label}' saltato: nel villaggio e' gia' "
-                        f"presente '{GID_LABELS.get(hit.gid, hit.gid)}' "
-                        "(mutuamente esclusivo)"
-                    )
-                    exclusive = True
-                    break
-            if exclusive:
+
+        if cur_lvl == 0:
+            gid = it.gid if it.gid > 0 else _pick_group_gid(state, gids)
+            ok, why = prereqs_met(state.fields, gid, is_capital(state))
+            if not ok:
+                reasons.append(f"'{label}' nuova costruzione bloccata: {why}")
                 continue
-            why = ""
-            for gid in gids:
-                ok, why = prereqs_met(
-                    state.fields, gid, is_capital(state)
-                )
-                if ok:
-                    why = ""
-                    break
-            if why:
-                reasons.append(
-                    f"'{label}' rinviato: prerequisiti mancanti ({why})"
-                )
-                continue
-            if not empty_slots(state):
-                reasons.append(
-                    f"'{label}' rinviato: nessuna area vuota nel dorf2"
-                )
-                continue
-            break  # costruibile: step applicabile
-        below_t = [
-            f for f in interiors
-            if target <= 0 or f.level < target
-        ]
-        if not below_t:
-            continue  # step completato
-        if [
-            f for f in below_t
-            if f.slot_id not in queued
-            and f.level < field_max_level(state, f)
-        ]:
-            break  # step applicabile
-        if all(f.slot_id in queued for f in below_t):
-            reasons.append(
-                f"'{label}' rinviato: edificio gia' in coda costruzioni"
-            )
+            break
         else:
-            reasons.append(
-                f"'{label}' al livello massimo consentito"
+            f = next(
+                (x for x in state.interior_fields() if x.slot_id == slot_id),
+                None,
             )
+            if f and f.slot_id not in queued and f.level < field_max_level(state, f):
+                break
+            if f and f.slot_id in queued:
+                reasons.append(
+                    f"'{label}' slot #{slot_id} gia' in coda di costruzione"
+                )
+                continue
+            if f and f.level >= field_max_level(state, f):
+                reasons.append(f"'{label}' al livello massimo consentito")
+                continue
     return reasons
 
 

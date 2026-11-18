@@ -44,9 +44,39 @@ _CANCEL_WORD = re.compile(
 
 # parole chiave (multi-lingua) per mappare un campo al suo tipo di risorsa
 _RESOURCE_KEYWORDS: dict[ResourceType, tuple[str, ...]] = {
-    ResourceType.WOOD: ("wood", "legno", "holz", "bois", "madera", "boschivo"),
-    ResourceType.CLAY: ("clay", "argilla", "lehm", "argile", "barro"),
-    ResourceType.IRON: ("iron", "ferro", "eisen", "fer", "hierro", "miniera"),
+    ResourceType.WOOD: (
+        "wood",
+        "legno",
+        "holz",
+        "bois",
+        "madera",
+        "boschivo",
+        "bosco",
+        "taglialegna",
+        "woodcutter",
+        "holzfäller",
+        "holzfaeller",
+    ),
+    ResourceType.CLAY: (
+        "clay",
+        "argilla",
+        "lehm",
+        "argile",
+        "barro",
+        "cava",
+        "clay pit",
+        "lehmgrube",
+    ),
+    ResourceType.IRON: (
+        "iron",
+        "ferro",
+        "eisen",
+        "fer",
+        "hierro",
+        "miniera",
+        "iron mine",
+        "eisenmine",
+    ),
     ResourceType.CROP: (
         "crop",
         "grano",
@@ -56,6 +86,8 @@ _RESOURCE_KEYWORDS: dict[ResourceType, tuple[str, ...]] = {
         "ble",
         "trigo",
         "campo",
+        "cropland",
+        "getreidefeld",
     ),
 }
 
@@ -197,11 +229,151 @@ class TravianParser:
     # seconda della versione/skin ('' = panoramica di default).
     _CP_TAB_SUFFIXES = ("", "&tt=3", "&tt=2", "&tt=4", "&tt=1")
 
+    # JS condiviso dalle pagine CP (scan tab Residenza + link diretto):
+    # cerca label "Punti cultura" multi-lingua e ne estrae i numeri
+    # prodotti/richiesti/giornalieri normalizzando i mark direzionali.
+    _CP_EVAL_JS = """
+        () => {
+            const raw = (document.body
+                && document.body.innerText) || '';
+            // Travian avvolge i numeri nei mark direzionali
+            // U+202D/U+202C: normalizza tutto a spazi.
+            const text = raw.replace(
+                /[\\u202d\\u202c\\u202f\\u00a0\\u200b]/g, ' ');
+            const clean = (s) => parseInt(
+                String(s).replace(/[^0-9]/g, ''), 10) || 0;
+            const num = '([0-9][0-9.,\\\\s]*)';
+            const cpLabel =
+                '(?:punti\\\\s+(?:di\\\\s+)?cultura' +
+                '|punti\\\\s+culturali|culture\\\\s+points?' +
+                '|kulturpunkte|puntos?\\\\s+de\\\\s+cultura' +
+                '|points?\\\\s+de\\\\s+culture)';
+            const out = {
+                have: 0, need: 0, daily: 0,
+                matched: false, specific: false,
+                has_cp: new RegExp(cpLabel, 'i').test(text),
+            };
+            if (!out.has_cp) return out;
+            // Link diretto alla tab CP dalla navbar della
+            // Residenza (la label "Punti cultura" e' presente
+            // nella navbar di tutte le tab).
+            const navLink = Array.from(
+                document.querySelectorAll('a[href]')
+            ).find((a) => new RegExp(
+                '^' + cpLabel + '$', 'i'
+            ).test((a.innerText || '').trim()));
+            if (navLink) {
+                out.cp_nav_href = navLink.href || '';
+                const tm = (navLink.getAttribute('href') || '')
+                    .match(/tt=(\\d+)/);
+                if (tm) out.cp_nav_tt = '&tt=' + tm[1];
+            }
+            // -- Campi specifici tab "Punti cultura" T4.x --
+            // have: "Punti cultura prodotti finora 1517"
+            let m = text.match(new RegExp(
+                cpLabel + '\\\\s+prodotti\\\\s+finora' +
+                '[^0-9]{0,15}' + num, 'i')) ||
+                text.match(
+                /(?:produced\s+(?:so\s+far|until\s+now)|bisher\s+produziert)[^0-9]{0,15}([0-9][0-9.,\s]*)/i);
+            if (m) {
+                out.have = clean(m[1]);
+                out.matched = true;
+                out.specific = true;
+            }
+            // need: "Il prossimo villaggio sara' disponibile
+            //        a 2000"
+            m = text.match(
+                /(?:prossimo\s+villaggio\s+sar.{0,10}disponibile\s+a|prossimo\s+villaggio\s+.{0,25}richiede|next\s+village.{0,20}(?:available|requires)|n.chstes\s+dorf.{0,25}(?:verf.gbar|ben.tigt))[^0-9]{0,10}([0-9][0-9.,\s]*)/i
+            );
+            if (m) {
+                out.need = clean(m[1]);
+                out.matched = true;
+                out.specific = true;
+            }
+            // daily: sezione "Punti cultura al giorno" ->
+            //        ultima riga "Totale 123"
+            m = text.match(new RegExp(
+                cpLabel + '\\\\s+al\\\\s+giorno' +
+                '[\\s\\S]{0,400}?(?:totale|total|gesamt)' +
+                '[^0-9]{0,10}' + num, 'i')) ||
+                text.match(
+                /(?:culture\s+points?\s+per\s+day|kulturpunkte\s+pro\s+tag)[\s\S]{0,400}?(?:total|gesamt)[^0-9]{0,10}([0-9][0-9.,\s]*)/i);
+            if (m) {
+                out.daily = clean(m[1]);
+                out.matched = true;
+                out.specific = true;
+            }
+            // Nuova UI: tab "Punti cultura" di /village/statistics —
+            // tabella "Villaggio PC/Giorno Party Truppe Slots" con riga
+            // "Somma 57". Non mostra i totali assoluti dello slot.
+            m = text.match(
+                /(?:PC|CP)\s*\/\s*(?:giorno|day|tag|jour|d[ií]a|dia)[\s\S]{0,900}?(?:somma|totale|total|gesamt)[^0-9]{0,10}([0-9][0-9.,\s]*)/i
+            );
+            if (m && !out.daily) {
+                out.daily = clean(m[1]);
+                out.matched = true;
+                out.specific = true;
+            }
+            // Stessa pagina nuova UI: riga "Somma 57 - 0   U / T"
+            // (slot insediamento usati/totali) e frase "prossimo slot
+            // insediamento il DD.MM.YY, HH:MM".
+            m = text.match(
+                /(?:somma|totale|total|gesamt)\s+[0-9][0-9.,\s]*[\s\S]{0,80}?(\d+)\s*\/\s*(\d+)/i
+            );
+            if (m) {
+                out.slots_used = clean(m[1]);
+                out.slots_total = clean(m[2]);
+            }
+            m = text.match(
+                /slot[^0-9]{0,60}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4}[^|±(\\n\\r]{0,15})/i
+            );
+            if (m) {
+                out.next_slot = String(m[1]).trim();
+            }
+            if (out.specific) return out;
+            // -- Fallback generico: "X / Y" o "X di Y" --
+            m = text.match(new RegExp(
+                cpLabel + '[^0-9]{0,40}' + num +
+                '[^0-9]{0,10}(?:/|\\\\bdi\\\\b|\\\\bof\\\\b' +
+                '|\\\\bvon\\\\b|\\\\bde\\\\b)[^0-9]{0,10}' +
+                num, 'i'));
+            if (m) {
+                out.have = clean(m[1]);
+                out.need = clean(m[2]);
+                out.matched = true;
+            } else {
+                // \b impedisce "serve" dentro "server" (l'ora del
+                // server veniva letta come CP richiesti).
+                const n = text.match(
+                    /\b(?:richiesti|necessari|servono|serve|needed|required|ben.tigt|requis|erforderlich)\b[^0-9]{0,25}([0-9][0-9.,\s]*)/i
+                );
+                if (n) {
+                    out.need = clean(n[1]);
+                    out.matched = true;
+                }
+            }
+            // daily generico: "250 al giorno", "250 per day"
+            const d = text.match(
+                /([0-9][0-9.,\s]*)[^0-9]{0,20}(?:al giorno|per day|a day|pro tag|par jour|al d[ií]a|daily)/i
+            ) || text.match(
+                /(?:produzione|production|producci.n)[^0-9]{0,25}([0-9][0-9.,\s]*)[^0-9]{0,15}(?:punti|points|cultur)/i
+            );
+            if (d) out.daily = clean(d[1]);
+            return out;
+        }
+    """
+
     def __init__(self, page: Page) -> None:
         self.page = page
         # Tab Residenza che l'ultima volta conteneva il riepilogo CP:
         # evita di riprovare tutte le tab a ogni ciclo.
         self._cp_tab: str | None = None
+        # Route edificio che l'ultima volta ha aperto la pagina CP:
+        # 'slot?id=' (nuova UI) oppure 'build.php?id=' (UI classica).
+        self._cp_base: str | None = None
+        # Extra dell'ultima pagina CP letta (nuova UI: slot
+        # insediamento usati/totali e data stimata prossimo slot).
+        self.cp_extra: dict = {}
         # Anti-detection: navigazione via click DOM quando possibile
         # (impostata dall'orchestrator da settings.dom_navigation).
         self.dom_nav: bool = True
@@ -420,8 +592,16 @@ class TravianParser:
                             const m = (link.getAttribute('href') || '').match(/build\\.php[?&]id=(\\d+)/);
                             if (m) slotId = parseInt(m[1], 10);
                         }
+                        let gid = null;
+                        const classStr = (el.className || '') + ' ' + Array.from(el.querySelectorAll('*')).map(c => c.className || '').join(' ');
+                        const gm = classStr.match(/\\bgid(\\d+)\\b/i);
+                        if (gm) gid = parseInt(gm[1], 10);
+                        if (!gid && link) {
+                            const gmLink = (link.getAttribute('href') || '').match(/[?&]gid=(\\d+)/);
+                            if (gmLink) gid = parseInt(gmLink[1], 10);
+                        }
                         if (name) {
-                            items.push({ building: name, level: level, time_left: duration, slot_id: slotId });
+                            items.push({ building: name, level: level, time_left: duration, slot_id: slotId, gid: gid });
                         }
                     });
                     return items;
@@ -804,39 +984,62 @@ class TravianParser:
                 () => {
                     const seen = {};
                     const slots = document.querySelectorAll(
-                        '#resourceFieldContainer .buildingSlot, #village_map .buildingSlot, #villageMap .buildingSlot, .buildingSlot, a[href*="build.php?id="], area'
+                        '#resourceFieldContainer .buildingSlot, ' +
+                        '#resourceFieldContainer a.resourceField, ' +
+                        '#resourceFieldContainer [data-aid], ' +
+                        '#village_map .buildingSlot, #villageMap .buildingSlot, ' +
+                        '.buildingSlot, a[href*="build.php?id="], ' +
+                        'a[href*="/slot?id="], area'
                     );
                     slots.forEach(slot => {
                         const href = slot.getAttribute('href') || '';
                         const cls = slot.getAttribute('class') || '';
                         let slotId = null;
-                        const matchId = href.match(/build\\.php[?&]id=(\\d+)/);
+                        // Vecchia UI: build.php?id=N o classe 'aN'.
+                        // Nuova UI (/resources): href /slot?id=N, data-aid=N
+                        // o classe 'buildingSlotN'.
+                        const matchId = href.match(/build\\.php[?&]id=(\\d+)/) ||
+                                        href.match(/\\/slot\\?[^#\\s]*?\\bid=(\\d+)/);
                         if (matchId) {
                             slotId = parseInt(matchId[1], 10);
                         } else {
-                            const matchCls = cls.match(/\\ba(\\d+)\\b/);
-                            if (matchCls) slotId = parseInt(matchCls[1], 10);
+                            const aid = slot.getAttribute('data-aid');
+                            if (aid && /^\\d+$/.test(aid)) {
+                                slotId = parseInt(aid, 10);
+                            } else {
+                                const matchCls = cls.match(/\\ba(\\d+)\\b/) ||
+                                                 cls.match(/\\bbuildingSlot(\\d+)\\b/);
+                                if (matchCls) slotId = parseInt(matchCls[1], 10);
+                            }
                         }
-                        // Solo i 18 campi risorsa del dorf1: link build.php
-                        // verso slot dorf2 (19-40) non devono inquinare la
-                        // lista dei campi.
+                        // Solo i 18 campi risorsa del dorf1: link verso slot
+                        // dorf2 (19-40) non devono inquinare la lista.
                         if (slotId === null || slotId < 1 || slotId > 18) return;
 
-                        // gid risorsa dalla classe Travian (gid1..gid4 o gN):
-                        // legno=1, argilla=2, ferro=3, grano=4.
+                        // gid risorsa: data-gid (nuova UI) o classe Travian
+                        // gidN/gN — legno=1, argilla=2, ferro=3, grano=4.
                         let gid = -1;
-                        const gidMatch = cls.match(/\\bg(?:id)?(\\d+)\\b/);
-                        if (gidMatch) gid = parseInt(gidMatch[1], 10);
+                        const dataGid = slot.getAttribute('data-gid');
+                        if (dataGid && /^\\d+$/.test(dataGid)) {
+                            gid = parseInt(dataGid, 10);
+                        } else {
+                            const gidMatch = cls.match(/\\bg(?:id)?(\\d+)\\b/);
+                            if (gidMatch) gid = parseInt(gidMatch[1], 10);
+                        }
 
                         const title = (slot.getAttribute('title') || slot.getAttribute('alt') || slot.innerText || '').trim();
 
-                        // Livello dal badge numerico dello slot quando il
-                        // title e' assente (es. <div class="level">3</div>).
+                        // Livello: badge numerico dello slot (.level vecchia
+                        // UI, .labelLayer nuova UI) o classe 'levelN'.
                         let level = -1;
-                        const lvlEl = slot.querySelector('.level, .lvl, .buildingLevel, [class*="level"]');
+                        const lvlEl = slot.querySelector('.level, .lvl, .buildingLevel, .labelLayer, [class*="level"]');
                         const lvlSrc = lvlEl ? lvlEl.innerText : '';
                         const lvlMatch = (lvlSrc || '').match(/\\d+/);
                         if (lvlMatch) level = parseInt(lvlMatch[0], 10);
+                        if (level < 0) {
+                            const lvlCls = cls.match(/\\blevel(\\d+)\\b/);
+                            if (lvlCls) level = parseInt(lvlCls[1], 10);
+                        }
 
                         // Dedup per slot: tieni la versione piu' ricca.
                         const prev = seen[slotId];
@@ -864,6 +1067,15 @@ class TravianParser:
                     lvl = parse_int(title)
                     if lvl <= 0:
                         lvl = max(0, safe_int(item.get("level"), 0))
+                    rtype = (
+                        FIELD_GID_TYPES.get(gid)
+                        or guess_resource_type(title)
+                    )
+                    # Nuova UI: il title e' assente o coincide col numero di
+                    # livello (innerText = ".labelLayer") — in quel caso il
+                    # nome deriva dal tipo risorsa, non dal badge.
+                    if not title or title.strip().isdigit():
+                        title = rtype.value if rtype else title
                     fields.append(
                         Field(
                             slot_id=int(s_id),
@@ -871,10 +1083,7 @@ class TravianParser:
                             level=lvl,
                             # Il gid del DOM e' piu' affidabile del titolo
                             # localizzato; il guess resta come fallback.
-                            resource_type=(
-                                FIELD_GID_TYPES.get(gid)
-                                or guess_resource_type(title)
-                            ),
+                            resource_type=rtype,
                             gid=gid,
                         )
                     )
@@ -917,6 +1126,37 @@ class TravianParser:
                     continue
             break
         logger.debug("Campi letti tramite DOM locator: %d", len(fields))
+        if not fields:
+            # Diagnostica drift markup: se entrambi i percorsi (JS + DOM)
+            # tornano vuoti, logga URL e conteggi dei selettori chiave
+            # cosi' il prossimo aggiornamento selettori parte dai dati.
+            try:
+                probe = await self.page.evaluate("""
+                    () => {
+                        const rfc = document.querySelector('#resourceFieldContainer');
+                        const kids = rfc
+                            ? Array.from(rfc.querySelectorAll('*'))
+                                .slice(0, 40)
+                                .map(el => el.tagName.toLowerCase() + '|' +
+                                     (el.getAttribute('class') || '').slice(0, 60) + '|' +
+                                     (el.getAttribute('href') || el.getAttribute('data-aid') ||
+                                      el.getAttribute('data-slot') || ''))
+                            : [];
+                        return {
+                            url: location.href,
+                            buildingSlot: document.querySelectorAll('.buildingSlot').length,
+                            buildLinks: document.querySelectorAll('a[href*="build.php?id="]').length,
+                            areas: document.querySelectorAll('area').length,
+                            rfcKids: kids,
+                            rfcHtml: rfc ? rfc.innerHTML.slice(0, 3000) : null,
+                        };
+                    }
+                """)
+            except Exception as exc:  # noqa: BLE001
+                probe = {"error": str(exc)}
+            logger.warning(
+                "read_fields: 0 campi dorf1 letti. Probe DOM: %s", probe
+            )
         return fields
 
     async def read_interior_fields(self) -> list[Field]:
@@ -1237,11 +1477,14 @@ class TravianParser:
             if key in seen:
                 continue
             seen.add(key)
-            if isinstance(slot_id, int):
-                # classificazione affidabile via build.php?id=N
+            q_gid = q.get("gid")
+            if isinstance(slot_id, int) and 1 <= slot_id <= 40:
                 is_res = 1 <= slot_id <= 18
+            elif isinstance(q_gid, int) and q_gid in (1, 2, 3, 4):
+                is_res = True
+            elif isinstance(q_gid, int) and q_gid >= 5:
+                is_res = False
             else:
-                # fallback: deduzione dal nome (multi-lingua)
                 is_res = guess_resource_type(name) is not None
             # Livello esplicito da .lvl/.level; fallback sul testo nome.
             q_level = q.get("level")
@@ -1257,6 +1500,7 @@ class TravianParser:
                     remaining_seconds=parse_timer(duration_str),
                     is_resource_field=is_res,
                     slot_id=slot_id if isinstance(slot_id, int) else 0,
+                    gid=q_gid if isinstance(q_gid, int) and q_gid > 0 else 0,
                 )
             )
         return items
@@ -1561,143 +1805,63 @@ class TravianParser:
         ) + [s for s in self._CP_TAB_SUFFIXES if s != self._cp_tab]
 
         # JS condiviso dalle navigazioni (scan tab + link diretto).
-        cp_eval_js = """
-            () => {
-                const raw = (document.body
-                    && document.body.innerText) || '';
-                // Travian avvolge i numeri nei mark direzionali
-                // U+202D/U+202C: normalizza tutto a spazi.
-                const text = raw.replace(
-                    /[\\u202d\\u202c\\u202f\\u00a0\\u200b]/g, ' ');
-                const clean = (s) => parseInt(
-                    String(s).replace(/[^0-9]/g, ''), 10) || 0;
-                const num = '([0-9][0-9.,\\\\s]*)';
-                const cpLabel =
-                    '(?:punti\\\\s+(?:di\\\\s+)?cultura' +
-                    '|punti\\\\s+culturali|culture\\\\s+points?' +
-                    '|kulturpunkte|puntos?\\\\s+de\\\\s+cultura' +
-                    '|points?\\\\s+de\\\\s+culture)';
-                const out = {
-                    have: 0, need: 0, daily: 0,
-                    matched: false, specific: false,
-                    has_cp: new RegExp(cpLabel, 'i').test(text),
-                };
-                if (!out.has_cp) return out;
-                // Link diretto alla tab CP dalla navbar della
-                // Residenza (la label "Punti cultura" e' presente
-                // nella navbar di tutte le tab).
-                const navLink = Array.from(
-                    document.querySelectorAll('a[href]')
-                ).find((a) => new RegExp(
-                    '^' + cpLabel + '$', 'i'
-                ).test((a.innerText || '').trim()));
-                if (navLink) {
-                    out.cp_nav_href = navLink.href || '';
-                    const tm = (navLink.getAttribute('href') || '')
-                        .match(/tt=(\\d+)/);
-                    if (tm) out.cp_nav_tt = '&tt=' + tm[1];
-                }
-                // -- Campi specifici tab "Punti cultura" T4.x --
-                // have: "Punti cultura prodotti finora 1517"
-                let m = text.match(new RegExp(
-                    cpLabel + '\\\\s+prodotti\\\\s+finora' +
-                    '[^0-9]{0,15}' + num, 'i')) ||
-                    text.match(
-                    /(?:produced\\s+(?:so\\s+far|until\\s+now)|bisher\\s+produziert)[^0-9]{0,15}([0-9][0-9.,\\s]*)/i);
-                if (m) {
-                    out.have = clean(m[1]);
-                    out.matched = true;
-                    out.specific = true;
-                }
-                // need: "Il prossimo villaggio sara' disponibile
-                //        a 2000"
-                m = text.match(
-                    /(?:prossimo\\s+villaggio\\s+sar.{0,10}disponibile\\s+a|prossimo\\s+villaggio\\s+.{0,25}richiede|next\\s+village.{0,20}(?:available|requires)|n.chstes\\s+dorf.{0,25}(?:verf.gbar|ben.tigt))[^0-9]{0,10}([0-9][0-9.,\\s]*)/i
-                );
-                if (m) {
-                    out.need = clean(m[1]);
-                    out.matched = true;
-                    out.specific = true;
-                }
-                // daily: sezione "Punti cultura al giorno" ->
-                //        ultima riga "Totale 123"
-                m = text.match(new RegExp(
-                    cpLabel + '\\\\s+al\\\\s+giorno' +
-                    '[\\\\s\\\\S]{0,400}?(?:totale|total|gesamt)' +
-                    '[^0-9]{0,10}' + num, 'i')) ||
-                    text.match(
-                    /(?:culture\\s+points?\\s+per\\s+day|kulturpunkte\\s+pro\\s+tag)[\\s\\S]{0,400}?(?:total|gesamt)[^0-9]{0,10}([0-9][0-9.,\\s]*)/i);
-                if (m) {
-                    out.daily = clean(m[1]);
-                    out.matched = true;
-                    out.specific = true;
-                }
-                if (out.specific) return out;
-                // -- Fallback generico: "X / Y" o "X di Y" --
-                m = text.match(new RegExp(
-                    cpLabel + '[^0-9]{0,40}' + num +
-                    '[^0-9]{0,10}(?:/|\\\\bdi\\\\b|\\\\bof\\\\b' +
-                    '|\\\\bvon\\\\b|\\\\bde\\\\b)[^0-9]{0,10}' +
-                    num, 'i'));
-                if (m) {
-                    out.have = clean(m[1]);
-                    out.need = clean(m[2]);
-                    out.matched = true;
-                } else {
-                    // \\b impedisce "serve" dentro "server" (l'ora del
-                    // server veniva letta come CP richiesti).
-                    const n = text.match(
-                        /\\b(?:richiesti|necessari|servono|serve|needed|required|ben.tigt|requis|erforderlich)\\b[^0-9]{0,25}([0-9][0-9.,\\s]*)/i
-                    );
-                    if (n) {
-                        out.need = clean(n[1]);
-                        out.matched = true;
-                    }
-                }
-                // daily generico: "250 al giorno", "250 per day"
-                const d = text.match(
-                    /([0-9][0-9.,\\s]*)[^0-9]{0,20}(?:al giorno|per day|a day|pro tag|par jour|al d[ií]a|daily)/i
-                ) || text.match(
-                    /(?:produzione|production|producci.n)[^0-9]{0,25}([0-9][0-9.,\\s]*)[^0-9]{0,15}(?:punti|points|cultur)/i
-                );
-                if (d) out.daily = clean(d[1]);
-                return out;
-            }
-        """
+        cp_eval_js = self._CP_EVAL_JS
+
+        # Route edificio: nuova UI '/slot?id=N' oppure classica
+        # 'build.php?id=N' — la prima che valida l'URL viene usata
+        # per le tab successive (cache _cp_base).
+        bases = (
+            [self._cp_base] if self._cp_base else []
+        ) + [b for b in ("slot?id=", f"{selectors.PATH_BUILD}?id=")
+             if b != self._cp_base]
+        slot_check = re.compile(
+            rf"(?:/slot|build\.php)\?[^#]*\bid={int(residence_slot)}\b"
+        )
 
         accepted = None   # (suffix, data) con campi specifici matchati
         generic = None    # (suffix, data) solo match generico
         nav_link = None   # (suffix_tt, href) dalla navbar
         tried = set()     # suffix gia' navigati
 
-        for suffix in suffixes:
-            url = f"{selectors.PATH_BUILD}?id={residence_slot}{suffix}"
-            if village_id:
-                url += f"&newdid={village_id}"
-            tried.add(suffix)
-            try:
-                await self._goto(
-                    _abs_game_url(self.page.url or "", url),
-                )
-            except Exception:
-                continue
-            try:
-                data = await self.page.evaluate(cp_eval_js)
-            except Exception:
-                continue
-            data = data or {}
-            if nav_link is None and data.get("cp_nav_href"):
-                nav_link = (
-                    data.get("cp_nav_tt") or "",
-                    data["cp_nav_href"],
-                )
-            if data.get("specific"):
-                accepted = (suffix, data)
-                break
-            if generic is None and data.get("matched"):
-                generic = (suffix, data)
-            if nav_link:
-                # Link diretto disponibile: evita lo scan cieco.
+        for base in bases:
+            # Le tab &tt=N esistono solo su build.php: la nuova UI
+            # /slot espone il link alla pagina CP nella navbar.
+            tab_list = suffixes if base.startswith("build") else [""]
+            for suffix in tab_list:
+                url = f"{base}{residence_slot}{suffix}"
+                if village_id:
+                    url += f"&newdid={village_id}"
+                tried.add(suffix)
+                try:
+                    await self._goto(
+                        _abs_game_url(self.page.url or "", url),
+                    )
+                except Exception:
+                    continue
+                if not slot_check.search(self.page.url or ""):
+                    # Route non valida su questo server (es. /slot su
+                    # vecchia UI): passa alla route alternativa.
+                    break
+                self._cp_base = base
+                try:
+                    data = await self.page.evaluate(cp_eval_js)
+                except Exception:
+                    continue
+                data = data or {}
+                if nav_link is None and data.get("cp_nav_href"):
+                    nav_link = (
+                        data.get("cp_nav_tt") or "",
+                        data["cp_nav_href"],
+                    )
+                if data.get("specific"):
+                    accepted = (suffix, data)
+                    break
+                if generic is None and data.get("matched"):
+                    generic = (suffix, data)
+                if nav_link:
+                    # Link diretto disponibile: evita lo scan cieco.
+                    break
+            if accepted is not None or nav_link is not None:
                 break
 
         # La navbar espone il link diretto alla tab CP: se la tab
@@ -1722,6 +1886,11 @@ class TravianParser:
             have = safe_int(data.get("have", 0))
             need = safe_int(data.get("need", 0))
             daily = safe_int(data.get("daily", 0))
+            self.cp_extra = {
+                k: data[k] for k in
+                ("slots_used", "slots_total", "next_slot")
+                if data.get(k) is not None
+            }
             # Parse parziale (label CP trovata ma have/daily a zero):
             # dump per confrontare il formato numerico reale del server.
             if not have or not daily:
@@ -1733,6 +1902,98 @@ class TravianParser:
             "Punti cultura non letti nella Residenza (slot %s): "
             "dump in debug/culture_points_fail.txt",
             residence_slot,
+        )
+        return (0, 0, 0)
+
+    async def read_culture_points_overview(self) -> tuple[int, int, int]:
+        """CP senza Residenza/Palazzo: pagina corrente, profilo, panoramica.
+
+        Alcune versioni espongono i Punti Cultura anche fuori dalla
+        Residenza (profilo giocatore spieler.php, panoramica villaggi
+        dorf3.php, box account/pagine /profile delle nuove UI): probe
+        best-effort con le stesse regex di ``read_culture_points``.
+        Ritorna (0, 0, 0) se nessuna pagina espone il dato.
+        """
+        if not self.page:
+            return (0, 0, 0)
+
+        async def _eval_cp() -> dict:
+            try:
+                data = await self.page.evaluate(self._CP_EVAL_JS)
+            except Exception:
+                return {}
+            return data if isinstance(data, dict) else {}
+
+        async def _scan(url: str | None) -> dict:
+            """Eval CP su ``url`` (o pagina corrente), seguendo il link
+            diretto alla sotto-pagina CP se la nav lo espone (es. tab
+            'Punti cultura' di /village/statistics nella nuova UI)."""
+            if url:
+                try:
+                    await self._goto(url)
+                except Exception:
+                    return {}
+            data = await _eval_cp()
+            if data.get("matched"):
+                return data
+            nav = data.get("cp_nav_href")
+            if nav:
+                try:
+                    await self._goto(nav)
+                except Exception:
+                    return data
+                data = await _eval_cp()
+            return data
+
+        def _finish(data: dict) -> tuple[int, int, int]:
+            """Salva gli extra (slots/ETA nuova UI) e ritorna la tupla."""
+            self.cp_extra = {
+                k: data[k] for k in
+                ("slots_used", "slots_total", "next_slot")
+                if data.get(k) is not None
+            }
+            return (
+                safe_int(data.get("have", 0)),
+                safe_int(data.get("need", 0)),
+                safe_int(data.get("daily", 0)),
+            )
+
+        # 1. La pagina corrente potrebbe gia' esporre i CP (es. box
+        #    account delle nuove UI): nessuna navigazione extra.
+        data = await _scan(None)
+        if data.get("matched"):
+            return _finish(data)
+
+        # 2. Candidati: link reali della navbar verso profilo/
+        #    panoramica + rotte classiche spieler.php e dorf3.php
+        #    (dorf3.php redirige a /village/statistics sulla nuova UI).
+        try:
+            hrefs = await self.page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href]'))
+                    .map(a => a.href || '')
+                    .filter(h => /spieler\\.php|dorf3\\.php|\\/profile|profil|village\\/statistics/i.test(h))"""
+            )
+        except Exception:
+            hrefs = []
+        candidates: list[str] = []
+        for h in hrefs or []:
+            if h and h not in candidates:
+                candidates.append(h)
+        for path in ("dorf3.php", "spieler.php", "village/statistics"):
+            url = _abs_game_url(self.page.url or "", path)
+            if url not in candidates:
+                candidates.append(url)
+
+        for url in candidates[:4]:
+            data = await _scan(url)
+            if data.get("matched"):
+                return _finish(data)
+
+        await self._dump_page_text("culture_points_fail")
+        logger.info(
+            "Punti cultura non letti (nessuna Residenza e nessuna "
+            "pagina profilo/panoramica con CP): "
+            "dump in debug/culture_points_fail.txt"
         )
         return (0, 0, 0)
 
