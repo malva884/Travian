@@ -1155,6 +1155,10 @@
                 <span>Eroe tattico (difesa/raid mirati)</span>
                 <input id="mod-hero-tactical" type="checkbox" onchange="saveModuleToggle('hero', 'tactical_hero_enabled', this.checked)" class="w-4 h-4 accent-emerald-400">
               </label>
+              <label class="flex items-center justify-between gap-2 text-[11px] text-slate-300">
+                <span>Usa pacchi risorse su deficit (Emergency Unpack)</span>
+                <input id="mod-hero-unpack" type="checkbox" onchange="saveModuleToggle('hero', 'emergency_unpack', this.checked)" class="w-4 h-4 accent-emerald-400">
+              </label>
               <button onclick="saveHeroConfig()" class="w-full px-2 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/35 text-[11px] font-bold">Salva Eroe</button>
             </div>
 
@@ -2338,6 +2342,7 @@
       setV('mod-hero-combathp', h.min_combat_health);
       setV('mod-hero-attr', h.attribute_focus || 'balanced');
       set('mod-hero-tactical', h.tactical_hero_enabled);
+      set('mod-hero-unpack', h.emergency_unpack !== false);
       const d = c.defense || {};
       set('mod-defense-enabled', d.enabled);
       setV('mod-def-panic', d.panic_threshold_seconds);
@@ -2609,7 +2614,13 @@
           <div class="min-w-0 flex-1">
             <div class="text-slate-200 font-semibold truncate">${idx + 1}. ${esc(name)} <span class="text-cyan-400">[${esc(_stepTag(step))}]</span></div>
             <div class="text-[10px] text-slate-400 flex items-center gap-2 mt-0.5">
-              <span>lv.${curLvl} → Target lv.${step.target}</span>
+              <span>lv.${curLvl} →</span>
+              <span class="flex items-center gap-1">Target lv.
+                <input type="number" min="0" max="25" step="1" value="${step.target}"
+                  onchange="updateQueueStepTarget(${idx}, this.value)"
+                  class="bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-[9px] text-slate-300 w-11"
+                  title="Livello obiettivo dello step (0 = rimuovi vincolo)">
+              </span>
               ${slotSelect}
             </div>
           </div>
@@ -2631,6 +2642,16 @@
       renderPriorityQueue();
       saveMicroBrainConfig();
       notify(`Slot per ${_stepLabel(step)}: ${step.slot_id ? '#' + step.slot_id : 'Auto'}`, 'cyan');
+    }
+
+    function updateQueueStepTarget(idx, val) {
+      const step = appState.priorityQueue[idx];
+      if (!step) return;
+      const num = Math.max(0, Math.min(25, Math.round(Number(val) || 0)));
+      step.target = num;
+      renderPriorityQueue();
+      saveMicroBrainConfig();
+      notify(`Target ${_stepLabel(step)}: lv.${num}`, 'cyan');
     }
 
     let _activeModalSlot = null;
@@ -3735,6 +3756,7 @@
         min_combat_health: Number(document.getElementById('mod-hero-combathp').value),
         attribute_focus: document.getElementById('mod-hero-attr').value,
         tactical_hero_enabled: document.getElementById('mod-hero-tactical').checked,
+        emergency_unpack: document.getElementById('mod-hero-unpack').checked,
       });
     }
 
