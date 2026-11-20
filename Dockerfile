@@ -27,9 +27,11 @@ RUN mkdir -p /app/state /app/debug
 
 # 8501: dashboard Streamlit — 8610: command API (command_server, avviato da
 # app.py). Su Coolify esporre anche la 8610 con un secondo dominio (HTTPS) e
-# impostare la variabile d'ambiente TRAVIAN_API_URL su quell'URL, altrimenti
-# i comandi dalla dashboard embedded (aggiungi account, salvataggi, ecc.)
-# puntano a 127.0.0.1 del browser e falliscono.
+# impostare le variabili d'ambiente:
+#   TRAVIAN_API_BIND=0.0.0.0          -> il server accetta connessioni dal proxy
+#   TRAVIAN_API_URL=https://<dominio-api>  -> URL pubblico iniettato nella HUD
+# Senza queste variabili i comandi dalla dashboard embedded (aggiungi account,
+# salvataggi, ecc.) puntano a 127.0.0.1 del browser e falliscono.
 EXPOSE 8501 8610
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \

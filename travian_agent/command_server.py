@@ -2024,9 +2024,13 @@ def start_command_server(port: int = COMMAND_PORT) -> bool:
     with _start_lock:
         if _server_started:
             return True
+        # Su deploy remoti (Coolify) il reverse proxy non raggiunge il
+        # loopback del container: TRAVIAN_API_BIND=0.0.0.0 espone la
+        # porta 8610 all'esterno. Default 127.0.0.1 per uso locale.
+        host = os.getenv("TRAVIAN_API_BIND", "127.0.0.1").strip() or "127.0.0.1"
         try:
             server = ThreadingHTTPServer(
-                ("127.0.0.1", port), _CommandCenterHandler
+                (host, port), _CommandCenterHandler
             )
         except OSError as exc:
             logger.warning(
@@ -2041,7 +2045,8 @@ def start_command_server(port: int = COMMAND_PORT) -> bool:
         thread.start()
         _server_started = True
         logger.info(
-            "Command Center live su http://127.0.0.1:%d/command-center/",
+            "Command Center live su http://%s:%d/command-center/",
+            host,
             port,
         )
         return True
