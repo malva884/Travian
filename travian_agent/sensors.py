@@ -2606,6 +2606,34 @@ class TravianParser:
 
             out = [t for t in tiles if isinstance(t, dict)]
 
+            # 1.5) Scheda singolo tile: su Legends /map?x=&y= mostra il
+            #      dettaglio della casella richiesta (es. "Valle
+            #      abbandonata (138|38) ... 6 Campi di grano") direttamente
+            #      nel body — si emette come tile a distanza 0.
+            if not out:
+                try:
+                    card = await self._eval_map_tile()
+                except Exception:
+                    card = None
+                if card and card.get("text") and (
+                    card.get("crop_fields")
+                    or card.get("free")
+                    or card.get("occupied")
+                ):
+                    otext = str(card.get("text") or "")
+                    is_oasis = bool(re.search(r"oas[ie]", otext, re.I))
+                    occ = bool(card.get("occupied")) and not is_oasis
+                    out = [{
+                        "x": int(center_x),
+                        "y": int(center_y),
+                        "village_name": "Oasi" if is_oasis else "",
+                        "population": 1 if occ else 0,
+                        "occupied": occ,
+                        "is_oasis": is_oasis,
+                        "crop_fields": int(card.get("crop_fields") or 0),
+                        "distance": 0.0,
+                    }]
+
             # 2) Fallback Legends: tile dalle risposte JSON mappa
             #    captate durante il caricamento (api/v1/map/position).
             if not out and captured:
@@ -2638,9 +2666,15 @@ class TravianParser:
                                 .slice(0, 200),
                         })
                     """)
+                    noisy = (
+                        "/js/", "/css/", "/img", "/font", "/static/",
+                        "/assets/", "i18n", ".woff", ".png", ".svg",
+                    )
                     dbg["xhrUrls"] = [
-                        getattr(r, "url", "") for r in captured[:12]
-                    ]
+                        u for u in
+                        (getattr(r, "url", "") for r in captured)
+                        if u and not any(k in u.lower() for k in noisy)
+                    ][:16]
                     logger.debug(
                         "scan_map_area (%s|%s): 0 tile estratti, dump=%s",
                         center_x, center_y, dbg,
