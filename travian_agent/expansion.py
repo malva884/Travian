@@ -289,6 +289,10 @@ class ExpansionManager:
     cp_next_slot: str = ""          # ETA testuale prossimo slot (nuova UI)
     next_celebration_attempt: float = 0.0
     next_cp_read: float = 0.0        # cooldown snapshot CP dashboard
+    # Metriche dell'ultima scansione cropper (last_scan_at, tiles_read,
+    # map_views, details_checked, cache_hits, candidates_found,
+    # free_deferred, parser_suspect): esposte a Diagnostica AI.
+    scan_stats: dict = field(default_factory=dict)
     # Buffer Decision Audit Log: eventi decisionali del ciclo in corso,
     # svuotato dall'orchestrator via drain_audit() (non persistito).
     _audit: list[dict] = field(default_factory=list)
@@ -354,6 +358,8 @@ class ExpansionManager:
                     data.get("next_celebration_attempt") or 0.0
                 )
                 self.next_cp_read = float(data.get("next_cp_read") or 0.0)
+                ss = data.get("scan_stats")
+                self.scan_stats = dict(ss) if isinstance(ss, dict) else {}
         except Exception:
             pass
 
@@ -374,6 +380,7 @@ class ExpansionManager:
                     "cp_next_slot": self.cp_next_slot,
                     "next_celebration_attempt": self.next_celebration_attempt,
                     "next_cp_read": self.next_cp_read,
+                    "scan_stats": self.scan_stats,
                 },
                 indent=2,
             )
@@ -712,8 +719,10 @@ class ExpansionManager:
                 approved, int(SCAN_COOLDOWN_SECONDS // 3600),
             )
             tiles_seen = 0
+            scanner: MapScanner | None = None
             try:
-                found, tiles_seen = await MapScanner(store).scan(
+                scanner = MapScanner(store)
+                found, tiles_seen = await scanner.scan(
                     observer=observer,
                     account_id=self.account_id,
                     villages=villages,
@@ -732,10 +741,15 @@ class ExpansionManager:
                         "Riprovo tra %d min.",
                         prefix, int(MAP_SCAN_RETRY_SECONDS // 60),
                     )
-            except Exception:
+            except Exception as e_scan:
                 logger.warning(
-                    "%s Scansione cropper fallita", prefix, exc_info=True
+                    "%s Scansione cropper fallita: %s",
+                    prefix, e_scan, exc_info=True,
                 )
+            # Telemetria Diagnostica AI: metriche ultima scansione
+            # (disponibili anche in caso di eccezione parziale).
+            if scanner is not None and scanner.last_stats:
+                self.scan_stats = dict(scanner.last_stats)
             # Cooldown pieno solo se la scansione ha letto tile; su vuoto/
             # errore si riprova al ciclo successivo con un retry breve.
             self.next_map_scan = now + (

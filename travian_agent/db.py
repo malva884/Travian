@@ -82,6 +82,17 @@ CREATE TABLE IF NOT EXISTS village_snapshots (
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_vs_acc ON village_snapshots(account_id, village_name, ts);
+-- Cache dei tile mappa ispezionati dal Cropper Finder: i tile scartati
+-- (occupati / non-cropper) non vengono ri-dettagliati a ogni scansione.
+CREATE TABLE IF NOT EXISTS map_tile_cache (
+    account_id TEXT NOT NULL,
+    x INTEGER NOT NULL,
+    y INTEGER NOT NULL,
+    occupied INTEGER DEFAULT 0,
+    crop_fields INTEGER DEFAULT 0,
+    checked_ts REAL NOT NULL,
+    PRIMARY KEY (account_id, x, y)
+);
 """
 
 _MIGRATION_FLAG = "_migration_v1"
@@ -192,6 +203,31 @@ def kv_write(key: str, data: str) -> None:
             )
     except Exception:
         logger.debug("kv_write(%s) fallito", key, exc_info=True)
+
+
+def kv_timestamps(keys: list[str] | None = None) -> dict[str, float]:
+    """``updated_ts`` delle chiavi kv_state richieste (o di tutte).
+
+    Usato dalla diagnostica AI: il timestamp di aggiornamento del
+    documento di un manager e' un proxy del suo ultimo run utile.
+    """
+    try:
+        with _db() as conn:
+            if keys:
+                marks = ",".join("?" for _ in keys)
+                rows = conn.execute(
+                    "SELECT key, updated_ts FROM kv_state"
+                    f" WHERE key IN ({marks})",
+                    tuple(keys),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT key, updated_ts FROM kv_state"
+                ).fetchall()
+        return {str(r[0]): float(r[1] or 0.0) for r in rows}
+    except Exception:
+        logger.debug("kv_timestamps fallito", exc_info=True)
+        return {}
 
 
 # ----------------------------------------------------------------------
@@ -395,6 +431,75 @@ def cropper_save(data: dict[str, list[dict]]) -> None:
             )
     except Exception:
         logger.debug("cropper_save() fallito", exc_info=True)
+
+
+# ----------------------------------------------------------------------
+# Map tile cache (Cropper Finder): esito ispezione per tile con TTL
+# ----------------------------------------------------------------------
+
+def tile_cache_get(
+    account_id: str, max_age_seconds: float
+) -> dict[tuple[int, int], dict]:
+    """Tile ispezionati di recente: ``(x, y) -> {occupied, crop_fields}``."""
+    try:
+        cutoff = time.time() - float(max_age_seconds or 0.0)
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT x, y, occupied, crop_fields, checked_ts"
+                " FROM map_tile_cache"
+                " WHERE account_id = ? AND checked_ts >= ?",
+                (account_id, cutoff),
+            ).fetchall()
+        return {
+            (int(r[0]), int(r[1])): {
+                "occupied": bool(r[2]),
+                "crop_fields": int(r[3] or 0),
+                "checked_ts": float(r[4] or 0.0),
+            }
+            for r in rows
+        }
+    except Exception:
+        logger.debug("tile_cache_get fallito", exc_info=True)
+        return {}
+
+
+def tile_cache_put(account_id: str, tiles: list[dict]) -> None:
+    """Upsert dei tile ispezionati ``{x, y, occupied, crop_fields}``.
+
+    Rotazione opportunistica: le righe piu' vecchie di 7 giorni vengono
+    eliminate a ogni scrittura (la TTL utile e' gestita in lettura).
+    """
+    if not tiles:
+        return
+    now = time.time()
+    try:
+        with _db() as conn:
+            conn.executemany(
+                "INSERT INTO map_tile_cache"
+                " (account_id, x, y, occupied, crop_fields, checked_ts)"
+                " VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(account_id, x, y) DO UPDATE SET"
+                " occupied=excluded.occupied,"
+                " crop_fields=excluded.crop_fields,"
+                " checked_ts=excluded.checked_ts",
+                [
+                    (
+                        str(account_id),
+                        int(t.get("x") or 0),
+                        int(t.get("y") or 0),
+                        1 if t.get("occupied") else 0,
+                        int(t.get("crop_fields") or 0),
+                        now,
+                    )
+                    for t in tiles
+                ],
+            )
+            conn.execute(
+                "DELETE FROM map_tile_cache WHERE checked_ts < ?",
+                (now - 7 * 86400,),
+            )
+    except Exception:
+        logger.debug("tile_cache_put fallito", exc_info=True)
 
 
 # ----------------------------------------------------------------------

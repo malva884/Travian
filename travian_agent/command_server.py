@@ -284,17 +284,42 @@ _ACCOUNT_FIELDS = {
 
 
 def _account_config(acc) -> dict:
-    """Config serializzabile di un Settings (nessun Path oggetto)."""
+    """Config serializzabile di un Settings (nessun Path oggetto).
+
+    La password non esce mai in chiaro: solo il flag "impostata si/no"
+    (utile per la diagnostica login)."""
     return {
         "account_id": acc.account_id,
         "server_url": acc.server_url,
         "username": acc.username,
+        "password_set": bool(getattr(acc, "password", "") or ""),
         "tribe": acc.tribe,
         "server_speed": float(getattr(acc, "server_speed", 1.0) or 1.0),
         "headless": acc.headless,
         "strategy_profile": acc.strategy_profile,
         "loop_interval_min": acc.loop_interval_min,
         "loop_interval_max": acc.loop_interval_max,
+        "action_delay_min": getattr(acc, "action_delay_min", None),
+        "action_delay_max": getattr(acc, "action_delay_max", None),
+        "max_build_queue": getattr(acc, "max_build_queue", None),
+        "max_resource_queue": getattr(acc, "max_resource_queue", None),
+        "max_interior_queue": getattr(acc, "max_interior_queue", None),
+        "allow_parallel_build": getattr(acc, "allow_parallel_build", None),
+        "auto_video_bonus": getattr(acc, "auto_video_bonus", None),
+        "stealth_pauses": getattr(acc, "stealth_pauses", None),
+        "module_pause_minutes": getattr(acc, "module_pause_minutes", None),
+        "module_pause_max_minutes": getattr(
+            acc, "module_pause_max_minutes", None
+        ),
+        "night_sleep_enabled": getattr(acc, "night_sleep_enabled", None),
+        "night_sleep_start_hour": getattr(
+            acc, "night_sleep_start_hour", None
+        ),
+        "night_sleep_hours_min": getattr(acc, "night_sleep_hours_min", None),
+        "night_sleep_hours_max": getattr(acc, "night_sleep_hours_max", None),
+        "session_conflict_pause_minutes": getattr(
+            acc, "session_conflict_pause_minutes", None
+        ),
         "min_net_crop_threshold": acc.min_net_crop_threshold,
         "builder_enabled": acc.builder_enabled,
         "farming": asdict(acc.farming),
@@ -1001,7 +1026,12 @@ _ASK_EOL_MODELS = {
     "gemini-1.5-pro", "gemini-1.5-pro-latest", "gemini-pro",
 }
 _ASK_DEFAULT_MODEL = "gemini-3.5-flash-lite"
-_AUDIT_PROMPT_ROWS = 20
+_AUDIT_PROMPT_ROWS = 80
+# Eventi audit scansionati per ricavare l'ultimo evento di ogni modulo
+# (copre anche i moduli silenziosi, non solo la coda del prompt).
+_AUDIT_MODULE_SCAN_ROWS = 400
+# Righe di errore lette dal log testuale dell'agente (state/agent_*.log).
+_MODULE_ERROR_TAIL = 12
 
 
 def _gemini_generate_sync(prompt: str, api_key: str, model_name: str) -> str:
@@ -1025,13 +1055,304 @@ def _gemini_generate_sync(prompt: str, api_key: str, model_name: str) -> str:
         return response.text or ""
 
 
+def _fmt_ts(ts) -> str:
+    """Epoch -> 'YYYY-MM-DD HH:MM:SS' locale; '' su valori invalidi/0."""
+    try:
+        val = float(ts or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if val <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(val).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError):
+        return ""
+
+
+def _audit_events_for_prompt(
+    account_id: str, snap: dict | None
+) -> list[dict]:
+    """Eventi del Decision Audit Log, dal piu' recente (DESC).
+
+    Fonte primaria: tabella ``village_snapshots`` del DB (timestamp
+    completi, storico fino a 7gg/5000 righe). Fallback: il tail
+    ``audit_logs`` gia' serializzato nello snapshot dashboard.
+    """
+    try:
+        from . import db
+
+        events = db.decision_query(
+            account_id, limit=_AUDIT_MODULE_SCAN_ROWS
+        )
+        if events:
+            return events
+    except Exception:  # noqa: BLE001
+        pass
+    out: list[dict] = []
+    if isinstance(snap, dict):
+        for r in (snap.get("audit_logs") or []):
+            out.append(
+                {
+                    "ts": 0.0,
+                    "time": str(r.get("time") or ""),
+                    "village_name": str(r.get("village") or ""),
+                    "module": str(r.get("module") or ""),
+                    "decision": str(r.get("decision") or ""),
+                    "outcome": str(r.get("outcome") or ""),
+                    "reason": str(r.get("reason") or ""),
+                }
+            )
+    return list(reversed(out))
+
+
+def _ev_brief(ev: dict | None) -> dict | None:
+    """Compatta un evento audit per il prompt (at/decision/outcome/...)."""
+    if not ev:
+        return None
+    return {
+        "at": ev.get("time") or _fmt_ts(ev.get("ts") or 0.0),
+        "decision": str(ev.get("decision") or ""),
+        "outcome": str(ev.get("outcome") or ""),
+        "village": str(ev.get("village_name") or ev.get("village") or ""),
+        "reason": str(ev.get("reason") or "")[:240],
+    }
+
+
+def _module_status(
+    account_id: str, acc, events: list[dict], snap: dict | None
+) -> dict:
+    """Stato operativo dei subsystem per la diagnostica.
+
+    Per ogni modulo: flag enabled da config, ``state_updated_at``
+    (updated_ts del documento kv — proxy del last run), ultimo evento
+    audit e ultimo BLOCKED. Per ``expansion`` anche il runtime persistito
+    (cooldown scansione cropper, feed_target, CP, tile fondati) e per
+    ``cropper_finder`` il conteggio dei candidati nel DB.
+    """
+    from . import db
+
+    safe = "".join(
+        c if c.isalnum() or c in "._-" else "_" for c in account_id
+    )
+    kv_keys = {
+        "builder": f"build_plan_{account_id}.json",
+        "scout": f"scout_{safe}.json",
+        "farming": f"farming_{safe}.json",
+        "hero": f"hero_{safe}.json",
+        "expansion": f"expansion_{safe}.json",
+        "defense": f"defense_{safe}.json",
+        "replenishment": f"replenish_{safe}.json",
+        "war": f"war_targets_{safe}.json",
+    }
+    kv_ts = db.kv_timestamps(list(kv_keys.values()))
+    enabled = {
+        "builder": bool(getattr(acc, "builder_enabled", True)),
+        "scout": bool(getattr(acc.scout_brain, "enabled", False)),
+        "farming": bool(getattr(acc.farming, "enabled", False)),
+        "hero": bool(getattr(acc.hero, "enabled", False)),
+        "expansion": bool(getattr(acc.expansion, "auto_expand", False)),
+        "defense": bool(getattr(acc.defense, "enabled", False)),
+        "replenishment": bool(
+            getattr(acc.replenishment, "enabled", False)
+        ),
+    }
+
+    # events e' DESC: la prima occorrenza per modulo e' la piu' recente.
+    last_ev: dict[str, dict] = {}
+    last_blocked: dict[str, dict] = {}
+    for ev in events:
+        mod = str(ev.get("module") or "")
+        if not mod:
+            continue
+        last_ev.setdefault(mod, ev)
+        if str(ev.get("outcome") or "") == "BLOCKED":
+            last_blocked.setdefault(mod, ev)
+
+    status: dict[str, dict] = {}
+    for mod, key in kv_keys.items():
+        entry: dict = {
+            "enabled": enabled.get(mod),
+            "state_updated_at": _fmt_ts(kv_ts.get(key, 0.0)),
+            "last_audit_event": _ev_brief(last_ev.get(mod)),
+        }
+        blocked = last_blocked.get(mod)
+        if blocked is not None:
+            entry["last_blocked"] = _ev_brief(blocked)
+        status[mod] = entry
+    # Moduli audit senza documento kv (command_center, smithy, ...).
+    for mod, ev in last_ev.items():
+        if mod not in status:
+            status[mod] = {
+                "enabled": None,
+                "state_updated_at": "",
+                "last_audit_event": _ev_brief(ev),
+            }
+
+    # Doc kv dell'ExpansionManager: letto una volta per cropper_finder
+    # (scan_stats) e per il blocco runtime (cooldown, feed_target, CP).
+    try:
+        raw = db.kv_read(kv_keys["expansion"])
+        exp_doc = json.loads(raw) if raw else {}
+        if not isinstance(exp_doc, dict):
+            exp_doc = {}
+    except Exception:  # noqa: BLE001
+        exp_doc = {}
+
+    # Cropper Finder: conteggi dei candidati nel DB + cooldown scansione
+    # (gira dentro ExpansionManager -> doc expansion_<acc>.json).
+    try:
+        from .cropper import CropperStore
+
+        cands = CropperStore().list_candidates(account_id)
+        by_status: dict[str, int] = {}
+        for c in cands:
+            by_status[c.status] = by_status.get(c.status, 0) + 1
+        status["cropper_finder"] = {
+            "enabled": bool(
+                getattr(acc.expansion, "cropper_scan", True)
+            ),
+            "scan_radius": int(
+                getattr(acc.expansion, "scan_radius", 0) or 0
+            ),
+            "candidates_total": len(cands),
+            "candidates_by_status": by_status,
+            # Metriche ultima scansione persistite da ExpansionManager
+            # (last_scan_at, tiles_read, map_views, details_checked,
+            # cache_hits, candidates_found, free_deferred,
+            # parser_suspect). Vuote se mai eseguita.
+            "last_scan": exp_doc.get("scan_stats") or None,
+            "candidates": [
+                {
+                    "id": c.id,
+                    "x": c.x,
+                    "y": c.y,
+                    "type": c.type,
+                    "status": c.status,
+                    "bonus_crop_percent": c.bonus_crop_percent,
+                    "distance_hours": c.distance_hours,
+                }
+                for c in cands[:25]
+            ],
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug("Stato cropper_finder non disponibile", exc_info=True)
+
+    # Runtime expansion: cooldown e obiettivi persistiti dal manager.
+    rt: dict = {}
+    for k in ("feed_target", "bootstrap_target", "founded_tiles"):
+        if exp_doc.get(k) is not None:
+            rt[k] = exp_doc.get(k)
+    for k in (
+        "next_map_scan",
+        "next_found_attempt",
+        "next_celebration_attempt",
+        "next_cp_read",
+    ):
+        if exp_doc.get(k):
+            rt[k] = _fmt_ts(exp_doc.get(k))
+    for k in ("cp_current", "cp_required", "cp_daily"):
+        if exp_doc.get(k):
+            rt[k] = exp_doc.get(k)
+    if rt:
+        status.setdefault("expansion", {})["runtime"] = rt
+
+    # Coloni addestrati: dallo snapshot (TRAIN_SETTLERS gira nel modulo
+    # expansion — l'ultimo evento audit e' lo stesso canale).
+    if isinstance(snap, dict):
+        settlers = {
+            str(v.get("name") or ""): int(
+                (v.get("settlers") or {}).get("trained") or 0
+            )
+            for v in snap.get("villages") or []
+        }
+        settlers = {k: n for k, n in settlers.items() if n}
+        status["settlers"] = {
+            "trained_by_village": settlers,
+            "trained_total": sum(settlers.values()),
+            "last_audit_event": _ev_brief(last_ev.get("expansion")),
+        }
+    return status
+
+
+def _focus_diagnostics(acc, snap: dict | None) -> dict:
+    """skip_reasons + slot STUCK della Coda Prioritaria per villaggio.
+
+    Ricalcola sul GameState ricostruito dallo snapshot con la stessa
+    logica del builder runtime. Nota: ``focus_stuck_slots`` riflette il
+    circuit-breaker in memoria del processo agente; se /api/ask gira in
+    un processo diverso (dashboard) il set puo' essere vuoto — i motivi
+    STUCK restano comunque visibili nell'audit log.
+    """
+    out: dict[str, dict] = {}
+    if not isinstance(snap, dict):
+        return out
+    try:
+        from .builder import focus_skip_reasons, focus_stuck_slots
+    except Exception:  # noqa: BLE001
+        return out
+    for v in snap.get("villages") or []:
+        name = str(v.get("name") or "")
+        if not name:
+            continue
+        state = _state_from_snapshot(snap, name)
+        if state is None:
+            continue
+        entry: dict = {}
+        try:
+            reasons = focus_skip_reasons(state, acc)
+            if reasons:
+                entry["skip_reasons"] = reasons
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            stuck = sorted(int(s) for s in focus_stuck_slots(state))
+            if stuck:
+                entry["stuck_slots"] = stuck
+        except Exception:  # noqa: BLE001
+            pass
+        if entry:
+            out[name] = entry
+    return out
+
+
+def _agent_log_errors(
+    account_id: str, limit: int = _MODULE_ERROR_TAIL
+) -> list[str]:
+    """Ultime righe di errore dal log dell'agente (state/agent_<id>.log).
+
+    Le eccezioni dei moduli ("Errore modulo ...") finiscono solo nel log
+    testuale, non nel Decision Audit Log: questo tail copre il buco.
+    """
+    path = STATE_DIR / f"agent_{account_id}.log"
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - 262144))
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    hits = [
+        ln.strip()[:220]
+        for ln in tail.splitlines()
+        if any(
+            k in ln.lower()
+            for k in ("errore", "error", "traceback", "exception")
+        )
+    ]
+    return hits[-limit:]
+
+
 def _handle_ask_agent(body: dict) -> tuple[dict, int]:
     """POST /api/ask — chat diagnostica con contesto agente pre-assemblato.
 
     ``{"question", "account_id"?, "village"?, "history"? [{q,a}]}``: il
-    prompt include inputs snapshot (dashboard_state senza audit), config
-    serializzata (API key mascherata) e ultime 20 righe del Decision
-    Audit Log. La chiave e' quella di scout_brain o GEMINI_API_KEY env.
+    prompt include stato worker, stato operativo dei moduli (ultimo
+    evento audit, updated_ts del doc kv, ultimo BLOCKED, conteggio
+    cropper_candidates), snapshot telemetria con eta' e diagnostica
+    Coda Prioritaria (skip reasons + slot STUCK), config serializzata
+    (segreti mascherati), tail errori del log agente e ultime
+    ``_AUDIT_PROMPT_ROWS`` righe del Decision Audit Log dal DB.
+    La chiave e' quella di scout_brain o GEMINI_API_KEY env.
     """
     from .config import load_accounts
 
@@ -1073,16 +1394,37 @@ def _handle_ask_agent(body: dict) -> tuple[dict, int]:
         )
 
     snap, _status = _read_snapshot(account_id)
-    audit_rows = (
-        list(snap.get("audit_logs") or [])[-_AUDIT_PROMPT_ROWS:]
-        if isinstance(snap, dict)
-        else []
-    )
     snap_ctx = (
         {k: v for k, v in snap.items() if k != "audit_logs"}
         if isinstance(snap, dict)
         else None
     )
+    events = _audit_events_for_prompt(account_id, snap)
+    # Le righe del prompt in ordine cronologico (events e' DESC).
+    audit_rows = list(reversed(events[:_AUDIT_PROMPT_ROWS]))
+
+    focus_diag = _focus_diagnostics(acc, snap)
+    if isinstance(snap_ctx, dict):
+        snap_ctx = dict(snap_ctx)
+        # Eta' dello snapshot: chiave per distinguere "agente fermo"
+        # da "modulo che non produce eventi".
+        try:
+            snap_ts = datetime.fromisoformat(str(snap.get("timestamp") or ""))
+            snap_ctx["snapshot_age_seconds"] = max(
+                0,
+                int(
+                    (
+                        datetime.now(snap_ts.tzinfo) - snap_ts
+                    ).total_seconds()
+                ),
+            )
+        except (TypeError, ValueError):
+            pass
+        if focus_diag:
+            snap_ctx["focus_queue_diagnostics"] = focus_diag
+
+    module_status = _module_status(account_id, acc, events, snap)
+    log_errors = _agent_log_errors(account_id)
 
     cfg = _account_config(acc)
     # La chiave non deve finire nel prompt: mascherata, ma la presenza
@@ -1098,10 +1440,22 @@ def _handle_ask_agent(body: dict) -> tuple[dict, int]:
 
     sections = [
         "Sei il modulo diagnostico AI di un agente Travian. Rispondi in "
-        "italiano, in modo sintetico e operativo, basandoti SOLO sui dati "
-        "forniti: snapshot dei villaggi, configurazione e audit log delle "
-        "decisioni. Se i dati non bastano per rispondere, dillo "
-        "esplicitamente e indica cosa manca o quale check fare.",
+        "italiano, in modo tecnico, diretto e azionabile. Nel contesto hai "
+        "sezioni separate: STATO WORKER (processi/pause), STATO MODULI "
+        "(enabled, state_updated_at = ultimo salvataggio del modulo, "
+        "last_audit_event, last_blocked, conteggi cropper/coloni), "
+        "SNAPSHOT (telemetria villaggi con snapshot_age_seconds e "
+        "focus_queue_diagnostics = motivi di skip e slot STUCK della Coda "
+        "Prioritaria), CONFIGURAZIONE, ERRORI LOG e DECISION AUDIT LOG. "
+        "INCROCIA le fonti prima di rispondere: confronta i flag enabled/"
+        "auto_expand/cropper_scan della config con i timestamp dei moduli "
+        "e con gli eventi audit; se un modulo non ha eventi recenti "
+        "verifica se e' disabilitato, se il worker e' fermo o in pausa, se "
+        "lo snapshot e' vecchio o se l'ultimo BLOCKED/errore ne spiega il "
+        "fermo. Cita sempre le evidenze usate (timestamp, decisioni, "
+        "motivi). Rispondi 'non determinabile dai dati' solo dopo aver "
+        "controllato TUTTE le sezioni, indicando quale dato manca o quale "
+        "check manuale fare.",
         f"DATA/ORA SERVER: {datetime.now().isoformat(timespec='seconds')}",
         f"ACCOUNT: {account_id}"
         + (f" · VILLAGGIO FOCUS: {village}" if village else ""),
@@ -1111,30 +1465,54 @@ def _handle_ask_agent(body: dict) -> tuple[dict, int]:
             f"Utente: {h['q']}\nAgente: {h.get('a', '')}" for h in history
         )
         sections.append(f"CONVERSAZIONE PRECEDENTE:\n{prev}")
+    try:
+        workers = _worker_rows()
+    except Exception:  # noqa: BLE001
+        workers = None
+    if workers:
+        sections.append(
+            "STATO WORKER (processi agente, pause, sessioni):\n"
+            + json.dumps(workers, ensure_ascii=False, indent=1)
+        )
+    sections.append(
+        "STATO MODULI / BACKGROUND JOBS (enabled, ultimo salvataggio di "
+        "stato, ultimo evento audit, ultimo BLOCKED, conteggi):\n"
+        + json.dumps(module_status, ensure_ascii=False, indent=1)[:24000]
+    )
     if snap_ctx is not None:
         sections.append(
-            "INPUTS SNAPSHOT (ultima telemetria villaggi):\n"
+            "INPUTS SNAPSHOT (ultima telemetria villaggi; "
+            "snapshot_age_seconds = eta' del dato; "
+            "focus_queue_diagnostics = skip reasons e slot STUCK):\n"
             + json.dumps(snap_ctx, ensure_ascii=False, indent=1)[:60000]
         )
     else:
         sections.append(
             "INPUTS SNAPSHOT: nessuna telemetria disponibile (l'agente "
-            "non ha ancora completato un ciclo)."
+            "non ha ancora completato un ciclo o non e' in esecuzione — "
+            "incrocia con STATO WORKER)."
         )
     sections.append(
         "CONFIGURAZIONE AGENTE:\n"
         + json.dumps(cfg, ensure_ascii=False, indent=1)[:30000]
     )
+    if log_errors:
+        sections.append(
+            "ULTIMI ERRORI DAL LOG AGENTE (state/agent_*.log):\n"
+            + "\n".join(log_errors)
+        )
     if audit_rows:
         audit_txt = "\n".join(
-            f"[{r.get('time', '?')}] {r.get('village', '?')} "
-            f"{r.get('module', '?')} {r.get('decision', '?')}: "
-            f"{r.get('reason', '')}"
+            f"[{r.get('time') or _fmt_ts(r.get('ts')) or '?'}] "
+            f"{r.get('village_name') or r.get('village') or '?'} "
+            f"{r.get('module', '?')} {r.get('decision', '?')} "
+            f"({r.get('outcome') or '-'}): "
+            f"{str(r.get('reason') or '')[:300]}"
             for r in audit_rows
         )
         sections.append(
-            f"DECISION AUDIT LOG (ultime {len(audit_rows)} righe):\n"
-            + audit_txt
+            f"DECISION AUDIT LOG (ultime {len(audit_rows)} righe, "
+            "cronologico):\n" + audit_txt
         )
     else:
         sections.append("DECISION AUDIT LOG: nessuna voce registrata.")
@@ -1164,6 +1542,9 @@ def _handle_ask_agent(body: dict) -> tuple[dict, int]:
                 "village": village,
                 "snapshot": snap_ctx is not None,
                 "audit_rows": len(audit_rows),
+                "modules_tracked": len(module_status),
+                "focus_diag_villages": sorted(focus_diag),
+                "agent_log_errors": len(log_errors),
             },
         },
         200,

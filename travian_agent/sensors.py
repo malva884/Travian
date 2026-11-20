@@ -2322,12 +2322,15 @@ class TravianParser:
                 () => {
                     const body = (document.body && document.body.innerText) || '';
                     const panel = document.querySelector(
-                        '#map_details, .map_details, #tileDetails, .tileDetails, #map_infobox, .infobox'
+                        '#map_details, .map_details, #tileDetails, .tileDetails, #map_infobox, .infobox, ' +
+                        '#positionDetails, .position-details, .tile-details, #map_popup, #popupMap, .popupContent'
                     );
                     const text = (panel && panel.innerText) || body;
 
-                    // Distribuzione campi "3-3-3-9" (9c) o "1-1-1-15" (15c)
-                    const dist = text.match(/(\\d)\\s*[-\\u2212\\u2010-\\u2015]\\s*(\\d)\\s*[-\\u2212\\u2010-\\u2015]\\s*(\\d)\\s*[-\\u2212\\u2010-\\u2015]\\s*(\\d+)/);
+                    // Distribuzione campi "3-3-3-9" (9c) o "1-1-1-15" (15c).
+                    // Su Legends i separatori possono essere celle/whitespace,
+                    // slash, punti o virgole — non solo trattini.
+                    const dist = text.match(/(\\d)\\s*[-\\u2212\\u2010-\\u2015\\/.,:\\s]\\s*(\\d)\\s*[-\\u2212\\u2010-\\u2015\\/.,:\\s]\\s*(\\d)\\s*[-\\u2212\\u2010-\\u2015\\/.,:\\s]\\s*(\\d+)/);
                     let cropFields = 0;
                     if (dist) {
                         cropFields = parseInt(dist[4], 10) || 0;
@@ -2442,29 +2445,64 @@ class TravianParser:
         """Scansiona la mappa attorno al villaggio attivo (karte.php).
 
         Estrae i villaggi grigi (inattivi/abbandonati), oasi e insediamenti vicini.
+        Canali di estrazione, in ordine: DOM della griglia (T4.4/T4.5,
+        incluse iframe), poi risposte JSON XHR/fetch captate durante il
+        caricamento (Travian Legends: api/v1/map/position e simili).
         """
         if not self.page:
             return []
-        try:
-            await self._goto(
-                _abs_game_url(self.page.url or "", f"{selectors.PATH_MAP}?x={center_x}&y={center_y}"),
-            )
-            # T4.5/T4.6: la griglia mappa e' renderizzata via JS dopo il
-            # DOMContentLoaded — attendiamo la comparsa di almeno un tile
-            # (timeout breve, non fatale: il dump diagnostico copre i casi ko).
+
+        # Travian Legends renderizza la mappa via XHR JSON: le risposte
+        # vengono captate e parsate quando il DOM non espone i tile.
+        captured: list = []
+
+        def _on_response(resp) -> None:
             try:
-                await self.page.wait_for_selector(
-                    "a[href*='position_details.php'], a[href*='karte.php?x='], "
-                    "map area, #mapContainer a, [id*='tile' i], [data-x][data-y]",
-                    timeout=6000,
-                )
+                rt = resp.request.resource_type
+                if rt and rt not in ("xhr", "fetch"):
+                    return
             except Exception:
                 pass
-        except Exception:
-            return []
+            captured.append(resp)
 
         try:
-            tiles: list = await self.page.evaluate("""
+            self.page.on("response", _on_response)
+        except Exception:
+            pass
+
+        try:
+            try:
+                await self._goto(
+                    _abs_game_url(self.page.url or "", f"{selectors.PATH_MAP}?x={center_x}&y={center_y}"),
+                )
+                # T4.5/T4.6/Legends: la griglia mappa e' renderizzata via
+                # JS/XHR dopo il DOMContentLoaded — attendiamo la comparsa
+                # di almeno un tile o di una risposta mappa (timeout
+                # breve, non fatale: il dump diagnostico copre i casi ko).
+                try:
+                    await self.page.wait_for_selector(
+                        "a[href*='position_details.php'], a[href*='karte.php?x='], "
+                        "map area, #mapContainer a, [id*='tile' i], [data-x][data-y], "
+                        "[data-cell-id], .map .cell, #map .tile",
+                        timeout=4500,
+                    )
+                except Exception:
+                    pass
+                # Attesa breve extra per XHR mappa ancora in volo.
+                if not captured:
+                    try:
+                        await self.page.wait_for_timeout(1200)
+                    except Exception:
+                        pass
+            except Exception:
+                return []
+
+            # 1) Estrazione DOM (tutti i frame: la mappa puo' vivere in
+            #    un iframe).
+            tiles: list = []
+            for frame in list(getattr(self.page, "frames", [self.page])):
+                try:
+                    part = await frame.evaluate("""
                 (params) => {
                     const { centerX, centerY, rad } = params;
                     const results = [];
@@ -2561,7 +2599,25 @@ class TravianParser:
                     return results;
                 }
             """, {"centerX": center_x, "centerY": center_y, "rad": radius})
-            out = [t for t in (tiles or []) if isinstance(t, dict)]
+                    if isinstance(part, list):
+                        tiles.extend(part)
+                except Exception:
+                    continue
+
+            out = [t for t in tiles if isinstance(t, dict)]
+
+            # 2) Fallback Legends: tile dalle risposte JSON mappa
+            #    captate durante il caricamento (api/v1/map/position).
+            if not out and captured:
+                try:
+                    out = await self._map_xhr_tiles(
+                        captured, center_x, center_y, radius
+                    )
+                except Exception:
+                    logger.debug(
+                        "scan_map_area (%s|%s): parsing XHR mappa fallito",
+                        center_x, center_y, exc_info=True,
+                    )
             if not out:
                 # Dump diagnostico: rivela il markup reale della pagina mappa
                 # (container presenti, iframe, tile alternativi) al prossimo run.
@@ -2582,6 +2638,9 @@ class TravianParser:
                                 .slice(0, 200),
                         })
                     """)
+                    dbg["xhrUrls"] = [
+                        getattr(r, "url", "") for r in captured[:12]
+                    ]
                     logger.debug(
                         "scan_map_area (%s|%s): 0 tile estratti, dump=%s",
                         center_x, center_y, dbg,
@@ -2591,6 +2650,146 @@ class TravianParser:
             return out
         except Exception:
             return []
+        finally:
+            try:
+                self.page.remove_listener("response", _on_response)
+            except Exception:
+                pass
+
+    async def _map_xhr_tiles(
+        self,
+        responses: list,
+        center_x: int,
+        center_y: int,
+        radius: int,
+    ) -> list[dict]:
+        """Estrae i tile mappa dalle risposte JSON captate (Travian
+        Legends popola la griglia via api/v1/map/position e simili).
+
+        Cerca ricorsivamente dizionari con chiavi x/y nel payload. Prima
+        passata solo su URL "da mappa" (map/karte/position/tile); se non
+        produce nulla, seconda passata su tutte le XHR JSON.
+        """
+        found: dict[tuple[int, int], dict] = {}
+
+        def _walk(node, depth: int = 0) -> None:
+            if depth > 6:
+                return
+            if isinstance(node, dict):
+                if "x" in node and "y" in node:
+                    t = self._tile_from_map_json(node, center_x, center_y)
+                    if t is not None:
+                        found.setdefault((t["x"], t["y"]), t)
+                for v in node.values():
+                    _walk(v, depth + 1)
+            elif isinstance(node, list):
+                for v in node:
+                    _walk(v, depth + 1)
+
+        for want_mapish in (True, False):
+            for resp in responses:
+                url = (getattr(resp, "url", "") or "").lower()
+                mapish = any(
+                    k in url for k in ("map", "karte", "position", "tile")
+                )
+                if want_mapish != mapish:
+                    continue
+                try:
+                    payload = await resp.json()
+                except Exception:
+                    continue
+                _walk(payload)
+            if found:
+                break
+
+        return [
+            t for t in found.values() if t["distance"] <= radius * 1.5
+        ]
+
+    @staticmethod
+    def _tile_from_map_json(
+        d: dict, center_x: int, center_y: int
+    ) -> dict | None:
+        """Normalizza un tile dal payload JSON della mappa Legends."""
+        try:
+            x = int(d.get("x"))
+            y = int(d.get("y"))
+        except (TypeError, ValueError):
+            return None
+
+        def _num(*vals) -> int:
+            for v in vals:
+                if v is None:
+                    continue
+                try:
+                    return int(float(v))
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        village = d.get("village") if isinstance(d.get("village"), dict) else {}
+        oasis = d.get("oasis") if isinstance(d.get("oasis"), dict) else {}
+        ttype = str(d.get("type") or d.get("tileType") or "").lower()
+        is_oasis = bool(oasis) or bool(d.get("isOasis")) or "oasis" in ttype
+        pop = _num(
+            d.get("population"), d.get("pop"), village.get("population")
+        )
+        owner = (
+            d.get("playerId") or d.get("player") or d.get("owner")
+            or d.get("uid") or village.get("playerId")
+        )
+        name = str(
+            d.get("title") or d.get("name") or village.get("name") or ""
+        )
+        if not name:
+            name = "Oasi" if is_oasis else f"Tile ({x}|{y})"
+
+        # Distribuzione campi: "3-3-3-9" / "1 1 1 15" / "3339" / "11115"
+        # oppure chiave cropFields nei valori del tile (profondita' <= 2).
+        crop = _num(d.get("cropFields"), d.get("crop_fields"))
+        if not crop:
+            strs: list[str] = []
+
+            def _collect(n, depth: int) -> None:
+                if depth > 2:
+                    return
+                if isinstance(n, str):
+                    strs.append(n)
+                elif isinstance(n, dict):
+                    for v in n.values():
+                        _collect(v, depth + 1)
+                elif isinstance(n, list):
+                    for v in n:
+                        _collect(v, depth + 1)
+
+            _collect(d, 0)
+            dist_re = re.compile(
+                r"(\d)\s*[-\u2212\u2010-\u2015/.,:\s]\s*(\d)"
+                r"\s*[-\u2212\u2010-\u2015/.,:\s]\s*(\d)"
+                r"\s*[-\u2212\u2010-\u2015/.,:\s]\s*(\d+)"
+            )
+            compact_re = re.compile(r"^\s*(\d)(\d)(\d)(\d{1,2})\s*$")
+            for s in strs:
+                m = dist_re.search(s) or compact_re.search(s)
+                if m:
+                    crop = int(m.group(4))
+                    break
+
+        dist = ((x - center_x) ** 2 + (y - center_y) ** 2) ** 0.5
+        return {
+            "x": x,
+            "y": y,
+            "village_name": name,
+            "population": pop,
+            "occupied": (not is_oasis) and (bool(owner) or pop > 0),
+            "is_oasis": is_oasis,
+            "oasis_type": str(
+                oasis.get("type") or oasis.get("resType")
+                or d.get("oasisType") or ("crop" if is_oasis else "")
+            ),
+            "crop_fields": crop,
+            "distance": dist,
+        }
 
     async def read_combat_reports(self, limit: int = 15) -> list[dict]:
         """Legge gli ultimi report di saccheggio/combattimento (berichte.php).

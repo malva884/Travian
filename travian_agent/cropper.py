@@ -24,6 +24,7 @@ import logging
 import math
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -63,6 +64,15 @@ OASIS_INFLUENCE_RADIUS = 3.0
 SCAN_COOLDOWN_SECONDS = 3 * 3600.0
 # Quanti tile liberi dettagliare (read_map_tile) per singola scansione
 MAX_DETAIL_CHECKS_PER_SCAN = 24
+# TTL cache tile ispezionati (map_tile_cache): i tile scartati (es.
+# 4-4-4-6 o occupati) non vengono ri-controllati per 48h, cosi' ogni
+# scansione avanza oltre i primi MAX_DETAIL_CHECKS_PER_SCAN tile.
+TILE_CACHE_TTL_SECONDS = 48 * 3600.0
+# Navigazione multi-vista: la griglia karte.php mostra ~17x17 tile;
+# step 15 copre il raggio impostato senza sovrapposizioni eccessive.
+MAP_VIEW_STEP = 15
+# Tetto di pagine mappa caricate per ciclo (richieste HTTP extra).
+MAX_MAP_VIEWS_PER_SCAN = 10
 
 
 def make_candidate_id(crop_fields: int, x: int, y: int) -> str:
@@ -289,8 +299,40 @@ class MapScanner:
     vengono associate al candidato entro OASIS_INFLUENCE_RADIUS campi.
     """
 
-    def __init__(self, store: CropperStore | None = None) -> None:
+    def __init__(
+        self,
+        store: CropperStore | None = None,
+        max_views: int = MAX_MAP_VIEWS_PER_SCAN,
+    ) -> None:
         self.store = store or CropperStore()
+        # Tetto viste mappa per scansione (anti-bot: pagine karte.php).
+        self.max_views = max(1, int(max_views or 1))
+        # Metriche dell'ultima scansione: persistite dall'ExpansionManager
+        # (campo scan_stats del doc kv) ed esposte a /api/ask.
+        self.last_stats: dict = {}
+
+    @staticmethod
+    def _view_centers(cx: int, cy: int, radius: int) -> list[tuple[int, int]]:
+        """Centri delle viste mappa per coprire il raggio impostato.
+
+        La griglia karte.php mostra ~17x17 tile: un'unica vista centrata
+        sul villaggio non copre un raggio di 30-45 campi. La copertura
+        avviene su una griglia di viste a passo ``MAP_VIEW_STEP``,
+        ordinate per distanza dal centro (le piu' interne prima).
+        """
+        step = MAP_VIEW_STEP
+        span = max(0, int(radius))
+        n = span // step
+        out = [(cx, cy)]
+        for i in range(-n, n + 1):
+            for j in range(-n, n + 1):
+                if i == 0 and j == 0:
+                    continue
+                vx, vy = cx + i * step, cy + j * step
+                if math.hypot(vx - cx, vy - cy) <= span:
+                    out.append((vx, vy))
+        out.sort(key=lambda p: math.hypot(p[0] - cx, p[1] - cy))
+        return out
 
     async def scan(
         self,
@@ -333,103 +375,238 @@ class MapScanner:
         logger.info(
             "%s CropperScanner: avvio scansione — centri: %s, "
             "raggio: %d campi, filtri: cropper %s, raggio oasi: %.0f, "
-            "max dettagli per scansione: %d",
+            "max dettagli per scansione: %d, max viste mappa: %d",
             prefix, centers_desc, radius,
             "/".join(f"{n}c" for n in CROPPER_FIELD_COUNTS),
-            OASIS_INFLUENCE_RADIUS, max_detail_checks,
+            OASIS_INFLUENCE_RADIUS, max_detail_checks, self.max_views,
         )
 
+        # Cache tile ispezionati (map_tile_cache): attiva solo quando lo
+        # store dei candidati usa il DB condiviso — i file-store dei test
+        # non toccano la cache. Evita di ri-dettagliare tile scartati.
+        use_cache = bool(getattr(self.store, "_db_mode", True))
+        tile_cache: dict[tuple[int, int], dict] = (
+            db.tile_cache_get(account_id, TILE_CACHE_TTL_SECONDS)
+            if use_cache
+            else {}
+        )
+        cache_batch: list[dict] = []
+
+        # Rotazione delle viste: con piu' viste del tetto, ogni scansione
+        # (cooldown 3h) parte da un offset diverso e copre tutto il
+        # raggio nel giro di qualche ciclo.
+        rot = int(time.time() // SCAN_COOLDOWN_SECONDS)
+
         new_found = 0
-        tiles_seen = 0
         details_done = 0
-        seen_tiles: set[tuple[int, int]] = set()
+        cache_hits = 0
+        views_used = 0
+        free_checked = 0
+        free_with_fields = 0
+        fields_from_map = 0
+        deferred = 0
+        seen_tiles: set[tuple[int, int]] = set()   # tile dettagliati/skippati
+        seen_all: set[tuple[int, int]] = set()     # dedup griglia tra viste
         oases_tiles: list[dict] = []
 
         for center in centers:
-            tiles = await self._scan_grid(
-                observer, center.x or 0, center.y or 0, radius
-            )
-            tiles_seen += len(tiles)
-            oases_tiles.extend(t for t in tiles if t.get("is_oasis"))
-            free_tiles = [
-                t for t in tiles
-                if not t.get("is_oasis") and not t.get("occupied")
-            ]
-            logger.info(
-                "%s CropperScanner: '%s' -> %d tile letti, %d liberi, %d oasi.",
-                prefix, center.name, len(tiles), len(free_tiles),
-                sum(1 for t in tiles if t.get("is_oasis")),
-            )
+            cx, cy = int(center.x or 0), int(center.y or 0)
+            views = self._view_centers(cx, cy, radius)
+            # Il centro del villaggio e' sempre la prima vista; la
+            # rotazione cicla solo le viste esterne (copertura completa
+            # del raggio nel giro di poche scansioni).
+            rest = [v for v in views if v != (cx, cy)]
+            if len(rest) > self.max_views - 1:
+                offset = rot % len(rest)
+                rest = rest[offset:] + rest[:offset]
+            views = [(cx, cy)] + rest[: self.max_views - 1]
+            center_coords: set[tuple[int, int]] = set()
+            center_free: set[tuple[int, int]] = set()
+            center_oases: set[tuple[int, int]] = set()
+            for vx, vy in views:
+                tiles = await self._scan_grid(observer, vx, vy, radius)
+                views_used += 1
+                new_tiles = []
+                for t in tiles:
+                    try:
+                        key = (int(t["x"]), int(t["y"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if key in seen_all:
+                        continue
+                    seen_all.add(key)
+                    center_coords.add(key)
+                    new_tiles.append(t)
+                oases_new = [t for t in new_tiles if t.get("is_oasis")]
+                for t in oases_new:
+                    center_oases.add((int(t["x"]), int(t["y"])))
+                oases_tiles.extend(oases_new)
+                free_new = [
+                    t for t in new_tiles
+                    if not t.get("is_oasis") and not t.get("occupied")
+                ]
+                for t in free_new:
+                    center_free.add((int(t["x"]), int(t["y"])))
 
-            total_free = len(free_tiles)
-            for tile in free_tiles:
+                # Dettaglio immediato dei tile liberi in raggio: il
+                # budget di letture si spende su tile nuovi (catalogo e
+                # cache gia' filtrati) fino al limite per scansione.
+                for tile in free_new:
+                    try:
+                        tx, ty = int(tile["x"]), int(tile["y"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (tx, ty) in seen_tiles:
+                        continue
+                    if math.hypot(tx - cx, ty - cy) > radius:
+                        # Fuori dal raggio del centro: il tile resta
+                        # candidabile solo se entra nel raggio di un
+                        # altro centro in una vista successiva.
+                        continue
+                    if details_done >= max_detail_checks:
+                        deferred += 1
+                        continue
+                    seen_tiles.add((tx, ty))
+
+                    # Gia' catalogato (qualunque stato): non ri-dettagliare
+                    known_status = self.store.status_at(account_id, tx, ty)
+                    if known_status is not None:
+                        logger.debug(
+                            "%s CropperScanner: tile (%d|%d) gia' "
+                            "catalogato (status=%s), salto.",
+                            prefix, tx, ty, known_status,
+                        )
+                        continue
+
+                    # Gia' ispezionato di recente (cache DB)
+                    cached = tile_cache.get((tx, ty))
+                    if cached is not None:
+                        cache_hits += 1
+                        logger.debug(
+                            "%s CropperScanner: tile (%d|%d) in cache "
+                            "(%s), salto.",
+                            prefix, tx, ty,
+                            "occupato" if cached.get("occupied")
+                            else f"{int(cached.get('crop_fields') or 0)}c",
+                        )
+                        continue
+
+                    # Su Legends la distribuzione campi puo' gia' essere
+                    # nel payload mappa: niente position_details.
+                    grid_crop = int(tile.get("crop_fields") or 0)
+                    if grid_crop:
+                        info = {"occupied": False, "crop_fields": grid_crop,
+                                "text": "map-json"}
+                        fields_from_map += 1
+                    else:
+                        logger.debug(
+                            "%s CropperScanner [%s]: dettaglio tile %d "
+                            "(limite %d) a (%d|%d)...",
+                            prefix, center.name, details_done + 1,
+                            max_detail_checks, tx, ty,
+                        )
+                        info = await observer.read_map_tile(tx, ty)
+                        details_done += 1
+                    if info.get("occupied"):
+                        logger.debug(
+                            "%s CropperScanner: tile (%d|%d) occupato, "
+                            "scarto.",
+                            prefix, tx, ty,
+                        )
+                        # occupied=True senza testo = lettura fallita:
+                        # non si mette in cache un dato non osservato.
+                        if info.get("text"):
+                            cache_batch.append(
+                                {"x": tx, "y": ty, "occupied": True,
+                                 "crop_fields": 0}
+                            )
+                        continue
+                    crop = int(info.get("crop_fields") or 0)
+                    free_checked += 1
+                    if crop:
+                        free_with_fields += 1
+                    cache_batch.append(
+                        {"x": tx, "y": ty, "occupied": False,
+                         "crop_fields": crop}
+                    )
+                    if crop not in CROPPER_FIELD_COUNTS:
+                        logger.debug(
+                            "%s CropperScanner: tile (%d|%d) ha %dc, non "
+                            "e' un cropper %s, scarto.",
+                            prefix, tx, ty, crop,
+                            "/".join(
+                                f"{n}c" for n in CROPPER_FIELD_COUNTS
+                            ),
+                        )
+                        continue
+
+                    candidate = self._build_candidate(
+                        tx, ty, crop, centers, oases_tiles
+                    )
+                    self.store.upsert(account_id, candidate)
+                    new_found += 1
+                    logger.info(
+                        "%s[Cropper Finder] Trovato %s a (%d|%d) | "
+                        "Bonus Oasi: +%d%% | Stato: Pending",
+                        prefix, candidate.type, tx, ty,
+                        max(0, candidate.bonus_crop_percent - 100),
+                    )
+                    logger.debug(
+                        "%s[Cropper Finder]   distanza %.1fh da '%s'.",
+                        prefix, candidate.distance_hours,
+                        candidate.nearest_village,
+                    )
                 if details_done >= max_detail_checks:
                     logger.debug(
-                        "%s CropperScanner: raggiunto limite dettagli (%d), "
-                        "%d tile liberi non verificati.",
-                        prefix, max_detail_checks,
-                        total_free - len(seen_tiles),
+                        "%s CropperScanner: raggiunto limite dettagli "
+                        "(%d), ~%d tile liberi non verificati.",
+                        prefix, max_detail_checks, deferred,
                     )
-                    break
-                tx, ty = int(tile["x"]), int(tile["y"])
-                if (tx, ty) in seen_tiles:
-                    continue
-                seen_tiles.add((tx, ty))
-                # Gia' catalogato (qualunque stato): non ri-dettagliare
-                known_status = self.store.status_at(account_id, tx, ty)
-                if known_status is not None:
-                    logger.debug(
-                        "%s CropperScanner: tile (%d|%d) gia' catalogato "
-                        "(status=%s), salto.",
-                        prefix, tx, ty, known_status,
-                    )
-                    continue
+                    break  # altre viste = richieste mappa senza dettagli
 
-                logger.debug(
-                    "%s CropperScanner [%s]: dettaglio tile %d/%d "
-                    "(limite %d) a (%d|%d)...",
-                    prefix, center.name, len(seen_tiles), total_free,
-                    max_detail_checks, tx, ty,
-                )
-                info = await observer.read_map_tile(tx, ty)
-                details_done += 1
-                if info.get("occupied"):
-                    logger.debug(
-                        "%s CropperScanner: tile (%d|%d) occupato, scarto.",
-                        prefix, tx, ty,
-                    )
-                    continue
-                crop = int(info.get("crop_fields") or 0)
-                if crop not in CROPPER_FIELD_COUNTS:
-                    logger.debug(
-                        "%s CropperScanner: tile (%d|%d) ha %dc, non e' un "
-                        "cropper %s, scarto.",
-                        prefix, tx, ty, crop,
-                        "/".join(f"{n}c" for n in CROPPER_FIELD_COUNTS),
-                    )
-                    continue
+            tiles_seen = len(seen_all)
+            logger.info(
+                "%s CropperScanner: '%s' -> %d tile letti, %d liberi, "
+                "%d oasi (%d viste).",
+                prefix, center.name, tiles_seen, len(center_free),
+                len(center_oases), views_used,
+            )
+            if details_done >= max_detail_checks:
+                break
 
-                candidate = self._build_candidate(
-                    tx, ty, crop, centers, oases_tiles
-                )
-                self.store.upsert(account_id, candidate)
-                new_found += 1
-                logger.info(
-                    "%s[Cropper Finder] Trovato %s a (%d|%d) | "
-                    "Bonus Oasi: +%d%% | Stato: Pending",
-                    prefix, candidate.type, tx, ty,
-                    max(0, candidate.bonus_crop_percent - 100),
-                )
-                logger.debug(
-                    "%s[Cropper Finder]   distanza %.1fh da '%s'.",
-                    prefix, candidate.distance_hours,
-                    candidate.nearest_village,
-                )
-
+        tiles_seen = len(seen_all)
+        # details>0 su tile liberi ma nessun campo grano letto: quasi
+        # sicuramente il parser della pagina dettagli non riconosce il
+        # markup di questo server (es. layout Legends) — il warning resta
+        # nel log agente e in last_stats.parser_suspect per /api/ask.
+        parser_suspect = bool(free_checked >= 4 and free_with_fields == 0)
+        if parser_suspect:
+            logger.warning(
+                "%s CropperScanner: %d tile liberi dettagliati ma "
+                "crop_fields=0 su tutti — parser position_details "
+                "probabilmente non allineato al markup del server.",
+                prefix, free_checked,
+            )
+        if use_cache and cache_batch:
+            db.tile_cache_put(account_id, cache_batch)
+        self.last_stats = {
+            "last_scan_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "tiles_read": tiles_seen,
+            "map_views": views_used,
+            "details_checked": details_done,
+            "cache_hits": cache_hits,
+            "fields_from_map": fields_from_map,
+            "candidates_found": new_found,
+            "free_deferred": deferred,
+            "parser_suspect": parser_suspect,
+        }
         logger.info(
             "%s CropperScanner: scansione completata — tile letti: %d, "
-            "dettagli effettuati: %d, nuovi candidati: %d.",
-            prefix, tiles_seen, details_done, new_found,
+            "viste mappa: %d, dettagli effettuati: %d, hit cache: %d, "
+            "nuovi candidati: %d%s.",
+            prefix, tiles_seen, views_used, details_done, cache_hits,
+            new_found,
+            " [PARSER SOSPETTO]" if parser_suspect else "",
         )
         return new_found, tiles_seen
 
@@ -451,14 +628,20 @@ class MapScanner:
             is_oasis = bool(t.get("is_oasis"))
             name = str(t.get("village_name") or "")
             bonus, oasis_type = _parse_oasis_bonus(name)
+            # occupied: i tile dal JSON mappa (Legends) lo portano gia';
+            # dal DOM si deduce dalla popolazione nel tooltip.
+            occupied = bool(t.get("occupied")) or (
+                not is_oasis and bool(t.get("population"))
+            )
             out.append(
                 {
                     "x": x,
                     "y": y,
-                    "occupied": not is_oasis and bool(t.get("population")),
+                    "occupied": occupied,
                     "is_oasis": is_oasis,
                     "oasis_bonus": bonus,
-                    "oasis_type": oasis_type,
+                    "oasis_type": str(t.get("oasis_type") or oasis_type),
+                    "crop_fields": int(t.get("crop_fields") or 0),
                 }
             )
         return out
