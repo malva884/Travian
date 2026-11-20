@@ -30,6 +30,7 @@ from .builder import (
     net_crop,
     plan_upgrades,
     queue_slots_free,
+    record_upgrade_exec,
     save_build_plan,
 )
 from .building_prereqs import (
@@ -2458,6 +2459,27 @@ async def monitor_all_villages(
                         except (TypeError, ValueError):
                             continue
                 if _done_slot > 0:
+                    # Circuit-breaker Coda Prioritaria: registra il livello
+                    # dello slot REALMENTE eseguito; se lo step non
+                    # progredisce dopo 2 EXECUTED viene marcato STUCK.
+                    try:
+                        _lvl = next(
+                            (
+                                int(f.level)
+                                for f in state.fields
+                                if f.slot_id == _done_slot
+                            ),
+                            0,
+                        )
+                        record_upgrade_exec(
+                            str(
+                                village.village_id or village.name or "0"
+                            ),
+                            _done_slot,
+                            _lvl,
+                        )
+                    except Exception:
+                        pass
                     state.build_queue.append(
                         BuildQueueItem(
                             name="(upgrade avviato)",

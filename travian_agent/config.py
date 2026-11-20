@@ -102,6 +102,10 @@ class VillageConfig:
     # pressione raid. 0 = auto (3 per villaggio singolo o ruolo
     # early_cropper_founder, 2 per gli altri ruoli).
     max_crannies: int = 0
+    # Pesi risorsa per il selettore campi dorf1 (Strategy Compiler):
+    # {"wood","clay","iron","crop"} float > 0 — il campo da uppare e'
+    # scelto minimizzando (riempimento/peso); vuoto = risorsa piu' scarsa.
+    resource_weights: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:
@@ -147,6 +151,11 @@ class ExpansionConfig:
     # villaggio produce almeno cosi' tanto lordo all'ora (wood+clay+iron+crop).
     # Default tarato su server 1x: su speed server impostare ~ speed * 900.
     min_freeze_hourly_prod: int = 900
+    # AUTO_CELEBRATION (Strategy Compiler): Piccola Festa automatica nel
+    # Municipio di OGNI villaggio che lo possiede quando i CP non bastano
+    # per il prossimo slot e le risorse coprono il costo della festa.
+    # Indipendente da auto_expand (gira nel blocco CP dello step).
+    auto_celebrate: bool = False
 
 
 @dataclass
@@ -459,6 +468,9 @@ def _parse_account_item(item: dict) -> Settings:
                                 min_freeze_hourly_prod=int(
                                     dict(item.get("expansion_settings") or {}).get("min_freeze_hourly_prod", 900)
                                 ),
+                                auto_celebrate=bool(
+                                    dict(item.get("expansion_settings") or {}).get("auto_celebrate", False)
+                                ),
                                 target_slots=[
                                     ExpansionTarget(
                                         x=int(t.get("x", 0)),
@@ -517,6 +529,14 @@ def _parse_account_item(item: dict) -> Settings:
                                     smithy_auto_upgrade=dict(
                                         cfg.get("smithy_auto_upgrade") or {}
                                     ),
+                                    max_crannies=int(cfg.get("max_crannies", 0) or 0),
+                                    resource_weights={
+                                        str(k): float(v)
+                                        for k, v in dict(
+                                            cfg.get("resource_weights") or {}
+                                        ).items()
+                                        if str(k) in ("wood", "clay", "iron", "crop")
+                                    },
                                 )
                                 for key, cfg in (item.get("villages") or {}).items()
                                 if isinstance(cfg, dict)
@@ -676,6 +696,7 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                 "scan_radius": acc.expansion.scan_radius,
                 "spending_freeze": acc.expansion.spending_freeze,
                 "min_freeze_hourly_prod": acc.expansion.min_freeze_hourly_prod,
+                "auto_celebrate": acc.expansion.auto_celebrate,
                 "target_slots": [
                     {"x": t.x, "y": t.y, "note": t.note}
                     for t in acc.expansion.target_slots
@@ -713,6 +734,8 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                         cfg.troop_replenishment_preset
                     ),
                     "smithy_auto_upgrade": dict(cfg.smithy_auto_upgrade),
+                    "max_crannies": int(cfg.max_crannies or 0),
+                    "resource_weights": dict(cfg.resource_weights),
                 }
                 for key, cfg in acc.villages.items()
             },

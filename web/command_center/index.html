@@ -155,6 +155,10 @@
           <button onclick="switchView('audits')" data-view="audits" class="sidebar-btn w-full flex items-center justify-between px-3 py-2 rounded-xl text-slate-300 hover:bg-slate-800/60">
             <span>Audits</span>
           </button>
+          <button onclick="switchView('ask-agent')" data-view="ask-agent" class="sidebar-btn w-full flex items-center justify-between px-3 py-2 rounded-xl text-slate-300 hover:bg-slate-800/60">
+            <span>Chiedi all'Agente</span>
+            <span class="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-purple-500/15 text-purple-300 border border-purple-500/40">AI</span>
+          </button>
           <button onclick="switchView('debug')" data-view="debug" class="sidebar-btn w-full flex items-center justify-between px-3 py-2 rounded-xl text-slate-300 hover:bg-slate-800/60">
             <span>Debug</span>
           </button>
@@ -1520,6 +1524,81 @@
       </div>
     </section>
 
+    <!-- VIEW 11: CHIEDI ALL'AGENTE / DIAGNOSTICA AI -->
+    <section id="view-ask-agent" class="view-section hidden space-y-4">
+      <div class="panel-card rounded-2xl p-4 space-y-3 font-mono">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-xs uppercase tracking-wider text-purple-400 font-bold">Chiedi all'Agente — Diagnostica AI (Gemini)</h2>
+          <div class="flex items-center gap-2 text-[10px]">
+            <span id="ask-context-badge" class="px-2 py-0.5 rounded-lg bg-cyan-500/15 text-cyan-300 border border-cyan-500/35">snapshot · config · audit 20</span>
+            <span id="ask-model-badge" class="px-2 py-0.5 rounded-lg bg-slate-700/40 text-slate-300 border border-slate-600">Gemini</span>
+          </div>
+        </div>
+        <p class="text-[10px] text-slate-500">A ogni domanda vengono inviati automaticamente l'ultimo Inputs Snapshot dei villaggi, la configurazione dell'account e le ultime 20 righe del Decision Audit Log. Es: "Quando partono i coloni?", "C'è qualche blocco?".</p>
+        <div id="ask-chat-log" class="space-y-2.5 max-h-[460px] overflow-y-auto pr-1">
+          <div id="ask-chat-hint" class="text-slate-500 italic text-[11px]">Nessuna domanda ancora — scegli un suggerimento o scrivi sotto.</div>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button onclick="askAgent('Quando partono i coloni?')" class="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-purple-500/20 text-slate-300 hover:text-purple-300 border border-slate-700 hover:border-purple-500/40 text-[11px]">🧭 Quando partono i coloni?</button>
+          <button onclick="askAgent('C&#39;è qualche blocco o stallo in corso?')" class="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-purple-500/20 text-slate-300 hover:text-purple-300 border border-slate-700 hover:border-purple-500/40 text-[11px]">🧱 C'è qualche blocco?</button>
+          <button onclick="askAgent('Perché non si costruisce adesso?')" class="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-purple-500/20 text-slate-300 hover:text-purple-300 border border-slate-700 hover:border-purple-500/40 text-[11px]">🏗️ Perché non si costruisce?</button>
+          <button onclick="askAgent('Quali rischi o attacchi imminenti vedi?')" class="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-purple-500/20 text-slate-300 hover:text-purple-300 border border-slate-700 hover:border-purple-500/40 text-[11px]">⚔️ Rischi imminenti?</button>
+          <button onclick="askAgent('Prossimi step di espansione?')" class="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-purple-500/20 text-slate-300 hover:text-purple-300 border border-slate-700 hover:border-purple-500/40 text-[11px]">🌱 Prossimi step espansione?</button>
+        </div>
+        <div class="flex gap-2 pt-1 border-t border-slate-800">
+          <input id="ask-input" type="text" placeholder="Scrivi una domanda sull'agente…"
+            onkeydown="if(event.key==='Enter')askAgent()"
+            class="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200 focus:border-purple-400 focus:outline-none">
+          <button id="ask-send-btn" onclick="askAgent()" class="px-4 py-2 rounded-xl bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/40 text-xs font-bold shrink-0">
+            ✦ Invia
+          </button>
+        </div>
+      </div>
+
+      <!-- STRATEGY COMPILER — testo strategico -> patch accounts.json -->
+      <div class="panel-card rounded-2xl p-4 space-y-3 font-mono border-l-4 border-l-purple-500">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="text-xs uppercase tracking-wider text-purple-400 font-bold">Strategy Compiler — Testo Strategico → Config Account</h2>
+          <span id="strategy-model-badge" class="px-2 py-0.5 rounded-lg bg-slate-700/40 text-slate-300 border border-slate-600 text-[10px]">Gemini Structured Output</span>
+        </div>
+        <p class="text-[10px] text-slate-500">Incolla una strategia in linguaggio naturale: l'AI la compila in un patch di configurazione (ruoli, coda prioritaria edifici, pesi risorse, eroe/truppe/anti-raid, feste al Municipio). Rivedi il <b>diff JSON</b> prima di applicare — le azioni non coperte dal bot finiscono in <b>unsupported_actions</b>.</p>
+        <div class="flex flex-wrap gap-2 items-center">
+          <select id="strategy-template" onchange="fillStrategyTemplate()" class="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-300 focus:border-purple-400 focus:outline-none">
+            <option value="">— Template strategia… —</option>
+            <option value="romans_start">🏛️ Romani Start — Corsa al 2° Villaggio</option>
+            <option value="romans_raider">⚔️ Romani Raider EI — Imperatore + Saccheggio</option>
+            <option value="roman_hammer">🔨 Romano Offensivo — Catapulte &amp; Hammer</option>
+          </select>
+          <button onclick="clearStrategyResult()" class="px-2.5 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700/60 text-slate-400 border border-slate-700 text-[11px]">Pulisci</button>
+        </div>
+        <textarea id="strategy-text" rows="9" spellcheck="false"
+          placeholder="Descrivi la strategia in linguaggio naturale…"
+          class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-[11px] leading-relaxed text-slate-200 focus:border-purple-400 focus:outline-none"></textarea>
+        <div class="flex flex-wrap items-center gap-2">
+          <button id="strategy-compile-btn" onclick="compileStrategy()" class="px-4 py-2 rounded-xl bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/40 text-xs font-bold">
+            ⚙ Compila Strategia con AI
+          </button>
+          <button id="strategy-apply-btn" onclick="applyStrategy()" disabled class="px-4 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 text-xs font-bold disabled:opacity-40 disabled:cursor-not-allowed">
+            ✓ Applica all'Account
+          </button>
+          <span id="strategy-status" class="text-[10px] text-slate-500"></span>
+        </div>
+        <div id="strategy-summary" class="hidden text-[11px] text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 rounded-lg px-3 py-2"></div>
+        <div id="strategy-result" class="hidden space-y-2">
+          <div class="text-[10px] uppercase tracking-wider text-slate-400">Diff configurazione proposto (validato sui dataclass)</div>
+          <pre id="strategy-diff" class="max-h-[340px] overflow-auto bg-slate-950 border border-slate-800 rounded-xl p-3 text-[10px] leading-relaxed text-slate-300"></pre>
+          <div id="strategy-unsupported-box" class="hidden space-y-1">
+            <div class="text-[10px] uppercase tracking-wider text-amber-400">Azioni non supportate dal bot (richieste dal testo)</div>
+            <ul id="strategy-unsupported" class="list-disc list-inside text-[11px] text-amber-300 space-y-0.5"></ul>
+          </div>
+          <div id="strategy-warnings-box" class="hidden space-y-1">
+            <div class="text-[10px] uppercase tracking-wider text-red-400">Campi scartati in validazione</div>
+            <ul id="strategy-warnings" class="list-disc list-inside text-[11px] text-red-300 space-y-0.5"></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- VIEW 10: DEBUG -->
     <section id="view-debug" class="view-section hidden space-y-4">
       <div class="grid grid-cols-1 xl:grid-cols-12 gap-4 font-mono">
@@ -2127,6 +2206,11 @@
       document.getElementById('header-view-title').textContent = meta.title;
       document.getElementById('header-view-subtitle').textContent = meta.sub;
       if (viewId === 'audits') renderFullAuditTable();
+      if (viewId === 'ask-agent') {
+        updateAskContextBadge();
+        const inp = document.getElementById('ask-input');
+        if (inp) setTimeout(() => inp.focus(), 60);
+      }
       if (viewId === 'debug') renderDebugDiagnostics();
       if (viewId === 'command-center') renderCommandCenterFeed();
       if (viewId === 'overview') renderOverview();
@@ -3294,6 +3378,284 @@
         simSel.innerHTML = villages.length
           ? villages.map(v => `<option value="${esc(v.name)}">${esc(v.name)}</option>`).join('')
           : '<option value="">(auto: primo villaggio)</option>';
+      }
+    }
+
+    // =========================================================================
+    // CHIEDI ALL'AGENTE: chat diagnostica Gemini (POST /api/ask)
+    // =========================================================================
+    const askHistory = [];
+
+    function updateAskContextBadge() {
+      const badge = document.getElementById('ask-context-badge');
+      if (!badge) return;
+      const acc = appState.activeAccount || '?';
+      const snap = !!(appState.liveData && appState.liveData.villages);
+      const auditN = ((appState.liveData || {}).audit_logs || []).length;
+      badge.textContent =
+        `${acc} · snapshot ${snap ? 'OK' : 'n/d'} · audit ${Math.min(auditN, 20)}/20 · config`;
+    }
+
+    function appendAskMessage(role, text, meta = '') {
+      const log = document.getElementById('ask-chat-log');
+      if (!log) return null;
+      const hint = document.getElementById('ask-chat-hint');
+      if (hint) hint.remove();
+      const row = document.createElement('div');
+      if (role === 'user') {
+        row.className = 'flex justify-end';
+        row.innerHTML =
+          `<div class="max-w-[85%] px-3 py-2 rounded-xl bg-purple-500/20 border ` +
+          `border-purple-500/40 text-[12px] text-purple-100">${esc(text)}</div>`;
+      } else if (role === 'agent') {
+        const metaLine = meta
+          ? `<div class="text-[9px] text-slate-500 mb-1">${esc(meta)}</div>` : '';
+        row.innerHTML =
+          `<div class="max-w-[92%] px-3 py-2 rounded-xl bg-slate-900/90 border ` +
+          `border-slate-700 text-[12px] text-slate-200">` +
+          metaLine +
+          `<div class="whitespace-pre-wrap">${esc(text)}</div></div>`;
+      } else { // 'error' / 'pending'
+        row.className = 'flex';
+        row.innerHTML =
+          `<div class="max-w-[92%] px-3 py-2 rounded-xl border text-[11px] ` +
+          (role === 'error'
+            ? 'bg-red-500/10 border-red-500/40 text-red-300'
+            : 'bg-slate-900/90 border-slate-700 text-slate-400') +
+          `">${esc(text)}</div>`;
+      }
+      log.appendChild(row);
+      log.scrollTop = log.scrollHeight;
+      return row;
+    }
+
+    async function askAgent(preset) {
+      const input = document.getElementById('ask-input');
+      const btn = document.getElementById('ask-send-btn');
+      const question = String(
+        preset !== undefined ? preset : (input ? input.value : '')
+      ).trim();
+      if (!question) return;
+      if (input) input.value = '';
+      if (btn) { btn.disabled = true; btn.classList.add('opacity-50'); }
+      appendAskMessage('user', question);
+      const pending = appendAskMessage('pending',
+        '⏳ Analisi contesto agente in corso (snapshot + config + audit log)…');
+      try {
+        const res = await fetch(`${window.TravianOpsAPI.baseUrl}/api/ask`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question,
+            account_id: appState.activeAccount || '',
+            village: appState.activeVillage || '',
+            history: askHistory.slice(-6),
+          })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (pending) pending.remove();
+        if (res.ok && data.status === 'ok' && data.answer) {
+          const ctx = data.context || {};
+          const meta = `${data.model || 'Gemini'} · ` +
+            `audit ${ctx.audit_rows ?? '?'} righe · ` +
+            `snapshot ${ctx.snapshot ? '✓' : '—'}`;
+          appendAskMessage('agent', data.answer, meta);
+          askHistory.push({ q: question, a: data.answer });
+          if (askHistory.length > 10) askHistory.shift();
+          const mb = document.getElementById('ask-model-badge');
+          if (mb && data.model) mb.textContent = data.model;
+        } else {
+          appendAskMessage('error',
+            `⚠️ ${data.reason || `HTTP ${res.status}`}`);
+        }
+      } catch (e) {
+        if (pending) pending.remove();
+        appendAskMessage('error',
+          '⚠️ Command server non raggiungibile (avvia l\u2019app o l\u2019agente).');
+      } finally {
+        if (btn) { btn.disabled = false; btn.classList.remove('opacity-50'); }
+      }
+      updateAskContextBadge();
+    }
+
+    // =========================================================================
+    // STRATEGY COMPILER — testo strategico -> patch config (Gemini structured)
+    // =========================================================================
+    const STRATEGY_TEMPLATES = {
+      romans_start: [
+        "ROMANI START — CORSA AL 2° VILLAGGIO",
+        "",
+        "Fase 1 (giorni 1-3): massimizza la produzione con campi risorsa bilanciati,",
+        "peso extra su argilla e legno. Sviluppa Edificio Principale 5, Magazzino/",
+        "Granaio 10, Mercato 5 e Residenza 10 nel villaggio iniziale.",
+        "Fase 2: accumula Punti Cultura — costruisci Accademia 10 e Municipio, poi",
+        "lancia automaticamente Piccole Feste finche' i CP non bastano per il",
+        "prossimo slot. Addestra 3 coloni e fonda il 2° villaggio sul cropper",
+        "15c piu' vicino approvato.",
+        "Eroe: avventure automatiche, cura sotto il 50%, punti attributo su risorse.",
+        "Anti-raid: almeno 2 Nascondigli finche' non c'e' la fuga mercato.",
+        "Obiettivo: 2° villaggio entro il giorno 7-10 su server x1.",
+      ].join("\n"),
+      romans_raider: [
+        "ROMANI RAIDER EI — EQUITES IMPERATORIS + SACCHEGGIO",
+        "",
+        "Il villaggio e' un raider aggressivo: ruolo hammer, Caserma 20, Scuderia 20",
+        "e Fucina 20 con potenziamento automatico delle unita' offensive",
+        "(Imperatore, Equites Caesaris, Ariete, Catapulta).",
+        "Farming: raid periodici dalla farm list + raid dinamici AI Scout Brain con",
+        "eroe in supporto quando salute >= 65%. Truppe priorita': cavalry_off.",
+        "Economia: pesi risorse sbilanciati su legno e grano per sostenere la",
+        "produzione continua di cavalleria; grano sempre sopra la safety net.",
+        "Difesa minima: niente mura oltre livello 5, nessun addestramento difensivo.",
+      ].join("\n"),
+      roman_hammer: [
+        "ROMANO OFFENSIVO — CATAPULTE & HAMMER",
+        "",
+        "Villaggio da guerra: priorità assoluta a Caserma, Scuderia, Officina e",
+        "Fucina (tutte 20), Punto di Raduno 15, Piazza del Torneo 20.",
+        "Truppe: Imperano + Equites Caesaris + Arieti + Catapulte; replenishment",
+        "automatico delle perdite fino ai target (t3: 5000, t6: 2500, t7: 300,",
+        "t8: 300). Eroe: punti su strength, combattimento sopra il 65%.",
+        "Economia di supporto: Magazzino/Granaio 20, campi bilanciati con leggero",
+        "peso su ferro. Niente feste, niente coloni: ogni risorsa va all'esercito.",
+      ].join("\n"),
+    };
+    let strategyCompiledPatch = null;
+
+    function fillStrategyTemplate() {
+      const sel = document.getElementById('strategy-template');
+      const ta = document.getElementById('strategy-text');
+      if (!sel || !ta) return;
+      const tpl = STRATEGY_TEMPLATES[sel.value];
+      if (tpl) ta.value = tpl;
+    }
+
+    function clearStrategyResult() {
+      strategyCompiledPatch = null;
+      const ta = document.getElementById('strategy-text');
+      if (ta) ta.value = '';
+      const sel = document.getElementById('strategy-template');
+      if (sel) sel.value = '';
+      ['strategy-result', 'strategy-summary'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.add('hidden');
+      });
+      const status = document.getElementById('strategy-status');
+      if (status) status.textContent = '';
+      const btn = document.getElementById('strategy-apply-btn');
+      if (btn) btn.disabled = true;
+    }
+
+    function _renderStrategyDiff(diff) {
+      const el = document.getElementById('strategy-diff');
+      if (!el) return;
+      el.textContent = (diff && Object.keys(diff).length)
+        ? JSON.stringify(diff, null, 2)
+        : '// Nessuna modifica: la config attuale copre gia\' la strategia.';
+    }
+
+    function _renderStrategyList(listEl, boxEl, items) {
+      const ul = document.getElementById(listEl);
+      const box = document.getElementById(boxEl);
+      if (!ul || !box) return;
+      const arr = (items || []).filter(x => String(x).trim());
+      box.classList.toggle('hidden', !arr.length);
+      ul.innerHTML = arr.map(x => `<li>${esc(x)}</li>`).join('');
+    }
+
+    async function compileStrategy() {
+      const ta = document.getElementById('strategy-text');
+      const btn = document.getElementById('strategy-compile-btn');
+      const applyBtn = document.getElementById('strategy-apply-btn');
+      const status = document.getElementById('strategy-status');
+      const text = String(ta ? ta.value : '').trim();
+      if (!text) {
+        notify('Incolla o scegli una strategia da compilare', 'amber');
+        return;
+      }
+      strategyCompiledPatch = null;
+      if (applyBtn) applyBtn.disabled = true;
+      if (btn) { btn.disabled = true; btn.classList.add('opacity-50'); }
+      if (status) status.textContent = '⏳ Compilazione in corso (Gemini + validazione schema)…';
+      try {
+        const res = await fetch(`${window.TravianOpsAPI.baseUrl}/api/strategy/compile`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            account_id: appState.activeAccount || '',
+            text,
+          })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.status === 'ok') {
+          strategyCompiledPatch = data.patch || null;
+          const sum = document.getElementById('strategy-summary');
+          if (sum) {
+            sum.classList.toggle('hidden', !data.summary);
+            sum.textContent = data.summary ? `📋 ${data.summary}` : '';
+          }
+          document.getElementById('strategy-result').classList.remove('hidden');
+          _renderStrategyDiff(data.diff);
+          _renderStrategyList(
+            'strategy-unsupported', 'strategy-unsupported-box',
+            data.unsupported_actions
+          );
+          _renderStrategyList(
+            'strategy-warnings', 'strategy-warnings-box', data.warnings
+          );
+          const mb = document.getElementById('strategy-model-badge');
+          if (mb && data.model) mb.textContent = data.model;
+          const hasDiff = data.diff && Object.keys(data.diff).length;
+          if (applyBtn) applyBtn.disabled = !(hasDiff && strategyCompiledPatch);
+          if (status) status.textContent = hasDiff
+            ? '✔ Patch validato — rivedi il diff e applica.'
+            : '✔ Nessuna modifica necessaria.';
+          notify('Strategia compilata: diff pronto', 'emerald');
+        } else {
+          if (status) status.textContent = '';
+          notify(`Compilazione rifiutata: ${data.reason || res.status}`, 'amber');
+        }
+      } catch (e) {
+        if (status) status.textContent = '';
+        notify('Command server offline (:8610) — compilazione impossibile', 'red');
+      } finally {
+        if (btn) { btn.disabled = false; btn.classList.remove('opacity-50'); }
+      }
+    }
+
+    async function applyStrategy() {
+      if (!strategyCompiledPatch) return;
+      const btn = document.getElementById('strategy-apply-btn');
+      const status = document.getElementById('strategy-status');
+      if (btn) { btn.disabled = true; btn.classList.add('opacity-50'); }
+      if (status) status.textContent = '⏳ Salvataggio su accounts.json…';
+      try {
+        const res = await fetch(`${window.TravianOpsAPI.baseUrl}/api/strategy/apply`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            account_id: appState.activeAccount || '',
+            patch: strategyCompiledPatch,
+          })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.status === 'saved') {
+          strategyCompiledPatch = null;
+          if (status) status.textContent = '✔ Configurazione applicata (hot-reload attivo).';
+          notify('Strategia applicata all\'account', 'emerald');
+          _renderStrategyList(
+            'strategy-warnings', 'strategy-warnings-box', data.warnings
+          );
+          _renderStrategyDiff(data.diff);
+        } else {
+          if (btn) { btn.disabled = false; btn.classList.remove('opacity-50'); }
+          if (status) status.textContent = '';
+          notify(`Apply rifiutato: ${data.reason || res.status}`, 'amber');
+        }
+      } catch (e) {
+        if (btn) { btn.disabled = false; btn.classList.remove('opacity-50'); }
+        if (status) status.textContent = '';
+        notify('Command server offline (:8610)', 'red');
       }
     }
 

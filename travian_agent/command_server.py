@@ -6,6 +6,13 @@ Espone su una porta dedicata (default 8610):
   telemetria scritto dall'orchestratore (``state/dashboard_state_*.json``);
 - ``POST /api/command`` — accoda un comando rapido per l'agente
   (``{"action","village_name","params","account_id"}``);
+- ``POST /api/ask`` — diagnostica AI (Gemini): risponde a una domanda in
+  linguaggio naturale usando come contesto snapshot telemetria, config
+  e ultime righe del Decision Audit Log;
+- ``POST /api/strategy/compile`` — Strategy Compiler: traduce una
+  strategia in linguaggio naturale in un patch accounts.json validato
+  (Gemini Structured Outputs + schema dataclass) con diff old->new e
+  ``unsupported_actions``; ``POST /api/strategy/apply`` lo persiste;
 - ``GET  /command-center[/...]`` — serve i file statici di
   ``web/command_center`` (index.html).
 
@@ -16,6 +23,7 @@ occupata viene ignorato — vale il primo server attivo.
 
 from __future__ import annotations
 
+import copy
 import ctypes
 import json
 import logging
@@ -983,6 +991,753 @@ def _handle_debug_simulate(body: dict) -> tuple[dict, int]:
     )
 
 
+# ---------------------------------------------------------------------------
+# Chiedi all'Agente / Diagnostica AI (Gemini)
+# ---------------------------------------------------------------------------
+# Stessa mappatura dei modelli EOL di ai_scout_brain: la API v1beta li ha
+# deprecati, la richiesta verrebbe rifiutata.
+_ASK_EOL_MODELS = {
+    "gemini-1.5-flash", "gemini-1.5-flash-latest",
+    "gemini-1.5-pro", "gemini-1.5-pro-latest", "gemini-pro",
+}
+_ASK_DEFAULT_MODEL = "gemini-3.5-flash-lite"
+_AUDIT_PROMPT_ROWS = 20
+
+
+def _gemini_generate_sync(prompt: str, api_key: str, model_name: str) -> str:
+    """Chiamata sincrona a Gemini: SDK google-genai, fallback legacy."""
+    if model_name in _ASK_EOL_MODELS:
+        model_name = _ASK_DEFAULT_MODEL
+    try:
+        from google import genai as _genai  # type: ignore
+
+        client = _genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name, contents=prompt
+        )
+        return response.text or ""
+    except ImportError:
+        import google.generativeai as _legacy  # type: ignore
+
+        _legacy.configure(api_key=api_key)
+        model = _legacy.GenerativeModel(model_name)
+        response = model.generate_content(prompt)
+        return response.text or ""
+
+
+def _handle_ask_agent(body: dict) -> tuple[dict, int]:
+    """POST /api/ask — chat diagnostica con contesto agente pre-assemblato.
+
+    ``{"question", "account_id"?, "village"?, "history"? [{q,a}]}``: il
+    prompt include inputs snapshot (dashboard_state senza audit), config
+    serializzata (API key mascherata) e ultime 20 righe del Decision
+    Audit Log. La chiave e' quella di scout_brain o GEMINI_API_KEY env.
+    """
+    from .config import load_accounts
+
+    question = str(body.get("question") or "").strip()
+    if not question:
+        return {"status": "rejected", "reason": "domanda mancante"}, 400
+    account_id = str(body.get("account_id") or "") or _default_account_id()
+    if not account_id:
+        return (
+            {"status": "rejected", "reason": "account_id non risolvibile"},
+            400,
+        )
+    village = str(body.get("village") or "").strip()
+
+    acc = next(
+        (a for a in load_accounts() if a.account_id == account_id), None
+    )
+    if acc is None:
+        return (
+            {"status": "rejected",
+             "reason": f"account '{account_id}' non in accounts.json"},
+            404,
+        )
+
+    api_key = (
+        str(getattr(acc.scout_brain, "gemini_api_key", "") or "")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or ""
+    ).strip()
+    if not api_key:
+        return (
+            {
+                "status": "rejected",
+                "reason": "GEMINI_API_KEY non configurata: impostala in "
+                "Farming & Eroe → AI Scout Brain o nel file .env",
+            },
+            400,
+        )
+
+    snap, _status = _read_snapshot(account_id)
+    audit_rows = (
+        list(snap.get("audit_logs") or [])[-_AUDIT_PROMPT_ROWS:]
+        if isinstance(snap, dict)
+        else []
+    )
+    snap_ctx = (
+        {k: v for k, v in snap.items() if k != "audit_logs"}
+        if isinstance(snap, dict)
+        else None
+    )
+
+    cfg = _account_config(acc)
+    # La chiave non deve finire nel prompt: mascherata, ma la presenza
+    # resta visibile (diagnostica "perche' lo scout va in fallback").
+    sb_cfg = cfg.get("scout_brain")
+    if isinstance(sb_cfg, dict):
+        sb_cfg["gemini_api_key"] = "***" if sb_cfg.get("gemini_api_key") else ""
+
+    history = [
+        h for h in (body.get("history") or [])
+        if isinstance(h, dict) and h.get("q")
+    ][-6:]
+
+    sections = [
+        "Sei il modulo diagnostico AI di un agente Travian. Rispondi in "
+        "italiano, in modo sintetico e operativo, basandoti SOLO sui dati "
+        "forniti: snapshot dei villaggi, configurazione e audit log delle "
+        "decisioni. Se i dati non bastano per rispondere, dillo "
+        "esplicitamente e indica cosa manca o quale check fare.",
+        f"DATA/ORA SERVER: {datetime.now().isoformat(timespec='seconds')}",
+        f"ACCOUNT: {account_id}"
+        + (f" · VILLAGGIO FOCUS: {village}" if village else ""),
+    ]
+    if history:
+        prev = "\n".join(
+            f"Utente: {h['q']}\nAgente: {h.get('a', '')}" for h in history
+        )
+        sections.append(f"CONVERSAZIONE PRECEDENTE:\n{prev}")
+    if snap_ctx is not None:
+        sections.append(
+            "INPUTS SNAPSHOT (ultima telemetria villaggi):\n"
+            + json.dumps(snap_ctx, ensure_ascii=False, indent=1)[:60000]
+        )
+    else:
+        sections.append(
+            "INPUTS SNAPSHOT: nessuna telemetria disponibile (l'agente "
+            "non ha ancora completato un ciclo)."
+        )
+    sections.append(
+        "CONFIGURAZIONE AGENTE:\n"
+        + json.dumps(cfg, ensure_ascii=False, indent=1)[:30000]
+    )
+    if audit_rows:
+        audit_txt = "\n".join(
+            f"[{r.get('time', '?')}] {r.get('village', '?')} "
+            f"{r.get('module', '?')} {r.get('decision', '?')}: "
+            f"{r.get('reason', '')}"
+            for r in audit_rows
+        )
+        sections.append(
+            f"DECISION AUDIT LOG (ultime {len(audit_rows)} righe):\n"
+            + audit_txt
+        )
+    else:
+        sections.append("DECISION AUDIT LOG: nessuna voce registrata.")
+    sections.append(f"DOMANDA UTENTE: {question}")
+    prompt = "\n\n".join(sections)
+
+    model_name = str(
+        getattr(acc.scout_brain, "gemini_model", "") or _ASK_DEFAULT_MODEL
+    )
+    used_model = (
+        _ASK_DEFAULT_MODEL if model_name in _ASK_EOL_MODELS else model_name
+    )
+    try:
+        answer = _gemini_generate_sync(prompt, api_key, model_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Diagnostica AI (ask) fallita", exc_info=True)
+        return {"status": "error", "reason": f"Gemini: {exc}"}, 502
+    if not answer.strip():
+        return {"status": "error", "reason": "risposta vuota da Gemini"}, 502
+    return (
+        {
+            "status": "ok",
+            "answer": answer.strip(),
+            "model": used_model,
+            "context": {
+                "account_id": account_id,
+                "village": village,
+                "snapshot": snap_ctx is not None,
+                "audit_rows": len(audit_rows),
+            },
+        },
+        200,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Strategy Compiler (Testo Strategico -> Config Account via Gemini)
+# ---------------------------------------------------------------------------
+# Sottoinsieme dei campi account delegabili alla strategia: credenziali
+# e URL server non passano MAI per l'LLM.
+_STRATEGY_ACCOUNT_FIELDS = _ACCOUNT_FIELDS - {
+    "username", "password", "server_url",
+}
+
+# Schema di Structured Output (OpenAPI 3.0 subset, Gemini): il modello
+# risponde con un oggetto {summary?, patch, unsupported_actions?} — la
+# validazione vera avviene server-side sui dataclass di config.py.
+_STRATEGY_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "summary": {"type": "STRING"},
+        "patch": {
+            "type": "OBJECT",
+            "properties": {
+                "account": {"type": "OBJECT"},
+                "villages": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "village": {"type": "STRING"},
+                            "patch": {"type": "OBJECT"},
+                        },
+                        "required": ["village", "patch"],
+                    },
+                },
+                "farming": {"type": "OBJECT"},
+                "scout_brain": {"type": "OBJECT"},
+                "hero": {"type": "OBJECT"},
+                "defense": {"type": "OBJECT"},
+                "replenishment": {"type": "OBJECT"},
+                "expansion": {"type": "OBJECT"},
+            },
+        },
+        "unsupported_actions": {
+            "type": "ARRAY", "items": {"type": "STRING"},
+        },
+    },
+    "required": ["patch"],
+}
+
+
+def _gemini_generate_json_sync(
+    prompt: str, api_key: str, model_name: str, schema: dict | None = None
+) -> str:
+    """Variante JSON di ``_gemini_generate_sync`` con Structured Outputs.
+
+    Il nuovo SDK (google-genai) accetta ``response_mime_type`` +
+    ``response_schema``; su SDK assente/vecchio o schema rifiutato si
+    ripiega sulla chiamata testuale (il prompt chiede comunque JSON).
+    """
+    if model_name in _ASK_EOL_MODELS:
+        model_name = _ASK_DEFAULT_MODEL
+    if schema:
+        try:
+            from google import genai as _genai  # type: ignore
+
+            client = _genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": schema,
+                },
+            )
+            return response.text or ""
+        except ImportError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Structured output rifiutato: fallback su JSON testuale",
+                exc_info=True,
+            )
+    return _gemini_generate_sync(prompt, api_key, model_name)
+
+
+def _clean_queue_steps(
+    steps, warnings: list[str], field_name: str
+) -> list[dict]:
+    """Normalizza gli step {key|gid, target_level, priority} della coda.
+
+    Ogni step deve risolversi a un gid valido (FOCUS_KEY_GIDS o gid
+    numerico): gli step non interpretabili vengono scartati con warning
+    invece di corrompere la coda prioritaria del villaggio.
+    """
+    from .building_prereqs import gids_for_focus_key
+
+    out: list[dict] = []
+    for i, raw in enumerate(steps or []):
+        s = {"key": raw} if isinstance(raw, str) else raw
+        if not isinstance(s, dict):
+            warnings.append(
+                f"{field_name}[{i}]: step non oggetto — scartato"
+            )
+            continue
+        key = str(s.get("key") or "").strip().lower()
+        try:
+            gid_i = int(s.get("gid") or 0)
+        except (TypeError, ValueError):
+            gid_i = 0
+        if key and not gids_for_focus_key(key):
+            warnings.append(
+                f"{field_name}[{i}]: chiave '{key}' sconosciuta — scartato"
+            )
+            continue
+        if not key and gid_i <= 0:
+            warnings.append(
+                f"{field_name}[{i}]: step senza key/gid — scartato"
+            )
+            continue
+        step: dict = {}
+        if key:
+            step["key"] = key
+        if gid_i > 0:
+            step["gid"] = gid_i
+        try:
+            step["target_level"] = max(
+                0, min(int(s.get("target_level") or s.get("target") or 0), 100)
+            )
+        except (TypeError, ValueError):
+            step["target_level"] = 0
+        try:
+            step["priority"] = int(s.get("priority") or i + 1)
+        except (TypeError, ValueError):
+            step["priority"] = i + 1
+        try:
+            if int(s.get("slot_id") or 0) > 0:
+                step["slot_id"] = int(s["slot_id"])
+        except (TypeError, ValueError):
+            pass
+        if s.get("allow_duplicate_building"):
+            step["allow_duplicate_building"] = True
+        out.append(step)
+    return out
+
+
+def _sanitize_village_patch(
+    patch: dict, warnings: list[str], vname: str
+) -> dict:
+    """Pulisce il patch villaggio: ruolo valido, step coda e mappe OK.
+
+    Ritorna un patch ridotto ai soli campi VillageConfig ammissibili;
+    le chiavi extra finiscono in ``warnings`` (elencate poi come
+    unsupported_actions lato UI).
+    """
+    from .config import VillageConfig
+    from .models import VillageRole
+    from .presets import resolve_role
+
+    out = dict(patch or {})
+    valid_fields = set(VillageConfig.__dataclass_fields__)
+    for k in list(out):
+        if k not in valid_fields:
+            warnings.append(
+                f"villaggio {vname}: campo '{k}' non supportato — scartato"
+            )
+            out.pop(k)
+
+    role = out.get("role")
+    if role is not None:
+        resolved = resolve_role(str(role))
+        valid_roles = {r.value for r in VillageRole}
+        if resolved not in valid_roles:
+            warnings.append(
+                f"villaggio {vname}: ruolo '{role}' non valido — scartato"
+            )
+            out.pop("role")
+        else:
+            out["role"] = resolved
+
+    for fname in ("building_queue_plan", "building_focus"):
+        if fname in out:
+            out[fname] = _clean_queue_steps(
+                out.get(fname), warnings, f"{vname}.{fname}"
+            )
+
+    if "resource_weights" in out:
+        weights = out.get("resource_weights")
+        clean: dict[str, float] = {}
+        if isinstance(weights, dict):
+            for k, v in weights.items():
+                key = str(k).strip().lower()
+                if key not in ("wood", "clay", "iron", "crop"):
+                    warnings.append(
+                        f"villaggio {vname}: resource_weights '{k}' "
+                        "non una risorsa — scartato"
+                    )
+                    continue
+                try:
+                    w = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if w > 0:
+                    clean[key] = w
+        elif weights:
+            warnings.append(
+                f"villaggio {vname}: resource_weights non oggetto — scartato"
+            )
+        out["resource_weights"] = clean
+
+    if "troop_targets" in out:
+        targets = out.get("troop_targets")
+        clean_t: dict[str, int] = {}
+        if isinstance(targets, dict):
+            for k, v in targets.items():
+                try:
+                    qty = int(v or 0)
+                except (TypeError, ValueError):
+                    continue
+                if qty > 0:
+                    clean_t[str(k)] = qty
+        elif targets:
+            warnings.append(
+                f"villaggio {vname}: troop_targets non oggetto — scartato"
+            )
+        out["troop_targets"] = clean_t
+    return out
+
+
+def _apply_strategy_patch(acc, patch: dict) -> tuple[dict, dict, list[str]]:
+    """Applica un patch strategia a un Settings (muta ``acc``).
+
+    Stesso percorso di ``_handle_config_patch`` (``_apply_fields_checked``
+    sui dataclass) cosi' compile e apply condividono identiche regole di
+    validazione. Ritorna ``(validated_patch, diff, warnings)`` dove
+    ``validated_patch`` rispecchia l'input ma solo coi campi applicati —
+    e' cio' che la UI rispedisce a ``/api/strategy/apply``.
+    """
+    from .config import ExpansionTarget, VillageConfig
+
+    warnings: list[str] = []
+    diff: dict = {}
+    validated: dict = {}
+
+    acc_patch = patch.get("account")
+    if isinstance(acc_patch, dict) and acc_patch:
+        applied, df, wn = _apply_fields_checked(
+            acc, acc_patch, allowed=_STRATEGY_ACCOUNT_FIELDS
+        )
+        if applied:
+            validated["account"] = applied
+        if df:
+            diff["account"] = df
+        warnings.extend(f"account: {w}" for w in wn)
+
+    for section, attr in _CONFIG_SECTIONS.items():
+        sub = patch.get(section)
+        if not isinstance(sub, dict) or not sub:
+            continue
+        cfg = getattr(acc, attr)
+        sub = dict(sub)
+        if section == "expansion" and "target_slots" in sub:
+            slots = [
+                ExpansionTarget(
+                    x=int(t.get("x", 0)),
+                    y=int(t.get("y", 0)),
+                    note=str(t.get("note", "")),
+                )
+                for t in (sub.get("target_slots") or [])
+                if isinstance(t, dict)
+            ]
+            old = [asdict(t) for t in cfg.target_slots]
+            cfg.target_slots = slots
+            new = [asdict(t) for t in slots]
+            if new != old:
+                diff.setdefault("expansion", {})["target_slots"] = {
+                    "old": old, "new": new,
+                }
+            validated.setdefault("expansion", {})["target_slots"] = new
+            sub.pop("target_slots")
+        applied, df, wn = _apply_fields_checked(cfg, sub)
+        if applied:
+            validated.setdefault(section, {}).update(applied)
+        if df:
+            diff.setdefault(section, {}).update(df)
+        warnings.extend(f"{section}: {w}" for w in wn)
+
+    for item in patch.get("villages") or []:
+        if not isinstance(item, dict):
+            continue
+        vname = str(item.get("village") or "").strip()
+        vp = item.get("patch")
+        if not vname or not isinstance(vp, dict):
+            continue
+        cfg = acc.villages.get(vname)
+        if cfg is None:
+            cfg = next(
+                (c for c in acc.villages.values() if c.name == vname), None
+            )
+        if cfg is None:
+            cfg = VillageConfig(name=vname)
+            acc.villages[vname] = cfg
+            warnings.append(
+                f"villaggio '{vname}' non in config: creato ex-novo"
+            )
+        vp_clean = _sanitize_village_patch(vp, warnings, vname)
+        applied, df, wn = _apply_fields_checked(cfg, vp_clean)
+        if applied:
+            # Le personalizzazioni esplicite (strategia compresa) non
+            # vengono sovrascritte dai preset di ruolo automatici.
+            cfg.custom_modified = True
+            validated.setdefault("villages", []).append(
+                {"village": vname, "patch": applied}
+            )
+        if df:
+            diff[f"villaggio:{vname}"] = df
+        warnings.extend(f"villaggio {vname}: {w}" for w in wn)
+    return validated, diff, warnings
+
+
+def _strategy_prompt(acc, text: str, snap: dict | None) -> str:
+    """Prompt del compilatore: schema config + catalogo chiavi valide."""
+    from .building_prereqs import FOCUS_KEY_GIDS, GID_LABELS
+    from .models import STATIC_TROOP_LABELS, VillageRole
+    from .presets import ROLE_PRESETS, TRIBE_UNIT_SLOTS
+
+    cfg = _account_config(acc)
+    sb_cfg = cfg.get("scout_brain")
+    if isinstance(sb_cfg, dict):
+        sb_cfg["gemini_api_key"] = "***" if sb_cfg.get("gemini_api_key") else ""
+
+    villages_ser = cfg.get("villages") or {}
+    village_names = sorted(
+        {str(v.get("name") or k) for k, v in villages_ser.items()
+         if isinstance(v, dict)}
+        | {str(k) for k in villages_ser}
+    )
+    if isinstance(snap, dict):
+        for v in snap.get("villages") or []:
+            if isinstance(v, dict) and v.get("name"):
+                if str(v["name"]) not in village_names:
+                    village_names.append(str(v["name"]))
+
+    field_catalog = {
+        "account_fields": sorted(_STRATEGY_ACCOUNT_FIELDS),
+        "village_fields": [
+            "role", "building_queue_plan", "building_focus",
+            "building_focus_enabled", "resource_weights",
+            "troop_targets", "allowed_units", "priority_units",
+            "farm_enabled", "farm_unit", "farm_unit_qty",
+            "target_village", "min_net_crop_threshold", "max_crannies",
+            "is_bootstrap", "is_reclaim_source", "defense_enabled",
+            "market_slot", "smithy_auto_upgrade",
+            "troop_replenishment_preset",
+        ],
+        "farming": sorted(cfg["farming"]),
+        "scout_brain": sorted(cfg["scout_brain"]),
+        "hero": sorted(cfg["hero"]),
+        "defense": sorted(cfg["defense"]),
+        "replenishment": sorted(cfg["replenishment"]),
+        "expansion": sorted(cfg["expansion"]),
+        "roles": sorted({r.value for r in VillageRole} | set(ROLE_PRESETS)),
+        "building_focus_keys": sorted(FOCUS_KEY_GIDS),
+        "gid_labels": GID_LABELS,
+        "resource_weight_keys": ["wood", "clay", "iron", "crop"],
+        "troop_abstract_slots": sorted(TRIBE_UNIT_SLOTS),
+        "troop_t_keys": sorted(STATIC_TROOP_LABELS),
+    }
+
+    return "\n\n".join([
+        "Sei il Strategy Compiler di un agente Travian. Traduci la "
+        "strategia in linguaggio naturale in un patch di configurazione "
+        "accounts.json. Rispondi SOLO con l'oggetto JSON richiesto: "
+        '{"summary": str, "patch": {...}, "unsupported_actions": [str]}',
+        "REGOLE:\n"
+        "- patch.account: solo i campi di 'account_fields'.\n"
+        "- patch.villages: array {village, patch} — 'village' deve essere "
+        "un nome/newdid tra i VILLAGGI NOTI; patch usa solo 'village_fields'.\n"
+        "- building_queue_plan/building_focus: lista ordinata di step "
+        '{"key"|"gid", "target_level", "priority"} — key da '
+        "'building_focus_keys' (gid da 'gid_labels').\n"
+        "- resource_weights: {wood,clay,iron,crop} float>0 (peso alto = "
+        "priorita' nel selettore campi dorf1).\n"
+        "- AUTO_CELEBRATION / feste automatiche al Municipio -> "
+        "expansion.auto_celebrate=true.\n"
+        "- HERO_AUTO_STATS / gestione punti abilita' -> hero.enabled=true "
+        "+ hero.attribute_focus; cura con unguenti (HERO_OINTMENT) -> "
+        "hero.heal_threshold.\n"
+        "- Anti-raid/crannies -> village.max_crannies o ruolo 'defensive'.\n"
+        "- Corsa al 2o villaggio / coloni -> expansion.auto_expand, "
+        "expansion.auto_celebrate, ruolo 'early_cropper_founder' o "
+        "'chiefing', troop_targets con 'settler'.\n"
+        "- Ogni richiesta NON mappabile sui campi elencati va in "
+        "'unsupported_actions' (una riga per azione).\n"
+        "- NON inventare nomi di campi: solo quelli del CATALOGO.",
+        f"CATALOGO CAMPI/CHIAVI VALIDE:\n{json.dumps(field_catalog, ensure_ascii=False)}",
+        f"VILLAGGI NOTI: {json.dumps(village_names, ensure_ascii=False)}",
+        "CONFIG ATTUALE (per contesto/diff):\n"
+        + json.dumps(cfg, ensure_ascii=False, indent=1)[:25000],
+        f"STRATEGIA UTENTE:\n{text}",
+    ])
+
+
+def _handle_strategy_compile(body: dict) -> tuple[dict, int]:
+    """POST /api/strategy/compile — testo -> patch validato + diff.
+
+    ``{"account_id", "text"}``: Gemini produce il patch via Structured
+    Outputs (JSON Schema), poi ``_apply_strategy_patch`` lo valida su
+    una copia dell'account — la risposta mostra solo cio' che
+    sopravviverebbe alla scrittura reale, con diff old->new.
+    """
+    from .ai_scout_brain import _extract_json_from_text
+    from .config import load_accounts
+
+    text = str(body.get("text") or body.get("strategy") or "").strip()
+    if not text:
+        return {"status": "rejected", "reason": "testo strategia mancante"}, 400
+    account_id = str(body.get("account_id") or "") or _default_account_id()
+    if not account_id:
+        return (
+            {"status": "rejected", "reason": "account_id non risolvibile"},
+            400,
+        )
+    acc = next(
+        (a for a in load_accounts() if a.account_id == account_id), None
+    )
+    if acc is None:
+        return (
+            {"status": "rejected",
+             "reason": f"account '{account_id}' non in accounts.json"},
+            404,
+        )
+    api_key = (
+        str(getattr(acc.scout_brain, "gemini_api_key", "") or "")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or ""
+    ).strip()
+    if not api_key:
+        return (
+            {
+                "status": "rejected",
+                "reason": "GEMINI_API_KEY non configurata: impostala in "
+                "Farming & Eroe → AI Scout Brain o nel file .env",
+            },
+            400,
+        )
+
+    snap, _status = _read_snapshot(account_id)
+    prompt = _strategy_prompt(acc, text, snap if isinstance(snap, dict) else None)
+    model_name = str(
+        getattr(acc.scout_brain, "gemini_model", "") or _ASK_DEFAULT_MODEL
+    )
+    used_model = (
+        _ASK_DEFAULT_MODEL if model_name in _ASK_EOL_MODELS else model_name
+    )
+    try:
+        raw = _gemini_generate_json_sync(
+            prompt, api_key, model_name, _STRATEGY_RESPONSE_SCHEMA
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Strategy Compiler (compile) fallito", exc_info=True)
+        return {"status": "error", "reason": f"Gemini: {exc}"}, 502
+    if not raw.strip():
+        return {"status": "error", "reason": "risposta vuota da Gemini"}, 502
+    try:
+        data = _extract_json_from_text(raw)
+    except (ValueError, TypeError):
+        return (
+            {
+                "status": "error",
+                "reason": "output Gemini non JSON valido",
+                "raw_excerpt": raw[:500],
+            },
+            502,
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("patch"), dict):
+        return (
+            {"status": "error", "reason": "patch mancante nella risposta AI"},
+            502,
+        )
+
+    sandbox = copy.deepcopy(acc)
+    validated, diff, warnings = _apply_strategy_patch(
+        sandbox, data["patch"]
+    )
+    unsupported = [
+        str(u) for u in (data.get("unsupported_actions") or [])
+    ][:50]
+    # Warning di validazione = richieste parzialmente non supportate:
+    # riportate a fianco di unsupported_actions per la UI.
+    try:
+        debug_trace.append_trace(
+            account_id,
+            "strategy_compile",
+            {
+                "summary": str(data.get("summary") or ""),
+                "diff": diff,
+                "warnings": warnings,
+                "unsupported_actions": unsupported,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return (
+        {
+            "status": "ok",
+            "summary": str(data.get("summary") or ""),
+            "model": used_model,
+            "patch": validated,
+            "diff": diff,
+            "warnings": warnings,
+            "unsupported_actions": unsupported,
+        },
+        200,
+    )
+
+
+def _handle_strategy_apply(body: dict) -> tuple[dict, int]:
+    """POST /api/strategy/apply — salva il patch validato dalla compile.
+
+    ``{"account_id", "patch"}``: il patch (gia' mostrato come diff al
+    passo compile) ripassa per ``_apply_strategy_patch`` sul Settings
+    reale e viene persistito con save_accounts (tmp+rename+.bak);
+    l'agente hot-reloada accounts.json al ciclo successivo.
+    """
+    from .config import load_accounts, save_accounts
+
+    account_id = str(body.get("account_id") or "") or _default_account_id()
+    patch = body.get("patch")
+    if not isinstance(patch, dict) or not patch:
+        return {"status": "rejected", "reason": "patch mancante"}, 400
+    accounts = load_accounts()
+    acc = next((a for a in accounts if a.account_id == account_id), None)
+    if acc is None:
+        return (
+            {"status": "rejected",
+             "reason": f"account '{account_id}' non trovato"},
+            404,
+        )
+    _validated, diff, warnings = _apply_strategy_patch(acc, patch)
+    if not diff:
+        return (
+            {
+                "status": "rejected",
+                "reason": "nessun campo valido nel patch",
+                "warnings": warnings,
+            },
+            400,
+        )
+    for w in warnings:
+        logger.warning("Strategy apply %s: %s", account_id, w)
+    save_accounts(accounts)
+    try:
+        debug_trace.append_trace(
+            account_id,
+            "strategy_apply",
+            {"diff": diff, "warnings": warnings},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return (
+        {
+            "status": "saved",
+            "account_id": account_id,
+            "diff": diff,
+            "warnings": warnings,
+        },
+        200,
+    )
+
+
 def _default_account_id() -> str:
     """Account id dello snapshot piu' recente (per i POST senza campo).
 
@@ -1182,6 +1937,37 @@ class _CommandCenterHandler(BaseHTTPRequestHandler):
                 payload, status = _handle_farm_target_patch(body)
             else:
                 payload, status = _handle_cropper_patch(body)
+            self._send_json(payload, status=status)
+            return
+        if route in ("/api/strategy/compile", "/api/strategy/apply"):
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            try:
+                raw = self.rfile.read(max(0, length))
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                self._send_json({"error": "invalid json"}, status=400)
+                return
+            if route == "/api/strategy/compile":
+                payload, status = _handle_strategy_compile(body)
+            else:
+                payload, status = _handle_strategy_apply(body)
+            self._send_json(payload, status=status)
+            return
+        if route == "/api/ask":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            try:
+                raw = self.rfile.read(max(0, length))
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                self._send_json({"error": "invalid json"}, status=400)
+                return
+            payload, status = _handle_ask_agent(body)
             self._send_json(payload, status=status)
             return
         if route != "/api/command":

@@ -157,11 +157,10 @@ def rule_upgrade_weakest_field(state: GameState, settings: Settings) -> Action |
     if not fields:
         return None
 
-    role = settings.village_role_for(state.village_name, state.village_id)
-    if role == "croplog":
-        scarcest = ResourceType.CROP
-    else:
-        scarcest = state.resources.scarcest()
+    # Selettore dorf1 unico: croplog -> grano fisso, altrimenti i pesi
+    # strategici del villaggio (VillageConfig.resource_weights, Strategy
+    # Compiler) battono la scarsita' calcolata sul riempimento magazzini.
+    scarcest = builder.village_scarcest(state, settings)
     candidates = sorted(
         (f for f in fields if f.resource_type is scarcest),
         key=lambda f: (f.level, f.slot_id),

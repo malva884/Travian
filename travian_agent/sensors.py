@@ -237,9 +237,10 @@ class TravianParser:
             const raw = (document.body
                 && document.body.innerText) || '';
             // Travian avvolge i numeri nei mark direzionali
-            // U+202D/U+202C: normalizza tutto a spazi.
+            // (U+202D/U+202C, isolate U+2066-U+2069, U+061C):
+            // normalizza tutto a spazi.
             const text = raw.replace(
-                /[\\u202d\\u202c\\u202f\\u00a0\\u200b]/g, ' ');
+                /[\\u202d\\u202c\\u202f\\u00a0\\u200b\\u061c\\u2066-\\u2069]/g, ' ');
             const clean = (s) => parseInt(
                 String(s).replace(/[^0-9]/g, ''), 10) || 0;
             const num = '([0-9][0-9.,\\\\s]*)';
@@ -291,13 +292,17 @@ class TravianParser:
                 out.specific = true;
             }
             // daily: sezione "Punti cultura al giorno" ->
-            //        ultima riga "Totale 123"
-            m = text.match(new RegExp(
-                cpLabel + '\\\\s+al\\\\s+giorno' +
-                '[\\s\\S]{0,400}?(?:totale|total|gesamt)' +
-                '[^0-9]{0,10}' + num, 'i')) ||
-                text.match(
-                /(?:culture\s+points?\s+per\s+day|kulturpunkte\s+pro\s+tag)[\s\S]{0,400}?(?:total|gesamt)[^0-9]{0,10}([0-9][0-9.,\s]*)/i);
+            //        riga finale "Totale/Somma 123". Tollera
+            //        parole extra tra label e 'al giorno' (es.
+            //        "Punti cultura prodotti al giorno") e le
+            //        varianti 'quotidiani/giornalieri'.
+            //        NB: regex LITERAL — [\\s\\S] passato come stringa
+            //        a new RegExp collasserebbe a [sS] (escape non
+            //        valido in stringa): daily resterebbe sempre 0.
+            m = text.match(
+                /(?:punti\s+(?:di\s+)?cultura|punti\s+culturali|culture\s+points?|kulturpunkte|puntos?\s+de\s+cultura|points?\s+de\s+culture)[^0-9]{0,40}?(?:al\s+giorno|quotidian[oi]|giornalier[oi])[\s\S]{0,400}?(?:totale|total|gesamt|somma)[^0-9]{0,10}([0-9][0-9.,\s]*)/i
+            ) || text.match(
+                /(?:culture\s+points?\s+per\s+day|kulturpunkte\s+pro\s+tag)[\s\S]{0,400}?(?:total|gesamt|sum|totale|somma)[^0-9]{0,10}([0-9][0-9.,\s]*)/i);
             if (m) {
                 out.daily = clean(m[1]);
                 out.matched = true;
@@ -330,6 +335,18 @@ class TravianParser:
             if (m) {
                 out.next_slot = String(m[1]).trim();
             }
+            // daily generico: "250 al giorno", "250 per day".
+            // Provato anche quando i campi specifici hanno gia'
+            // matchato ma il daily e' rimasto a zero (wording
+            // diverso dalla sezione attesa o render asincrono).
+            if (!out.daily) {
+                const d = text.match(
+                    /([0-9][0-9.,\s]*)[^0-9]{0,20}(?:al giorno|per day|a day|pro tag|par jour|al d[ií]a|daily)/i
+                ) || text.match(
+                    /(?:produzione|production|producci.n)[^0-9]{0,25}([0-9][0-9.,\s]*)[^0-9]{0,15}(?:punti|points|cultur)/i
+                );
+                if (d) out.daily = clean(d[1]);
+            }
             if (out.specific) return out;
             // -- Fallback generico: "X / Y" o "X di Y" --
             m = text.match(new RegExp(
@@ -352,13 +369,6 @@ class TravianParser:
                     out.matched = true;
                 }
             }
-            // daily generico: "250 al giorno", "250 per day"
-            const d = text.match(
-                /([0-9][0-9.,\s]*)[^0-9]{0,20}(?:al giorno|per day|a day|pro tag|par jour|al d[ií]a|daily)/i
-            ) || text.match(
-                /(?:produzione|production|producci.n)[^0-9]{0,25}([0-9][0-9.,\s]*)[^0-9]{0,15}(?:punti|points|cultur)/i
-            );
-            if (d) out.daily = clean(d[1]);
             return out;
         }
     """
@@ -1886,6 +1896,18 @@ class TravianParser:
             have = safe_int(data.get("have", 0))
             need = safe_int(data.get("need", 0))
             daily = safe_int(data.get("daily", 0))
+            if not daily and (have or need):
+                # Safety net: su altre UI la tabella "Punti cultura al
+                # giorno" puo' arrivare via XHR dopo il primo render.
+                try:
+                    await self.page.wait_for_timeout(1000)
+                    retry = await self.page.evaluate(cp_eval_js) or {}
+                    rd = safe_int(retry.get("daily", 0))
+                    if rd:
+                        daily = rd
+                        data = retry
+                except Exception:  # noqa: BLE001
+                    pass
             self.cp_extra = {
                 k: data[k] for k in
                 ("slots_used", "slots_total", "next_slot")
@@ -1945,18 +1967,33 @@ class TravianParser:
                 data = await _eval_cp()
             return data
 
-        def _finish(data: dict) -> tuple[int, int, int]:
-            """Salva gli extra (slots/ETA nuova UI) e ritorna la tupla."""
+        async def _finish(data: dict) -> tuple[int, int, int]:
+            """Salva gli extra (slots/ETA nuova UI) e ritorna la tupla.
+
+            Se il daily e' a zero ma have/need sono stati letti, la
+            tabella 'Punti cultura al giorno' era probabilmente non
+            ancora renderizzata (XHR post-domcontentloaded): un
+            secondo eval a breve distanza la cattura.
+            """
+            have = safe_int(data.get("have", 0))
+            need = safe_int(data.get("need", 0))
+            daily = safe_int(data.get("daily", 0))
+            if not daily and (have or need):
+                try:
+                    await self.page.wait_for_timeout(1000)
+                    retry = await _eval_cp()
+                    rd = safe_int(retry.get("daily", 0))
+                    if rd:
+                        daily = rd
+                        data = retry
+                except Exception:  # noqa: BLE001
+                    pass
             self.cp_extra = {
                 k: data[k] for k in
                 ("slots_used", "slots_total", "next_slot")
                 if data.get(k) is not None
             }
-            return (
-                safe_int(data.get("have", 0)),
-                safe_int(data.get("need", 0)),
-                safe_int(data.get("daily", 0)),
-            )
+            return (have, need, daily)
 
         # 1. La pagina corrente potrebbe gia' esporre i CP (es. box
         #    account delle nuove UI): nessuna navigazione extra.
@@ -1987,7 +2024,7 @@ class TravianParser:
         for url in candidates[:4]:
             data = await _scan(url)
             if data.get("matched"):
-                return _finish(data)
+                return await _finish(data)
 
         await self._dump_page_text("culture_points_fail")
         logger.info(

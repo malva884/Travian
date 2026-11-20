@@ -76,6 +76,12 @@ FOUND_RETRY_SECONDS = 900.0
 # cooldown lungo dopo l'avvio (la festa impiega ore a completarsi).
 CELEBRATION_RETRY_SECONDS = 900.0
 CELEBRATION_COOLDOWN_SECONDS = 6.0 * 3600.0
+# Costo Piccola Festa (T4.x): controllo di pagabilita' per AUTO_CELEBRATION
+# quando la riserva dei 3 coloni non e' attiva (auto_expand off / villaggi
+# non-founder — la festa non deve affamare l'economia del villaggio).
+SMALL_CELEBRATION_COST = {
+    "wood": 6400, "clay": 6650, "iron": 5940, "crop": 1340,
+}
 # Retry breve quando la scansione mappa non legge tile (layout/pagina ko):
 # il cooldown pieno di 3h si applica solo a scansioni andate a buon fine.
 MAP_SCAN_RETRY_SECONDS = 600.0
@@ -592,43 +598,64 @@ class ExpansionManager:
         self,
         *,
         executor: "ActionExecutor",
-        founder: "Village",
+        village: "Village | None" = None,
+        founder: "Village | None" = None,
         interior_map: dict[str, list[Field]],
         states_by_village: dict[str, GameState],
         prefix: str,
         now: float,
-    ) -> None:
-        """Avvia una Piccola Festa nel Municipio del fondatore (spec 2).
+        require_settler_reserve: bool = True,
+    ) -> bool:
+        """Avvia una Piccola Festa nel Municipio del villaggio (spec 2).
 
-        Condizioni: Municipio >= 1, cooldown scaduto e risorse del
-        villaggio sopra la riserva dei 3 coloni (settler_reserve).
+        Condizioni: Municipio >= 1, cooldown scaduto e risorse
+        sufficienti. ``require_settler_reserve=True`` (percorso founder
+        del ciclo espansione) esige la riserva dei 3 coloni; ``False``
+        (AUTO_CELEBRATION, expansion.auto_celebrate) richiede solo il
+        costo della Piccola Festa. ``founder`` resta come alias legacy
+        del parametro ``village``.
         """
-        if now < self.next_celebration_attempt:
-            return
+        target = village if village is not None else founder
+        if target is None or now < self.next_celebration_attempt:
+            return False
+        vname = target.name or str(target.village_id)
         town_hall = find_town_hall(
-            interior_map.get(founder.name or "", [])
+            interior_map.get(target.name or "", [])
+            or interior_map.get(vname, [])
         )
         if town_hall is None:
-            return
-        fstate = states_by_village.get(founder.name or "")
+            return False
+        fstate = states_by_village.get(target.name or "") or (
+            states_by_village.get(vname)
+        )
         if fstate is None:
-            return
-        try:
-            from .replenishment import settler_reserve  # no cicli
-        except Exception:  # noqa: BLE001
-            settler_reserve = None
-        if settler_reserve is not None:
-            reserve = settler_reserve()
-            res = fstate.resources
-            available = {
-                "wood": res.wood, "clay": res.clay,
-                "iron": res.iron, "crop": res.crop,
-            }
+            return False
+        res = fstate.resources
+        available = {
+            "wood": res.wood, "clay": res.clay,
+            "iron": res.iron, "crop": res.crop,
+        }
+        if require_settler_reserve:
+            try:
+                from .replenishment import settler_reserve  # no cicli
+            except Exception:  # noqa: BLE001
+                settler_reserve = None
+            if settler_reserve is not None:
+                reserve = settler_reserve()
+                if any(
+                    int(available.get(k, 0)) < int(reserve.get(k, 0))
+                    for k in ("wood", "clay", "iron", "crop")
+                ):
+                    return False
+        else:
+            # AUTO_CELEBRATION: basta coprire il costo della festa
+            # (la pagabilita' reale e' comunque riverificata nel click
+            # del Municipio — link assente -> retry tra 15 min).
             if any(
-                int(available.get(k, 0)) < int(reserve.get(k, 0))
-                for k in ("wood", "clay", "iron", "crop")
+                int(available.get(k, 0)) < cost
+                for k, cost in SMALL_CELEBRATION_COST.items()
             ):
-                return
+                return False
         action = Action(
             type=ActionType.START_CELEBRATION,
             params={"town_hall_slot": town_hall.slot_id, "kind": "small"},
@@ -639,7 +666,7 @@ class ExpansionManager:
             ),
         )
         result = await executor.execute(
-            action, village_id=founder.village_id
+            action, village_id=target.village_id
         )
         self.next_celebration_attempt = now + (
             CELEBRATION_COOLDOWN_SECONDS
@@ -649,8 +676,9 @@ class ExpansionManager:
         self._save()
         logger.info(
             "%s CP Booster: festa al Municipio di '%s' -> %s",
-            prefix, founder.name, result.message,
+            prefix, vname, result.message,
         )
+        return result.success
 
     # ------------------------------------------------------------------
     # Step principale (una volta per ciclo account)
@@ -756,6 +784,33 @@ class ExpansionManager:
             else:
                 self.next_cp_read = now + CP_SNAPSHOT_RETRY
             self._save()
+
+        # 0.2 AUTO_CELEBRATION (expansion.auto_celebrate, Strategy
+        # Compiler): CP in deficit -> Piccola Festa nel Municipio di
+        # ogni villaggio che lo possiede e puo' pagarla. Indipendente da
+        # auto_expand: usa lo snapshot CP del blocco 0.1 e il cooldown
+        # condiviso next_celebration_attempt (una festa per ciclo).
+        if (
+            cfg.auto_celebrate
+            and self.cp_required > 0
+            and self.cp_current < self.cp_required
+            and now >= self.next_celebration_attempt
+        ):
+            for v in villages:
+                vkey = v.name or str(v.village_id)
+                if find_town_hall(interior_map.get(vkey, [])) is None:
+                    continue
+                done = await self._try_celebration(
+                    executor=executor,
+                    village=v,
+                    interior_map=interior_map,
+                    states_by_village=states_by_village or {},
+                    prefix=prefix,
+                    now=now,
+                    require_settler_reserve=False,
+                )
+                if done or now < self.next_celebration_attempt:
+                    break
 
         if not cfg.auto_expand:
             return

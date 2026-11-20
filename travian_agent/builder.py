@@ -801,6 +801,7 @@ def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
         return []
     queued = queued_slot_ids(state)
     reserved_slots: set[int] = set()
+    stuck = focus_stuck_slots(state)
     out: list[Field] = []
     items = _focus_items(plan)
     for it in items:
@@ -813,6 +814,16 @@ def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
         ):
             continue
         if slot_id is None:
+            continue
+        if slot_id in stuck:
+            # Circuit-breaker: step gia' "eseguito" 2+ volte senza che
+            # il livello sia cresciuto — passa allo step successivo.
+            logger.warning(
+                "[%s] Step Coda Prioritaria su slot %d marcato STUCK "
+                "(EXECUTED senza progresso): saltato.",
+                state.village_name,
+                slot_id,
+            )
             continue
         gids = (it.gid,) if it.gid > 0 else tuple(gids_for_focus_key(it.key))
         if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
@@ -871,6 +882,66 @@ def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
     return unique
 
 
+# Circuit-breaker "falso EXECUTED": traccia il livello dello slot al
+# momento di ogni ActionResult.success su UPGRADE_FIELD. Se per 2
+# esecuzioni consecutive il livello risulta identico allo snapshot
+# successivo (e lo slot non e' in coda), lo step viene marcato
+# "stuck" e saltato invece di ritentarlo all'infinito. Stato di
+# runtime, azzerato a riavvio; un cambio livello reale (build
+# completata o intervento manuale) azzera la storia dello slot.
+_FOCUS_EXEC_HISTORY: dict[tuple[str, int], list[int]] = {}
+_FOCUS_STUCK_MIN_ATTEMPTS = 2
+
+
+def record_upgrade_exec(village_id: int | str, slot_id: int, level: int) -> None:
+    """Registra un EXECUTED su ``slot_id`` con il livello noto all'epoca."""
+    if not slot_id or slot_id <= 0:
+        return
+    key = (str(village_id or "0"), int(slot_id))
+    hist = _FOCUS_EXEC_HISTORY.setdefault(key, [])
+    hist.append(int(level))
+    del hist[:-8]
+
+
+def focus_stuck_slots(state: GameState) -> set[int]:
+    """Slot della Coda Prioritaria bloccati da EXECUTED senza progresso.
+
+    Uno slot e' stuck se: >=2 EXECUTED consecutive sullo stesso
+    livello, il livello attuale non e' cresciuto rispetto a quello
+    registrato e non compare nella coda costruzioni. Se il livello e'
+    variato la storia viene azzerata (progresso reale o mano umana).
+    """
+    queued = queued_slot_ids(state)
+    levels = {f.slot_id: int(f.level) for f in state.fields}
+    # La chiave registrata da record_upgrade_exec puo' essere il newdid
+    # oppure il nome: entrambe identificano lo stesso villaggio.
+    vkeys = {
+        str(v) for v in (state.village_id, state.village_name) if v
+    }
+    stuck: set[int] = set()
+    for (vid, slot), hist in list(_FOCUS_EXEC_HISTORY.items()):
+        if vid not in vkeys or len(hist) < _FOCUS_STUCK_MIN_ATTEMPTS:
+            continue
+        if slot not in levels:
+            # Slot assente dallo snapshot (lettura parziale): il
+            # livello non e' osservabile -> niente marcatura STUCK.
+            continue
+        cur = levels[slot]
+        last = hist[-1]
+        if cur != last:
+            # Livello cambiato dopo l'ultimo EXECUTED: progresso
+            # reale o build manuale -> resetta il contatore.
+            del _FOCUS_EXEC_HISTORY[(vid, slot)]
+            continue
+        if slot in queued:
+            continue
+        if hist[-_FOCUS_STUCK_MIN_ATTEMPTS:].count(last) >= (
+            _FOCUS_STUCK_MIN_ATTEMPTS
+        ):
+            stuck.add(slot)
+    return stuck
+
+
 def focus_intents(state: GameState, settings: Settings) -> list[Field]:
     """Field candidati dalla coda prioritaria building_queue_plan.
 
@@ -927,6 +998,7 @@ def focus_skip_reasons(
         return []
     queued = queued_slot_ids(state)
     reserved_slots: set[int] = set()
+    stuck = focus_stuck_slots(state)
     reasons: list[str] = []
     items = _focus_items(plan)
     for it in items:
@@ -950,6 +1022,11 @@ def focus_skip_reasons(
             reasons.append(f"'{label}' nessun slot dorf2 libero (19-38)")
             continue
         if status != "OK" or slot_id is None:
+            continue
+        if slot_id in stuck:
+            reasons.append(
+                f"'{label}' slot {slot_id} bloccato: EXECUTED ripetuto senza aumento livello (STUCK)"
+            )
             continue
 
         if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
@@ -1090,15 +1167,47 @@ def role_intents(state: GameState, settings: Settings) -> list[Field]:
     return sorted(existing + newbies, key=lambda f: (f.level, f.slot_id))
 
 
+def weighted_scarcest(res: "Resources", weights: dict) -> ResourceType:
+    """Risorsa da uppare secondo i pesi strategici del villaggio.
+
+    ``VillageConfig.resource_weights`` (Strategy Compiler): punteggio =
+    (riempimento corrente / capacita') / peso — a parita' di riempimento
+    la risorsa col peso piu' alto vince. Pesi <= 0 escludono la risorsa;
+    dict vuoto/tutti nulli -> comportamento standard ``scarcest()``.
+    """
+    scored: dict[ResourceType, float] = {}
+    for rt in ResourceType:
+        try:
+            w = float((weights or {}).get(rt.value, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            w = 0.0
+        if w <= 0:
+            continue
+        cap = res.capacity(rt) or 1
+        scored[rt] = (res.amount(rt) / cap) / w
+    if not scored:
+        return res.scarcest()
+    return min(scored, key=scored.get)
+
+
+def village_scarcest(state: GameState, settings: Settings) -> ResourceType:
+    """Selettore unico dorf1: croplog -> grano, pesi -> weighted, else scarcest."""
+    role = settings.village_role_for(state.village_name, state.village_id)
+    if role == "croplog":
+        return ResourceType.CROP
+    vcfg = settings.village_config_for(state.village_name, state.village_id)
+    weights = getattr(vcfg, "resource_weights", None) if vcfg is not None else None
+    if weights:
+        return weighted_scarcest(state.resources, weights)
+    return state.resources.scarcest()
+
+
 def economy_intents(state: GameState, settings: Settings) -> list[Field]:
     """Campo risorsa piu' debole della risorsa piu' scarsa (logica base)."""
     fields = upgradeable_fields(state, state.resource_fields())
     if not fields:
         return []
-    role = settings.village_role_for(state.village_name, state.village_id)
-    scarcest = (
-        ResourceType.CROP if role == "croplog" else state.resources.scarcest()
-    )
+    scarcest = village_scarcest(state, settings)
     same_type = [f for f in fields if f.resource_type is scarcest]
     pool = same_type or fields
     return sorted(pool, key=lambda f: (f.level, f.slot_id))

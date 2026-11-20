@@ -8,7 +8,7 @@ import re
 import time
 from typing import Any
 
-from . import selectors
+from . import builder, selectors
 from .browser import TravianBrowser, human_click, sleep_human
 from .config import Settings
 from .models import (
@@ -300,6 +300,8 @@ class ActionExecutor:
                 return await self._train_settlers(action, village_id=vid_int)
             case ActionType.UPGRADE_UNITS:
                 return await self._upgrade_smithy_units(action, village_id=vid_int)
+            case ActionType.START_CELEBRATION:
+                return await self._start_celebration(action, village_id=vid_int)
             case ActionType.CLAIM_VIDEO_BONUS:
                 return await self._claim_video_bonus(action)
             case ActionType.ALERT:
@@ -512,16 +514,6 @@ class ActionExecutor:
                     )
                     continue
 
-                page_gid = await self._detect_page_gid(page)
-                if page_gid is not None and page_gid != gid:
-                    logger.warning(
-                        "Slot %s occupato da gid=%s (atteso vuoto per gid=%s): INVALID_SLOT_OCCUPIED",
-                        slot_id,
-                        page_gid,
-                        gid,
-                    )
-                    continue
-
                 # Individuare il blocco #contract_building{gid}
                 contract_block = page.locator(
                     f"#contract_building{gid}, .buildingWrapper.gid{gid}"
@@ -533,22 +525,43 @@ class ActionExecutor:
                     block_count = 0
 
                 if block_count == 0:
-                    # Tab non attivo: click sul tab di categoria
-                    tab_loc = page.locator(
-                        f".tabItem[data-tab-id='{cat_id}'], a[href*='category={cat_id}']"
-                    ).first
-                    try:
-                        if await tab_loc.count() > 0:
+                    # Il blocco .buildingWrapper.gid{N} esiste solo nel tab
+                    # categoria giusto: prova quello mappato, poi gli altri
+                    # (fallback per cataloghi/skin diversi).
+                    for cat_try in [cat_id] + [
+                        c for c in (1, 2, 3) if c != cat_id
+                    ]:
+                        tab_loc = page.locator(
+                            f".contentNavi a[href*='category={cat_try}'], "
+                            f".tabItem[data-tab-id='{cat_try}'], "
+                            f".tabItem a[href*='category={cat_try}'], "
+                            f"a[href*='category={cat_try}']"
+                        ).first
+                        try:
+                            if await tab_loc.count() == 0:
+                                continue
                             await human_click(page, tab_loc)
                             await sleep_human(0.8, 1.5)
-                            contract_block = page.locator(
-                                f"#contract_building{gid}, .buildingWrapper.gid{gid}"
-                            ).first
                             block_count = await contract_block.count()
-                    except Exception:
-                        pass
+                        except Exception:
+                            continue
+                        if block_count > 0:
+                            break
 
                 if block_count == 0:
+                    # Blocco del gid assente anche dopo il tab: la
+                    # pagina mostra il contratto singolo dell'edificio
+                    # che occupa lo slot (slot non vuoto) oppure il gid
+                    # non e' in elenco (prerequisiti/categoria errata).
+                    page_gid = await self._detect_page_gid(page)
+                    if page_gid is not None and page_gid != gid:
+                        logger.warning(
+                            "Slot %s occupato da gid=%s (atteso vuoto per gid=%s): INVALID_SLOT_OCCUPIED",
+                            slot_id,
+                            page_gid,
+                            gid,
+                        )
+                        continue
                     try:
                         prereq_missing = await page.evaluate(
                             """
@@ -578,6 +591,8 @@ class ActionExecutor:
                     f"#contract_building{gid} .contractLink button.green",
                     f".buildingWrapper.gid{gid} button.green.new",
                     f".buildingWrapper.gid{gid} button.textButtonV1.green",
+                    f".buildingWrapper.gid{gid} button.green",
+                    f".buildingWrapper.gid{gid} .contractLink button.green",
                     f"#contract_building{gid} button[type='button'].green",
                 ]
                 for sel in new_btn_selectors:
@@ -759,42 +774,109 @@ class ActionExecutor:
                 pass
             await sleep_human(1.0, 2.0)
 
-            # Verifica reale nel DOM: coda cresciuta, underConstruction o timer in .buildingList
+            # Verifica reale nel DOM: la coda e' cresciuta, oppure lo
+            # slot mostra il marker underConstruction, oppure una riga
+            # della coda e' legata a slot/gid. ATTENZIONE: il controllo
+            # deve restare STRETTISSIMO — la vecchia regex /build/i
+            # matchava le classi 'buildingSlot'/'buildingList' stesse e
+            # produceva falsi EXECUTED (bug Mercato slot 19).
+            confirm_kind = None
             queue_after = await self._build_queue_count(page)
-            try:
-                under_construction = await page.evaluate(
-                    """
-                    (sid) => Array.from(document.querySelectorAll(
-                        '#resourceFieldContainer a[data-aid], ' +
-                        '#village_map [data-aid], .buildingSlot, .buildingList'
-                    )).some(el =>
-                        (el.getAttribute('data-aid') === String(sid) ||
-                         /\\ba(\\d+)\\b/.exec(el.className || '')?.[1] === String(sid)
-                        ) && /underconstruction|inconstruction|build/i.test(
-                            el.className || ''
-                        )
+            for _attempt in range(3):
+                try:
+                    confirm_kind = await page.evaluate(
+                        """
+                        ({ sid, gid }) => {
+                            const sidStr = String(sid);
+                            const clsOf = (el) => {
+                                const c = el ? el.className : '';
+                                return typeof c === 'string'
+                                    ? c
+                                    : (c && c.baseVal) || '';
+                            };
+                            const isSlotEl = (el) => {
+                                if (el.getAttribute('data-aid') === sidStr) {
+                                    return true;
+                                }
+                                const cls = clsOf(el);
+                                const m = cls.match(/\\ba(\\d+)\\b/) ||
+                                          cls.match(/\\bbuildingSlot(\\d+)\\b/i);
+                                return m !== null && m[1] === sidStr;
+                            };
+                            const busyRe = /underconstruction|inconstruction/i;
+                            // 1) Slot marcato 'in costruzione' nella vista
+                            for (const el of document.querySelectorAll(
+                                '#resourceFieldContainer a[data-aid], ' +
+                                '#village_map [data-aid], #villageMap [data-aid], ' +
+                                '.buildingSlot, .buildingSlot a'
+                            )) {
+                                if (!isSlotEl(el)) continue;
+                                if (busyRe.test(clsOf(el))) return 'slot-marker';
+                                const kids = el.querySelectorAll
+                                    ? el.querySelectorAll('*')
+                                    : [];
+                                for (const k of kids) {
+                                    if (busyRe.test(clsOf(k))) {
+                                        return 'slot-marker-inner';
+                                    }
+                                }
+                            }
+                            // 2) Riga della coda costruzioni legata a slot/gid
+                            const linkRe = new RegExp(
+                                'build\\\\.php[?&]id=' + sidStr + '(?![0-9])'
+                            );
+                            for (const row of document.querySelectorAll(
+                                '.buildingList li, #buildingContract .buildingRow, ' +
+                                '.buildingsOverview .buildingRow, ' +
+                                'table#building_contract tr, ' +
+                                '[class*="buildQueue" i] li, [class*="queueElement" i]'
+                            )) {
+                                const a = row.querySelector(
+                                    'a[href*="build.php?id="]'
+                                ) || row.closest('a[href*="build.php?id="]');
+                                if (a && linkRe.test(a.getAttribute('href') || '')) {
+                                    return 'queue-link';
+                                }
+                                if (gid > 0) {
+                                    const txt = clsOf(row) + ' ' + Array.from(
+                                        row.querySelectorAll('*')
+                                    ).map(c => clsOf(c)).join(' ');
+                                    if (new RegExp(
+                                        '\\\\bgid' + gid + '\\\\b', 'i'
+                                    ).test(txt)) {
+                                        return 'queue-gid';
+                                    }
+                                }
+                            }
+                            return null;
+                        }
+                        """,
+                        {"sid": int(slot_id), "gid": int(gid)},
                     )
-                    """,
-                    int(slot_id),
-                )
-            except Exception:
-                under_construction = False
+                except Exception:
+                    confirm_kind = None
+                if confirm_kind:
+                    break
+                if _attempt < 2:
+                    await asyncio.sleep(1.2)
+                    queue_after = await self._build_queue_count(page)
+            under_construction = bool(confirm_kind)
 
-            if queue_after is not None and queue_before is not None:
-                confirmed = queue_after > queue_before
-            elif queue_after is not None:
-                confirmed = queue_after > 0
-            else:
-                confirmed = bool(under_construction)
+            queue_grew = (
+                queue_after is not None
+                and queue_before is not None
+                and queue_after > queue_before
+            )
+            confirmed = queue_grew or under_construction
 
             if not confirmed:
                 logger.warning(
                     "Click su costruisci/migliora senza effetto osservabile sullo "
-                    "slot %s (coda %s->%s, underConstruction=%s, url=%s): QUEUE_UNCONFIRMED",
+                    "slot %s (coda %s->%s, marker=%s, url=%s): QUEUE_UNCONFIRMED",
                     slot_id,
                     queue_before,
                     queue_after,
-                    under_construction,
+                    confirm_kind,
                     page.url,
                 )
                 continue
