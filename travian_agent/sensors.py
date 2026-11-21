@@ -2896,6 +2896,391 @@ class TravianParser:
             "distance": dist,
         }
 
+    async def read_tile_details(self, x: int, y: int) -> dict:
+        """Scheda tile completa per la Smart Pre-Raid Intelligence.
+
+        Estende ``read_map_tile`` (riuso della stessa navigazione/path
+        caching) aggiungendo la lettura delle bestie della Natura
+        (oasi), dello stato di annessione e della protezione
+        principianti.
+
+        Ritorna::
+
+            {"x", "y", "ok", "type": free_oasis|occupied_oasis|village|
+             free_tile|unknown, "is_oasis", "occupied", "oasis_annexed",
+             "nature_troops": {"u31": n, ...}, "protection": bool,
+             "text"}
+        """
+        base = await self.read_map_tile(x, y)
+        out: dict = {
+            "x": int(x),
+            "y": int(y),
+            "ok": bool(base.get("ok")),
+            "type": "unknown",
+            "is_oasis": False,
+            "occupied": bool(base.get("occupied")),
+            "oasis_annexed": False,
+            "nature_troops": {},
+            "protection": False,
+            "text": str(base.get("text") or ""),
+        }
+        if not out["ok"]:
+            return out
+        text = out["text"].lower()
+        out["is_oasis"] = bool(re.search(r"oas[ie]", text))
+        try:
+            extra = await self._eval_tile_details()
+        except Exception:  # noqa: BLE001
+            extra = None
+        if isinstance(extra, dict):
+            nature = extra.get("nature") or {}
+            out["nature_troops"] = {
+                str(k): safe_int(v)
+                for k, v in nature.items()
+                if safe_int(v) > 0
+            }
+            out["oasis_annexed"] = bool(extra.get("annexed"))
+            out["protection"] = bool(extra.get("protection"))
+            if extra.get("is_oasis"):
+                out["is_oasis"] = True
+            if extra.get("village_link"):
+                out["oasis_annexed"] = True
+
+        # Classificazione tipo tile (spec): un'oasi annessa a un
+        # villaggio giocatore va trattata come villaggio.
+        if out["is_oasis"]:
+            out["type"] = (
+                "occupied_oasis" if out["oasis_annexed"] else "free_oasis"
+            )
+        elif out["occupied"]:
+            out["type"] = "village"
+        else:
+            out["type"] = "free_tile"
+        return out
+
+    async def _eval_tile_details(self) -> dict | None:
+        """Estrae bestie Natura / annessione / protezione dalla scheda tile.
+
+        Stesso scope del pannello di ``_eval_map_tile``: le icone bestie
+        sono 'unit u31..u40'; fallback testuale sui nomi localizzati
+        (mappa alias da ``combat_calc.NATURE_ALIASES``).
+        """
+        from .combat_calc import NATURE_ALIASES  # import ritardato
+
+        names = {
+            n: u for n, u in NATURE_ALIASES.items()
+            if not n.startswith("u") and not n.startswith("t")
+        }
+        return await self.page.evaluate(
+            """
+            (names) => {
+                const PANEL_SEL =
+                    '#map_details, .map_details, #tileDetails, .tileDetails, ' +
+                    '#map_infobox, .infobox, #positionDetails, .position-details, ' +
+                    '.tile-details, #map_popup, #popupMap, .popupContent, ' +
+                    '.detailInfo, #tile_details, .mappanel';
+                const panel = document.querySelector(PANEL_SEL);
+                const scope = panel || document.body;
+                const text = (scope && scope.innerText) || '';
+                const num = (t) => {
+                    const m = String(t || '').match(/(\\d[\\d.]*)/);
+                    return m ? parseInt(m[1].replace(/\\./g, ''), 10) : 0;
+                };
+                const nature = {};
+
+                // 1) Icone 'unit u31..u40' (bestie Natura): qty nella
+                //    cella adiacente, come il parser truppe rally.
+                scope.querySelectorAll(
+                    'img[class*="unit"], i[class*="unit"], ' +
+                    'span[class*="unit"], [class*=" unit u"], ' +
+                    '[class*="unit u"]'
+                ).forEach(icon => {
+                    const cls = icon.getAttribute('class') || '';
+                    const m = cls.match(
+                        /(?:^|[\\s_\\-])u(3\\d|40)(?=[\\s\\-]|$)/
+                    );
+                    if (!m) return;
+                    const key = 'u' + m[1];
+                    let qty = 0;
+                    const cell = icon.closest('td, a, li, .col, div');
+                    if (cell) {
+                        qty = num(cell.innerText || '');
+                        if (!qty && cell.nextElementSibling)
+                            qty = num(cell.nextElementSibling.innerText || '');
+                        if (!qty && cell.parentElement)
+                            qty = num(cell.parentElement.innerText || '');
+                    }
+                    if (qty > 0) nature[key] = (nature[key] || 0) + qty;
+                });
+
+                // 2) Fallback testuale: '19 Ragni' / '19 spiders'.
+                if (!Object.keys(nature).length) {
+                    const low = text.toLowerCase();
+                    for (const name in names) {
+                        const idx = low.indexOf(name);
+                        if (idx < 0) continue;
+                        // numero prima o dopo il nome (es. 'Rat: 25')
+                        const before = low.slice(0, idx).match(
+                            /(\\d[\\d.]*)\\s*$/
+                        );
+                        const after = low.slice(idx + name.length).match(
+                            /^\\s*[:\\-]?\\s*(\\d[\\d.]*)/
+                        );
+                        const q = before ? num(before[1])
+                                         : (after ? num(after[1]) : 0);
+                        if (q > 0) {
+                            const k = names[name];
+                            nature[k] = Math.max(nature[k] || 0, q);
+                        }
+                    }
+                }
+
+                // Annessione oasi: link a un villaggio/proprietario nel
+                // pannello o marcatori testuali multi-lingua.
+                const lowAll = text.toLowerCase();
+                const annexed = /(?:oasi\\s+occupat|occupied\\s+oasis|' +
+                    'besetzte\\s+oase|oasis\\s+occupied|di\\s+propriet|owner|' +
+                    'proprietario|trib[uù]|tribe|alleanza|alliance|' +
+                    'anness)/i.test(text);
+                const village_link = !!scope.querySelector(
+                    'a[href*="spieler.php"], a[href*="profile"], ' +
+                    'a[href*="allianz.php"], a[href*="karte.php?d="]'
+                );
+                const protection = /(?:beginner|protezione|' +
+                    'protez\\w*\\s+principiant|anf[aä]ngerschutz|' +
+                    'novice\\s+protection|beginners?\\s+protection)/i
+                    .test(text);
+                const is_oasis = /oas[ie]/i.test(text);
+                return {
+                    nature: nature,
+                    annexed: annexed,
+                    village_link: village_link,
+                    protection: protection,
+                    is_oasis: is_oasis,
+                };
+            }
+            """,
+            names,
+        )
+
+    async def parse_scout_report(self, x: int, y: int) -> dict | None:
+        """Legge l'ultimo report di spionaggio verso (x|y) da berichte.php.
+
+        Apre il report piu' recente la cui riga contiene le coordinate
+        e marcatori da ricognizione (icona 'reportScout'/'iReport' o
+        testo spia). Dalla pagina dettaglio estrae risorse, truppe del
+        difensore, livello mura ed eventuale perdita degli esploratori.
+
+        Ritorna::
+
+            {"x", "y", "ts", "resources": {wood, clay, iron, crop},
+             "troops": {"uN": n}, "wall_level": int,
+             "scouts_lost": bool}
+
+        o ``None`` se non esiste un report di spionaggio per il tile.
+        """
+        if not self.page:
+            return None
+        try:
+            await self._goto(
+                _abs_game_url(self.page.url or "", "berichte.php"),
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+        # 1) Riga report per le coordinate + link dettaglio.
+        try:
+            href = await self.page.evaluate(
+                """
+                (coords) => {
+                    const toInt = (s) => parseInt(
+                        String(s).replace(/[\\u2212\\u2010-\\u2015]/g, '-'), 10
+                    );
+                    const coordRe = new RegExp(
+                        '\\\\(\\\\s*([+\\\\u2212\\\\u2010-\\\\u2015\\\\-]?\\\\d+)\\\\s*[|/]\\\\s*' +
+                        '([+\\\\u2212\\\\u2010-\\\\u2015\\\\-]?\\\\d+)\\\\s*\\\\)'
+                    );
+                    const rows = document.querySelectorAll(
+                        '#overview tbody tr, table.reports tbody tr, ' +
+                        '#reports tbody tr, tr:has(.subject), tr:has(.sub)'
+                    );
+                    for (const row of rows) {
+                        const txt = (row.innerText || '');
+                        const m = txt.match(coordRe);
+                        if (!m) continue;
+                        if (toInt(m[1]) !== coords.x || toInt(m[2]) !== coords.y)
+                            continue;
+                        const scoutish = /(?:scout|spia|spi|esplor|ricogn|spy|' +
+                            'recon|erkund|natura|nature)/i.test(txt) ||
+                            !!row.querySelector(
+                                'img[src*="scout"], i[class*="scout" i], ' +
+                                '[class*="reportScout" i]'
+                            );
+                        const link = row.querySelector(
+                            'a[href*="berichte.php?id="], a[href*="report?id="]'
+                        );
+                        if (!link) continue;
+                        return {
+                            href: link.href || link.getAttribute('href'),
+                            scoutish: scoutish,
+                        };
+                    }
+                    return null;
+                }
+                """,
+                {"x": int(x), "y": int(y)},
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not href or not href.get("href"):
+            return None
+
+        # 2) Dettaglio report: risorse / truppe / mura / esploratori persi.
+        try:
+            await self._goto(_abs_game_url(self.page.url or "", href["href"]))
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            data = await self.page.evaluate(
+                """
+                () => {
+                    const num = (t) => {
+                        const m = String(t || '').match(/(\\d[\\d.]*)/);
+                        return m
+                            ? parseInt(m[1].replace(/\\./g, ''), 10) : 0;
+                    };
+                    const body = (document.body && document.body.innerText) || '';
+                    const out = {
+                        resources: {}, troops: {},
+                        wall_level: 0, scouts_lost: false,
+                        is_scout: false,
+                    };
+                    out.is_scout = /(?:scout|spia|esplor|ricogn|spy|' +
+                        'recon|erkund)/i.test(body);
+
+                    // Sezione difensore: unita' 'uN' + quantita'.
+                    const def = document.querySelector(
+                        '#defender, .defender, [class*="defender" i], ' +
+                        'div.role.defender'
+                    ) || document.body;
+                    def.querySelectorAll(
+                        'img[class*="unit"], i[class*="unit"], ' +
+                        'span[class*="unit"], [class*=" unit u"], ' +
+                        '[class*="unit u"]'
+                    ).forEach(icon => {
+                        const cls = icon.getAttribute('class') || '';
+                        const m = cls.match(
+                            /(?:^|[\\s_\\-])u(\\d{1,2})(?=[\\s\\-]|$)/
+                        );
+                        if (!m) return;
+                        const key = 'u' + m[1];
+                        let qty = 0;
+                        const cell = icon.closest('td, a, li, .col, div');
+                        if (cell) {
+                            qty = num(cell.innerText || '');
+                            if (!qty && cell.nextElementSibling)
+                                qty = num(cell.nextElementSibling.innerText || '');
+                        }
+                        if (qty > 0) out.troops[key] = (out.troops[key] || 0) + qty;
+                    });
+
+                    // Risorse spiate: icone r1..r4 + quantita'.
+                    const rmap = {
+                        'r1': 'wood', 'r2': 'clay',
+                        'r3': 'iron', 'r4': 'crop',
+                    };
+                    document.querySelectorAll(
+                        'img[class*="r1"], img[class*="r2"], ' +
+                        'img[class*="r3"], img[class*="r4"], ' +
+                        'i[class*="r1"], i[class*="r2"], ' +
+                        'i[class*="r3"], i[class*="r4"], ' +
+                        'span[class*="res"]'
+                    ).forEach(icon => {
+                        const cls = icon.getAttribute('class') || '';
+                        const m = cls.match(/\\br([1-4])\\b/);
+                        if (!m) return;
+                        const key = rmap['r' + m[1]];
+                        const cell = icon.closest('td, a, li, .col, div');
+                        let qty = 0;
+                        if (cell) {
+                            qty = num(cell.innerText || '');
+                            if (!qty && cell.nextElementSibling)
+                                qty = num(cell.nextElementSibling.innerText || '');
+                        }
+                        if (qty > 0)
+                            out.resources[key] = Math.max(
+                                out.resources[key] || 0, qty
+                            );
+                    });
+
+                    // Mura / reggia: riga con nome edificio + livello.
+                    const wallNames = new RegExp(
+                        '(mura|wall|mauer|palisade|palizzata|terrazzo|' +
+                        'earth\\\\s*wall|city\\\\s*wall|reggia|residenza|' +
+                        'residence|palace|palazzo|command\\\\s*center|' +
+                        'military\\\\s*base)', 'i'
+                    );
+                    document.querySelectorAll('tr, li, div').forEach(el => {
+                        const t = (el.innerText || '').trim();
+                        if (t && t.length < 200 && wallNames.test(t)) {
+                            const lv = t.match(
+                                /(?:livello|level|stufe|lvl)[^\\d]*(\\d+)/i
+                            ) || t.match(/\\b(\\d{1,2})\\s*$/);
+                            if (lv) {
+                                out.wall_level = Math.max(
+                                    out.wall_level, parseInt(lv[1], 10) || 0
+                                );
+                            }
+                        }
+                    });
+
+                    // Esploratori intercettati: sezione perdite attaccante
+                    // con numero > 0 o marcatore testuale di sconfitta.
+                    const att = document.querySelector(
+                        '#attacker, .attacker, [class*="attacker" i], ' +
+                        'div.role.attacker'
+                    );
+                    if (att) {
+                        att.querySelectorAll(
+                            '[class*="loss" i], .casualty, td:last-child'
+                        ).forEach(el => {
+                            if (num(el.innerText || '') > 0)
+                                out.scouts_lost = true;
+                        });
+                    }
+                    if (/(?:perdute|persi|killed|uccisi|lost|verloren|' +
+                        'died|intercett)/i.test(body)) {
+                        out.scouts_lost = true;
+                    }
+                    return out;
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(data, dict):
+            return None
+        res = data.get("resources") or {}
+        return {
+            "x": int(x),
+            "y": int(y),
+            "ts": time.time(),
+            "is_scout": bool(data.get("is_scout")),
+            "resources": {
+                "wood": safe_int(res.get("wood")),
+                "clay": safe_int(res.get("clay")),
+                "iron": safe_int(res.get("iron")),
+                "crop": safe_int(res.get("crop")),
+            },
+            "troops": {
+                str(k): safe_int(v)
+                for k, v in (data.get("troops") or {}).items()
+                if safe_int(v) > 0
+            },
+            "wall_level": safe_int(data.get("wall_level")),
+            "scouts_lost": bool(data.get("scouts_lost")),
+        }
+
     async def read_combat_reports(self, limit: int = 15) -> list[dict]:
         """Legge gli ultimi report di saccheggio/combattimento (berichte.php).
 

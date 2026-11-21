@@ -60,6 +60,12 @@ CREATE TABLE IF NOT EXISTS farm_targets (
     ord INTEGER DEFAULT 0,
     target_type TEXT DEFAULT '', last_raid_ts REAL DEFAULT 0,
     last_outcome TEXT DEFAULT '', fail_reason TEXT DEFAULT '',
+    last_scout_ts REAL DEFAULT 0, last_scout_req_ts REAL DEFAULT 0,
+    scouting_pending INTEGER DEFAULT 0,
+    scouted_resources TEXT DEFAULT '{}', scouted_troops TEXT DEFAULT '{}',
+    scouted_wall INTEGER DEFAULT 0,
+    nature_troops TEXT DEFAULT '{}', nature_ts REAL DEFAULT 0,
+    temp_blacklist_until REAL DEFAULT 0, paused_until REAL DEFAULT 0,
     PRIMARY KEY (account_id, id)
 );
 CREATE TABLE IF NOT EXISTS cropper_candidates (
@@ -123,7 +129,31 @@ _FARM_LATE_COLS = (
     ("last_raid_ts", "REAL DEFAULT 0"),
     ("last_outcome", "TEXT DEFAULT ''"),
     ("fail_reason", "TEXT DEFAULT ''"),
+    # Smart Pre-Raid Intelligence (spec oasi/villaggi)
+    ("last_scout_ts", "REAL DEFAULT 0"),
+    ("last_scout_req_ts", "REAL DEFAULT 0"),
+    ("scouting_pending", "INTEGER DEFAULT 0"),
+    ("scouted_resources", "TEXT DEFAULT '{}'"),
+    ("scouted_troops", "TEXT DEFAULT '{}'"),
+    ("scouted_wall", "INTEGER DEFAULT 0"),
+    ("nature_troops", "TEXT DEFAULT '{}'"),
+    ("nature_ts", "REAL DEFAULT 0"),
+    ("temp_blacklist_until", "REAL DEFAULT 0"),
+    ("paused_until", "REAL DEFAULT 0"),
 )
+
+
+# Colonne farm_targets il cui valore dict viene serializzato in JSON.
+_FARM_JSON_COLS = {"scouted_resources", "scouted_troops", "nature_troops"}
+
+
+def _farm_json(text) -> dict:
+    """Deserializza una colonna JSON di farm_targets in dict (o {})."""
+    try:
+        d = json.loads(text or "{}")
+        return d if isinstance(d, dict) else {}
+    except (TypeError, ValueError):
+        return {}
 
 
 def _ensure_farm_columns(conn: sqlite3.Connection) -> None:
@@ -242,7 +272,10 @@ def farm_load(acc_key: str) -> list[dict]:
                 "SELECT id, x, y, name, is_oasis, population, estimated_loot,"
                 " last_loot_ratio, losses_recorded, distance, nearest_village,"
                 " status, manual, updated_ts, target_type, last_raid_ts,"
-                " last_outcome, fail_reason"
+                " last_outcome, fail_reason, last_scout_ts,"
+                " last_scout_req_ts, scouting_pending, scouted_resources,"
+                " scouted_troops, scouted_wall, nature_troops, nature_ts,"
+                " temp_blacklist_until, paused_until"
                 " FROM farm_targets WHERE account_id = ? ORDER BY ord",
                 (acc_key,),
             ).fetchall()
@@ -257,6 +290,16 @@ def farm_load(acc_key: str) -> list[dict]:
                 "manual": bool(r[12]), "updated_ts": r[13] or 0.0,
                 "target_type": r[14] or "", "last_raid_ts": r[15] or 0.0,
                 "last_outcome": r[16] or "", "fail_reason": r[17] or "",
+                "last_scout_ts": r[18] or 0.0,
+                "last_scout_req_ts": r[19] or 0.0,
+                "scouting_pending": bool(r[20]),
+                "scouted_resources": _farm_json(r[21]),
+                "scouted_troops": _farm_json(r[22]),
+                "scouted_wall": r[23] or 0,
+                "nature_troops": _farm_json(r[24]),
+                "nature_ts": r[25] or 0.0,
+                "temp_blacklist_until": r[26] or 0.0,
+                "paused_until": r[27] or 0.0,
             }
             for r in rows
         ]
@@ -278,8 +321,11 @@ def farm_save(acc_key: str, rows: list[dict]) -> None:
                 " is_oasis, population, estimated_loot, last_loot_ratio,"
                 " losses_recorded, distance, nearest_village, status,"
                 " manual, updated_ts, ord, target_type, last_raid_ts,"
-                " last_outcome, fail_reason)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " last_outcome, fail_reason, last_scout_ts,"
+                " last_scout_req_ts, scouting_pending, scouted_resources,"
+                " scouted_troops, scouted_wall, nature_troops, nature_ts,"
+                " temp_blacklist_until, paused_until)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         acc_key, str(r.get("id") or ""),
@@ -300,6 +346,16 @@ def farm_save(acc_key: str, rows: list[dict]) -> None:
                         float(r.get("last_raid_ts") or 0.0),
                         str(r.get("last_outcome") or ""),
                         str(r.get("fail_reason") or ""),
+                        float(r.get("last_scout_ts") or 0.0),
+                        float(r.get("last_scout_req_ts") or 0.0),
+                        1 if r.get("scouting_pending") else 0,
+                        json.dumps(r.get("scouted_resources") or {}),
+                        json.dumps(r.get("scouted_troops") or {}),
+                        int(r.get("scouted_wall") or 0),
+                        json.dumps(r.get("nature_troops") or {}),
+                        float(r.get("nature_ts") or 0.0),
+                        float(r.get("temp_blacklist_until") or 0.0),
+                        float(r.get("paused_until") or 0.0),
                     )
                     for i, r in enumerate(rows)
                 ],
@@ -315,6 +371,9 @@ _FARM_PATCH_COLS = {
     "fail_reason", "last_loot_ratio", "losses_recorded", "name",
     "population", "estimated_loot", "distance", "nearest_village",
     "target_type", "is_oasis",
+    "last_scout_ts", "last_scout_req_ts", "scouting_pending",
+    "scouted_resources", "scouted_troops", "scouted_wall",
+    "nature_troops", "nature_ts", "temp_blacklist_until", "paused_until",
 }
 
 
@@ -337,6 +396,10 @@ def farm_patch(
     vals: list = []
     for col, val in fields.items():
         if col in _FARM_PATCH_COLS:
+            if col in _FARM_JSON_COLS:
+                val = json.dumps(val or {})
+            elif col == "scouting_pending":
+                val = 1 if val else 0
             sets.append(f"{col} = ?")
             vals.append(val)
     if not sets:

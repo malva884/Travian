@@ -172,6 +172,19 @@ class FarmingConfig:
     # list nativa del Gold Club (tt=99).
     targets_per_wave: int = 3           # max target approved per ciclo di raid
     auto_scan: bool = True              # scoperta target via scansione mappa periodica
+    # --- Smart Pre-Raid Intelligence ---
+    auto_scout_villages: bool = True    # spiata obbligatoria sui villaggi senza report valido
+    scout_ttl_minutes: float = 120.0    # validita' della spiata: oltre si ripete
+    oasis_auto_clear: bool = True       # pulizia belve Natura quando il rischio e' coperto
+    max_oasis_loss_pct: float = 0.0     # perdite max accettabili sul clear (0 = regola zero perdite)
+    min_raid_loot: int = 150            # bottino minimo sotto cui il raid non parte
+    micro_raid_qty: int = 3             # unita' del micro-raid su oasi vuota (2-5)
+    scouts_per_mission: int = 1         # esploratori per missione di spionaggio
+    max_troops_per_raid: int = 0        # tetto unita' per raid (0 = illimitato)
+    defended_blacklist_hours: float = 24.0  # blacklist breve su target difeso
+    scout_wall_threshold: int = 10      # mura oltre questa soglia = 'difeso'
+    scout_pending_timeout_minutes: float = 60.0  # retry spiata senza report
+    oasis_rescan_minutes: float = 30.0  # TTL cache bestie Natura (rilettura scheda tile)
 
 
 @dataclass
@@ -641,6 +654,18 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                 "unit": acc.farming.unit,
                 "targets_per_wave": acc.farming.targets_per_wave,
                 "auto_scan": acc.farming.auto_scan,
+                "auto_scout_villages": acc.farming.auto_scout_villages,
+                "scout_ttl_minutes": acc.farming.scout_ttl_minutes,
+                "oasis_auto_clear": acc.farming.oasis_auto_clear,
+                "max_oasis_loss_pct": acc.farming.max_oasis_loss_pct,
+                "min_raid_loot": acc.farming.min_raid_loot,
+                "micro_raid_qty": acc.farming.micro_raid_qty,
+                "scouts_per_mission": acc.farming.scouts_per_mission,
+                "max_troops_per_raid": acc.farming.max_troops_per_raid,
+                "defended_blacklist_hours": acc.farming.defended_blacklist_hours,
+                "scout_wall_threshold": acc.farming.scout_wall_threshold,
+                "scout_pending_timeout_minutes": acc.farming.scout_pending_timeout_minutes,
+                "oasis_rescan_minutes": acc.farming.oasis_rescan_minutes,
             },
             "scout_brain_settings": {
                 "enabled": acc.scout_brain.enabled,

@@ -85,6 +85,17 @@ class FarmTarget:
     last_raid_ts: float = 0.0      # ts ultimo invio raid verso il target
     last_outcome: str = ""         # clean | losses | empty (dai report)
     fail_reason: str = ""          # motivo ultimo mancato invio
+    # --- Smart Pre-Raid Intelligence ---
+    last_scout_ts: float = 0.0     # ts ultimo report di spionaggio valido
+    last_scout_req_ts: float = 0.0 # ts ultima missione scout inviata
+    scouting_pending: bool = False # spiata in corso (report atteso)
+    scouted_resources: dict = field(default_factory=dict)
+    scouted_troops: dict = field(default_factory=dict)
+    scouted_wall: int = 0          # livello mura/reggia letto dalla spiata
+    nature_troops: dict = field(default_factory=dict)  # bestie oasi {'uN': n}
+    nature_ts: float = 0.0         # ts ultima lettura bestie da mappa
+    temp_blacklist_until: float = 0.0  # blacklist temporanea (difeso/scout uccisi)
+    paused_until: float = 0.0      # pausa (protezione principianti)
     updated_ts: float = field(default_factory=time.time)
 
     @classmethod
@@ -112,6 +123,32 @@ class FarmTarget:
                 last_raid_ts=float(data.get("last_raid_ts") or 0.0),
                 last_outcome=str(data.get("last_outcome") or ""),
                 fail_reason=str(data.get("fail_reason") or ""),
+                last_scout_ts=float(data.get("last_scout_ts") or 0.0),
+                last_scout_req_ts=float(
+                    data.get("last_scout_req_ts") or 0.0
+                ),
+                scouting_pending=bool(data.get("scouting_pending")),
+                scouted_resources=(
+                    dict(data.get("scouted_resources"))
+                    if isinstance(data.get("scouted_resources"), dict)
+                    else {}
+                ),
+                scouted_troops=(
+                    dict(data.get("scouted_troops"))
+                    if isinstance(data.get("scouted_troops"), dict)
+                    else {}
+                ),
+                scouted_wall=int(data.get("scouted_wall") or 0),
+                nature_troops=(
+                    dict(data.get("nature_troops"))
+                    if isinstance(data.get("nature_troops"), dict)
+                    else {}
+                ),
+                nature_ts=float(data.get("nature_ts") or 0.0),
+                temp_blacklist_until=float(
+                    data.get("temp_blacklist_until") or 0.0
+                ),
+                paused_until=float(data.get("paused_until") or 0.0),
                 updated_ts=float(data.get("updated_ts") or time.time()),
             )
         except Exception:
@@ -222,6 +259,14 @@ class FarmTargetStore:
         memorizzata al momento della scansione.
         """
         approved = self.list_targets(STATUS_APPROVED)
+        now = time.time()
+        # Esclude target in blacklist temporanea o in pausa (protezione
+        # principianti): restano 'approved' ma non sono razziabili ora.
+        approved = [
+            t for t in approved
+            if float(t.temp_blacklist_until or 0.0) <= now
+            and float(t.paused_until or 0.0) <= now
+        ]
         if near_x is not None and near_y is not None:
             approved.sort(
                 key=lambda t: math.hypot(t.x - near_x, t.y - near_y)
@@ -265,6 +310,16 @@ class FarmTargetStore:
                 keep["losses_recorded"] = raw.get(
                     "losses_recorded", keep["losses_recorded"]
                 )
+                # Campi pre-raid intelligence: la scansione mappa non
+                # deve azzerare spiate e blacklist temporanee attive.
+                for _k in (
+                    "last_scout_ts", "last_scout_req_ts",
+                    "scouting_pending", "scouted_resources",
+                    "scouted_troops", "scouted_wall", "nature_troops",
+                    "nature_ts", "temp_blacklist_until", "paused_until",
+                    "last_raid_ts", "last_outcome", "fail_reason",
+                ):
+                    keep[_k] = raw.get(_k, keep[_k])
                 keep["updated_ts"] = time.time()
                 self._data[i] = keep
                 self._save()
@@ -418,6 +473,90 @@ class FarmTargetStore:
                 break
             if changed:
                 self._save()
+
+    # --------------------------------------------------------------
+    # Smart Pre-Raid Intelligence: spiate, bestie oasi, blacklist brevi
+    # --------------------------------------------------------------
+    def _patch_at(self, x: int, y: int, fields: dict) -> bool:
+        """UPDATE mirato per-coordinata (DB) o riga (file JSON)."""
+        with self._lock:
+            if self._db_key is not None:
+                fields = dict(fields)
+                fields["updated_ts"] = time.time()
+                if db.farm_patch(self._db_key, fields, x=x, y=y):
+                    self._load()
+                    return True
+                return False
+            self._load()
+            for raw in self._data:
+                if int(raw.get("x", 0)) == x and int(raw.get("y", 0)) == y:
+                    raw.update(fields)
+                    raw["updated_ts"] = time.time()
+                    self._save()
+                    return True
+            return False
+
+    def record_scout_sent(self, x: int, y: int) -> None:
+        """Marca la spiata in corso: evita invii multipli ravvicinati."""
+        self._patch_at(
+            x, y,
+            {"scouting_pending": True, "last_scout_req_ts": time.time()},
+        )
+
+    def record_scout_result(
+        self,
+        x: int,
+        y: int,
+        resources: dict,
+        troops: dict,
+        wall_level: int = 0,
+        report_ts: float | None = None,
+    ) -> None:
+        """Persiste l'esito della spiata (chiamato dal parser report)."""
+        self._patch_at(
+            x, y,
+            {
+                "scouting_pending": False,
+                "last_scout_ts": report_ts or time.time(),
+                "scouted_resources": dict(resources or {}),
+                "scouted_troops": dict(troops or {}),
+                "scouted_wall": int(wall_level or 0),
+                "last_outcome": "scouted",
+            },
+        )
+
+    def record_nature_troops(self, x: int, y: int, nature: dict) -> None:
+        """Salva il conteggio bestie letto dalla scheda tile mappa."""
+        self._patch_at(
+            x, y,
+            {"nature_troops": dict(nature or {}), "nature_ts": time.time()},
+        )
+
+    def set_temp_blacklist_at(
+        self, x: int, y: int, hours: float, reason: str = ""
+    ) -> None:
+        """Blacklist temporanea (target difeso / scout intercettati)."""
+        self._patch_at(
+            x, y,
+            {
+                "temp_blacklist_until": time.time() + hours * 3600.0,
+                "last_outcome": str(reason or "temp_blacklist"),
+            },
+        )
+
+    def set_pause_at(self, x: int, y: int, hours: float, reason: str = "") -> None:
+        """Pausa il target (es. protezione principianti attiva)."""
+        self._patch_at(
+            x, y,
+            {
+                "paused_until": time.time() + hours * 3600.0,
+                "last_outcome": str(reason or "paused"),
+            },
+        )
+
+    def note_skip(self, x: int, y: int, reason: str) -> None:
+        """Registra il motivo del raid saltato in last_outcome (spec oasi)."""
+        self._patch_at(x, y, {"last_outcome": str(reason or "")})
 
     # --------------------------------------------------------------
     # Discovery (Step 2 spec): tile scansionati -> pending

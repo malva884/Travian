@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import db
+from . import combat_calc, db
 from .config import BASE_DIR, Settings
 from .models import Action, ActionType, GID_RALLY_POINT
 
@@ -56,6 +56,12 @@ SCAN_MIN_SECONDS = 5400.0   # 1.5h
 SCAN_MAX_SECONDS = 9000.0   # 2.5h
 # Minimo di unita' per raid quando farm_unit_qty = auto
 AUTO_QTY_FLOOR = 3
+
+# Budget anti page-load storm per ciclo (Smart Pre-Raid Intelligence):
+# letture scheda tile oasi, apertura report spia e missioni esploratori.
+MAX_TILE_READS_PER_CYCLE = 5
+MAX_REPORT_READS_PER_CYCLE = 3
+MAX_SCOUTS_PER_CYCLE = 3
 
 # Alias delle truppe "leggere da saccheggio" per verificare la presenza
 # quando non e' configurata un'unita' specifica: le chiavi del sensore
@@ -343,6 +349,7 @@ class FarmingManager:
         self,
         *,
         executor: "ActionExecutor",
+        observer: "GameObserver",
         farm_store: "FarmTargetStore",
         settings: Settings,
         village: "Village",
@@ -354,7 +361,13 @@ class FarmingManager:
     ) -> bool:
         """Invia raid mirati (tt=2, move_type=4) sui target approved.
 
-        Ritorna True se almeno un raid e' partito.
+        Smart Pre-Raid Intelligence: prima di accodare un raid ogni
+        target passa la verifica di fattibilita' — le oasi vengono
+        lette dalla scheda tile mappa (bestie Natura, annessione,
+        protezione) e valutate col combat_calc, i villaggi richiedono
+        una spiata valida entro TTL (invio esploratori + parser report)
+        e il contingente e' calcolato sul bottino spiato.
+        Ritorna True se almeno un raid o una spiata e' partita.
         """
         approved = farm_store.get_approved_targets(
             near_x=village.x, near_y=village.y
@@ -437,6 +450,35 @@ class FarmingManager:
             return False
         approved = eligible
 
+        # --------------------------------------------------------------
+        # Configurazione Smart Pre-Raid Intelligence
+        # --------------------------------------------------------------
+        fcfg = settings.farming
+        auto_scout = bool(getattr(fcfg, "auto_scout_villages", True))
+        scout_ttl_s = float(getattr(fcfg, "scout_ttl_minutes", 120) or 120) * 60.0
+        oasis_clear = bool(getattr(fcfg, "oasis_auto_clear", True))
+        max_loss_pct = float(getattr(fcfg, "max_oasis_loss_pct", 0.0) or 0.0)
+        min_loot = int(getattr(fcfg, "min_raid_loot", 150) or 150)
+        micro_qty = max(2, min(5, int(getattr(fcfg, "micro_raid_qty", 3) or 3)))
+        max_per_raid = int(getattr(fcfg, "max_troops_per_raid", 0) or 0)
+        if farm_unit_qty and farm_unit_qty > 0:
+            # Override per-villaggio: funge da tetto per-raid
+            max_per_raid = int(farm_unit_qty)
+        scouts_qty = max(1, int(getattr(fcfg, "scouts_per_mission", 1) or 1))
+        bl_hours = float(getattr(fcfg, "defended_blacklist_hours", 24.0) or 24.0)
+        wall_threshold = int(getattr(fcfg, "scout_wall_threshold", 10) or 10)
+        pending_to_s = (
+            float(getattr(fcfg, "scout_pending_timeout_minutes", 60) or 60)
+            * 60.0
+        )
+        nature_ttl_s = (
+            float(getattr(fcfg, "oasis_rescan_minutes", 30) or 30) * 60.0
+        )
+        hero_enabled = bool(
+            getattr(settings.hero, "tactical_hero_enabled", True)
+        )
+        pause_hours = 12.0  # protezione principianti: pausa mezza giornata
+
         unit_key = self._raider_key(troops, unit_pref)
         if not unit_key:
             # Inventario a zero o sensore cieco: niente invio cieco — il
@@ -458,25 +500,313 @@ class FarmingManager:
             )
             return False
 
-        max_wave = max(1, int(settings.farming.targets_per_wave or 1))
-        selected = approved[:max_wave]
+        max_wave = max(1, int(fcfg.targets_per_wave or 1))
+        candidates = approved[:max_wave]
         available = troops.get("u" + unit_key[1:], troops.get(unit_key, 0))
-        if farm_unit_qty and farm_unit_qty > 0:
-            qty = farm_unit_qty
-        else:
-            qty = max(AUTO_QTY_FLOOR, available // max(1, len(selected)))
-        if available > 0:
-            qty = min(qty, available)
 
-        raid_targets = [
-            {
-                "x": t.x,
-                "y": t.y,
-                "target_name": t.name,
-                "troops": {unit_key: qty},
+        # Chiave esploratore per la tribu' dell'account (fallback su
+        # qualunque unita' esploratrice presente in casa).
+        scout_key = combat_calc.scout_unit_key(
+            getattr(settings, "tribe", "") or ""
+        )
+        if not scout_key or int(troops.get(scout_key, 0) or 0) <= 0:
+            scout_key = next(
+                (
+                    k for k in combat_calc.ALL_SCOUT_UNITS
+                    if int(troops.get(k, 0) or 0) > 0
+                ),
+                scout_key,
+            )
+        scout_avail = int(troops.get(scout_key, 0) or 0)
+
+        remaining: dict[str, int] = dict(troops or {})
+        raid_plan: list[dict] = []
+        scout_plan: list[dict] = []
+        skipped: list[str] = []
+        tile_reads = report_reads = 0
+
+        async def _eval_target(t_obj) -> str:
+            """Decide il destino del target: raid | scout | skip."""
+            nonlocal scout_avail, tile_reads, report_reads
+            tx, ty = int(t_obj.x), int(t_obj.y)
+
+            # ============ Caso A: OASI (is_oasis == True) ============
+            if bool(getattr(t_obj, "is_oasis", False)):
+                details: dict | None = None
+                nature = dict(getattr(t_obj, "nature_troops", {}) or {})
+                stale = (
+                    not nature
+                    or (now_ts - float(getattr(t_obj, "nature_ts", 0.0) or 0.0))
+                    > nature_ttl_s
+                )
+                if stale and tile_reads < MAX_TILE_READS_PER_CYCLE:
+                    tile_reads += 1
+                    try:
+                        details = await observer.read_tile_details(tx, ty)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "%s PreRaid: scheda tile (%s|%s) non letta: %s",
+                            prefix, tx, ty, exc,
+                        )
+                if details and details.get("ok"):
+                    if details.get("protection"):
+                        farm_store.set_pause_at(
+                            tx, ty, pause_hours, "protezione principianti"
+                        )
+                        return (
+                            f"({tx}|{ty}) pausa: protezione principianti"
+                        )
+                    nature = dict(details.get("nature_troops") or {})
+                    farm_store.record_nature_troops(tx, ty, nature)
+                    if details.get("oasis_annexed"):
+                        # Oasi annessa a un villaggio giocatore ->
+                        # si tratta come Caso B (villaggio).
+                        pass
+                    else:
+                        return _eval_free_oasis(t_obj, nature)
+                elif details is None and not nature:
+                    # Lettura fallita e nessun dato precedente: prudenza,
+                    # non si raida un'oasi di cui non si sa nulla.
+                    return f"({tx}|{ty}) scheda oasi non leggibile"
+                else:
+                    return _eval_free_oasis(t_obj, nature)
+
+            # ============ Caso B: VILLAGGIO (o oasi annessa) ============
+            if not auto_scout:
+                # Ricognizione disattivata: raid legacy su quantita' fissa.
+                qty = farm_unit_qty if farm_unit_qty > 0 else AUTO_QTY_FLOOR
+                qty = min(qty, remaining.get("u" + unit_key[1:], 0))
+                if qty <= 0:
+                    return f"({tx}|{ty}) truppe esaurite"
+                remaining["u" + unit_key[1:]] -= qty
+                raid_plan.append({
+                    "x": tx, "y": ty,
+                    "target_name": t_obj.name,
+                    "troops": {unit_key: qty},
+                })
+                return "raid"
+
+            t_obj = farm_store.find(t_obj.id) or t_obj  # dati freschi
+            scouted_res = dict(
+                getattr(t_obj, "scouted_resources", {}) or {}
+            )
+            scouted_trp = dict(getattr(t_obj, "scouted_troops", {}) or {})
+            wall = int(getattr(t_obj, "scouted_wall", 0) or 0)
+            last_scout = float(getattr(t_obj, "last_scout_ts", 0.0) or 0.0)
+            pending = bool(getattr(t_obj, "scouting_pending", False))
+            scout_req = float(
+                getattr(t_obj, "last_scout_req_ts", 0.0) or 0.0
+            )
+            fresh = last_scout > 0 and (now_ts - last_scout) <= scout_ttl_s
+
+            # --- Report spia in arrivo? Prova a raccoglierlo ---
+            if not fresh and report_reads < MAX_REPORT_READS_PER_CYCLE:
+                report_reads += 1
+                try:
+                    rep = await observer.parse_scout_report(tx, ty)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "%s PreRaid: report spia (%s|%s) non letto: %s",
+                        prefix, tx, ty, exc,
+                    )
+                    rep = None
+                if rep:
+                    farm_store.record_scout_result(
+                        tx, ty,
+                        rep.get("resources") or {},
+                        rep.get("troops") or {},
+                        int(rep.get("wall_level") or 0),
+                        float(rep.get("ts") or 0.0),
+                    )
+                    if rep.get("scouts_lost"):
+                        farm_store.set_temp_blacklist_at(
+                            tx, ty, bl_hours,
+                            "Scout intercettati — target sorvegliato",
+                        )
+                        return (
+                            f"({tx}|{ty}) scout intercettati: "
+                            "blacklist 24h"
+                        )
+                    scouted_res = dict(rep.get("resources") or {})
+                    scouted_trp = dict(rep.get("troops") or {})
+                    wall = int(rep.get("wall_level") or 0)
+                    last_scout = float(rep.get("ts") or 0.0)
+                    fresh = True
+                    pending = False
+                elif pending:
+                    if scout_req > 0 and (now_ts - scout_req) > pending_to_s:
+                        # Spiata scaduta senza report: sblocca e rinvia.
+                        farm_store._patch_at(
+                            tx, ty, {"scouting_pending": False}
+                        )
+                        pending = False
+                    else:
+                        return f"({tx}|{ty}) spiata in corso"
+
+            # --- Spiata valida: calcolo dinamico del raid ---
+            if fresh:
+                if scouted_trp or wall > wall_threshold:
+                    farm_store.set_temp_blacklist_at(
+                        tx, ty, bl_hours,
+                        f"defended (wall={wall}, troops={scouted_trp})",
+                    )
+                    return f"({tx}|{ty}) difeso: blacklist 24h"
+                loot = combat_calc.total_loot(scouted_res)
+                if loot < min_loot:
+                    farm_store.note_skip(
+                        tx, ty, f"bottino {loot} < soglia {min_loot}"
+                    )
+                    return f"({tx}|{ty}) bottino {loot} < {min_loot}"
+                qty = combat_calc.troops_for_loot(
+                    loot, unit_key,
+                    remaining.get("u" + unit_key[1:], 0),
+                    max_troops_per_raid=max_per_raid,
+                )
+                if qty <= 0:
+                    return f"({tx}|{ty}) truppe insufficienti"
+                remaining["u" + unit_key[1:]] -= qty
+                raid_plan.append({
+                    "x": tx, "y": ty,
+                    "target_name": t_obj.name,
+                    "troops": {unit_key: qty},
+                })
+                return "raid"
+
+            # --- Nessuna spiata: invio missione di spionaggio ---
+            if pending:
+                return f"({tx}|{ty}) spiata in corso"
+            if scout_avail <= 0:
+                farm_store.note_skip(
+                    tx, ty, "SKIPPED (nessun esploratore disponibile)"
+                )
+                return f"({tx}|{ty}) nessun esploratore"
+            if len(scout_plan) >= MAX_SCOUTS_PER_CYCLE:
+                return f"({tx}|{ty}) quota spiate ciclo esaurita"
+            qty = min(scouts_qty, scout_avail)
+            scout_avail -= qty
+            scout_plan.append({
+                "x": tx, "y": ty,
+                "target_name": t_obj.name,
+                "troops": {"t" + scout_key[1:]: qty},
+            })
+            return "scout"
+
+        def _eval_free_oasis(t_obj, nature: dict) -> str:
+            """Regola zero/minime perdite sull'oasi libera (spec A.2)."""
+            tx, ty = int(t_obj.x), int(t_obj.y)
+            ukey = "u" + unit_key[1:]
+            if not combat_calc.normalize_nature(nature):
+                # Oasi vuota: micro-raid per il bottino rigenerato.
+                qty = min(
+                    micro_qty, remaining.get(ukey, 0), max_per_raid or 99
+                )
+                if qty <= 0:
+                    return f"({tx}|{ty}) truppe esaurite"
+                remaining[ukey] -= qty
+                raid_plan.append({
+                    "x": tx, "y": ty,
+                    "target_name": t_obj.name,
+                    "troops": {unit_key: qty},
+                })
+                return "raid"
+            if not oasis_clear:
+                return f"({tx}|{ty}) oasi presidiata: clear disattivato"
+            clear_t, qty = combat_calc.min_troops_for_oasis(
+                nature, remaining, unit_key,
+                max_loss_pct=max_loss_pct,
+                cap=max_per_raid or len(remaining) * 1000 or 0,
+            )
+            if not clear_t or qty <= 0:
+                reason = (
+                    f"Skipped: {combat_calc.nature_summary(nature)}"
+                    " — forze insufficienti"
+                )
+                farm_store.note_skip(tx, ty, reason)
+                return f"({tx}|{ty}) {reason}"
+            remaining["u" + clear_t[1:]] -= qty
+            entry: dict = {
+                "x": tx, "y": ty,
+                "target_name": t_obj.name,
+                "troops": {clear_t: qty},
             }
-            for t in selected
-        ]
+            # Eroe tattico su oasi dense di belve con bottino alto.
+            beasts = sum(combat_calc.normalize_nature(nature).values())
+            if (
+                hero_enabled and beasts >= 15
+                and int(getattr(t_obj, "estimated_loot", 0) or 0) >= 1500
+            ):
+                entry["include_hero"] = True
+            raid_plan.append(entry)
+            return "raid"
+
+        for t_obj in candidates:
+            try:
+                verdict = await _eval_target(t_obj)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "%s PreRaid: valutazione (%s|%s) fallita: %s",
+                    prefix, t_obj.x, t_obj.y, exc,
+                )
+                verdict = f"({t_obj.x}|{t_obj.y}) errore valutazione"
+            if verdict != "raid" and verdict != "scout":
+                skipped.append(verdict)
+
+        if skipped:
+            self._audit_event(
+                "RAID_TARGET",
+                "SKIPPED",
+                f"Pre-raid: {len(skipped)} target scartati",
+                skipped=skipped[:12],
+            )
+
+        sent_any = False
+
+        # ---- Missioni di spionaggio (Caso B step 3) ----
+        if scout_plan:
+            scout_action = Action(
+                type=ActionType.SEND_SCOUT,
+                params={
+                    "rally_slot": rally_slot,
+                    "mission": "scout",
+                    "targets": scout_plan,
+                },
+                reason=(
+                    f"Custom Farm Targets: {len(scout_plan)} spiate "
+                    f"da '{village.name}' ({scout_key})"
+                ),
+            )
+            sres = await executor.execute(
+                scout_action, village_id=village.village_id
+            )
+            _s = (sres.data or {}).get("sent_coords")
+            _s_coords: set[tuple[int, int]] = set()
+            if _s is not None:
+                for _c in _s:
+                    try:
+                        _s_coords.add((int(_c[0]), int(_c[1])))
+                    except (TypeError, ValueError, IndexError):
+                        continue
+            for t in scout_plan:
+                _ok = (
+                    (t["x"], t["y"]) in _s_coords
+                    if _s is not None else bool(sres.success)
+                )
+                if _ok:
+                    farm_store.record_scout_sent(t["x"], t["y"])
+            self._audit_event(
+                "SCOUT_SEND",
+                "EXECUTED" if sres.success else "BLOCKED",
+                f"{len(scout_plan)} spiate da '{village.name}': "
+                f"{sres.message}",
+                coords=[[t["x"], t["y"]] for t in scout_plan],
+            )
+            if sres.success:
+                sent_any = True
+
+        # ---- Raid mirati (tt=2) ----
+        raid_targets = raid_plan
+        if not raid_targets:
+            return sent_any
         action = Action(
             type=ActionType.SEND_CUSTOM_RAID,
             params={
@@ -486,22 +816,22 @@ class FarmingManager:
             },
             reason=(
                 f"Custom Farm Targets: {len(raid_targets)} raid mirati "
-                f"({unit_key} x{qty}) da '{village.name}'"
+                f"da '{village.name}'"
             ),
         )
         result = await executor.execute(action, village_id=village.village_id)
         self._audit_event(
             "RAID_SEND",
             "EXECUTED" if result.success else "BLOCKED",
-            f"{len(raid_targets)} raid mirati ({unit_key} x{qty}) da "
+            f"{len(raid_targets)} raid mirati da "
             f"'{village.name}': {result.message}",
             coords=[[t['x'], t['y']] for t in raid_targets],
             unit=unit_key,
-            qty=qty,
+            troops=[t.get("troops") for t in raid_targets],
             expected_loot=int(
                 sum(
                     int(getattr(t, 'estimated_loot', 0) or 0)
-                    for t in selected
+                    for t in candidates
                 )
             ),
         )
@@ -520,11 +850,11 @@ class FarmingManager:
                 except (TypeError, ValueError, IndexError):
                     continue
         _failed = (result.data or {}).get("failed_targets") or []
-        for t in selected:
+        for t in raid_targets:
             try:
-                _coord = (int(t.x), int(t.y))
-            except (TypeError, ValueError):
-                _coord = (t.x, t.y)
+                _coord = (int(t["x"]), int(t["y"]))
+            except (TypeError, ValueError, KeyError):
+                continue
             _t_sent = (
                 _coord in _sent_coords
                 if _sent is not None
@@ -543,8 +873,20 @@ class FarmingManager:
                             break
                     except (TypeError, ValueError):
                         continue
+            # Protezione principianti: submit rifiutato dal gioco con
+            # il messaggio dedicato -> pausa del target, niente retry
+            # a catena.
+            _low = _reason.lower()
+            if (
+                "protezione principianti" in _low
+                or "beginner" in _low
+                or "protection" in _low
+            ):
+                farm_store.set_pause_at(
+                    _coord[0], _coord[1], pause_hours, _reason
+                )
             farm_store.record_raid_attempt(
-                t.x, t.y, _t_sent, _reason
+                _coord[0], _coord[1], _t_sent, _reason
             )
         if result.success:
             logger.info(
@@ -665,6 +1007,7 @@ class FarmingManager:
             )
             sent = await self._send_approved_raids(
                 executor=executor,
+                observer=observer,
                 farm_store=farm_store,
                 settings=settings,
                 village=village,

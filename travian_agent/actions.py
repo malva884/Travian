@@ -2107,8 +2107,18 @@ class ActionExecutor:
         """
         params = action.params or {}
         rally_slot = params.get("rally_slot")
+        # Missione spionaggio (Smart Pre-Raid Intelligence): le spie si
+        # inviano come attacco normale (c=3) con opzione 'spy' nella
+        # pagina di conferma; se il server espone un radio spy dedicato
+        # nel form tt=2 viene selezionato li'.
+        is_scout = (
+            action.type == ActionType.SEND_SCOUT
+            or str(params.get("mission") or "") == "scout"
+        )
         # Tipo movimento: 4=saccheggio (default), 2=rinforzo (dodge), 3=attacco
-        move_type = str(params.get("move_type") or "4")
+        move_type = str(
+            params.get("move_type") or ("3" if is_scout else "4")
+        )
         raw_targets = params.get("targets") or []
         if not raw_targets and "x" in params and "y" in params:
             raw_targets = [params]
@@ -2164,7 +2174,7 @@ class ActionExecutor:
                 fill_res = await page.evaluate(
                     """
                     (payload) => {
-                        const { x, y, troops, moveType, includeHero } = payload;
+                        const { x, y, troops, moveType, includeHero, scout } = payload;
                         const pick = (sels) => {
                             for (const s of sels) {
                                 const el = document.querySelector(s);
@@ -2211,6 +2221,25 @@ class ActionExecutor:
                             raidRadio.dispatchEvent(
                                 new Event('change', {bubbles: true})
                             );
+                        }
+
+                        // Missione spionaggio: alcuni layout espongono
+                        // un radio 'spy' gia' nel form tt=2 (spy=1 =
+                        // esplora risorse e truppe). Se presente viene
+                        // selezionato; altrimenti l'opzione si gestisce
+                        // nella pagina di conferma.
+                        if (scout) {
+                            const spyRadio = pick([
+                                'input[type="radio"][name="spy"][value="1"]',
+                                'input[name="spy"][value="1"]',
+                                'input[type="radio"][name="spy"]',
+                            ]);
+                            if (spyRadio) {
+                                spyRadio.checked = true;
+                                spyRadio.dispatchEvent(
+                                    new Event('change', {bubbles: true})
+                                );
+                            }
                         }
 
                         // Quantita' truppe: il form T4.x usa slot
@@ -2277,6 +2306,7 @@ class ActionExecutor:
                     {
                         "x": tx, "y": ty, "troops": troops,
                         "moveType": move_type, "includeHero": include_hero,
+                        "scout": is_scout,
                     },
                 )
 
@@ -2406,6 +2436,35 @@ class ActionExecutor:
                          "reason": f"submit_rejected:{_merr}"}
                     )
                     continue
+
+                # 4bis. Missione spionaggio: la pagina di conferma
+                # espone i radio 'spy' (1 = risorse e truppe, 2 = solo
+                # truppe/difese). Selezioniamo l'opzione 1 prima del
+                # click di conferma (spec c=4 / Esplora risorse e truppe).
+                if is_scout:
+                    try:
+                        await page.evaluate(
+                            """
+                            () => {
+                                const spy = document.querySelector(
+                                    'input[type="radio"][name="spy"][value="1"], ' +
+                                    'input[name="spy"][value="1"], ' +
+                                    'input[type="radio"][name="spy"]'
+                                );
+                                if (spy) {
+                                    spy.checked = true;
+                                    spy.dispatchEvent(
+                                        new MouseEvent('click', {bubbles: true})
+                                    );
+                                    spy.dispatchEvent(
+                                        new Event('change', {bubbles: true})
+                                    );
+                                }
+                            }
+                            """
+                        )
+                    except Exception:  # noqa: BLE001 — opzione assente
+                        pass
 
                 # 5. Secondo submit: conferma del raid nella schermata
                 # riepilogo. ATTENZIONE: sotto la tabella truppe ci sono

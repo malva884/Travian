@@ -315,6 +315,7 @@ class ActionType(str, Enum):
     CLAIM_VIDEO_BONUS = "claim_video_bonus"  # riscatto bonus +15% per 8 ore (video ad)
     SEND_RAID = "send_raid"          # invio raid da farm list (Punto di Raduno)
     SEND_CUSTOM_RAID = "send_custom_raid"  # invio raid dinamico a coordinate libere (AI Scout Brain)
+    SEND_SCOUT = "send_scout"          # missione di spionaggio (esploratori) pre-raid
     UPGRADE_UNITS = "upgrade_units"  # potenziamento unita' in Fucina (smithy_auto_upgrade)
     FOUND_VILLAGE = "found_village"  # fondazione nuovo villaggio via mappa
     START_CELEBRATION = "start_celebration"  # festa al Municipio (punti cultura)

@@ -2441,6 +2441,60 @@ if page == "Farming & Eroe":
                          "e villaggi razziabili come 'pending' nella tabella sotto.",
                 )
 
+            # ---------------- SMART PRE-RAID INTELLIGENCE ----------------
+            st.markdown("#### 🔍 Smart Pre-Raid Intelligence")
+            p_col1, p_col2, p_col3 = st.columns(3)
+            with p_col1:
+                auto_scout_sel = st.toggle(
+                    "Spiata automatica sui villaggi",
+                    value=bool(getattr(mod_acc.farming, "auto_scout_villages", True)),
+                    key="farm_autoscout_toggle",
+                    help="Invia esploratori sui villaggi approved senza report "
+                         "valido; il contingente raid e' calcolato sul bottino spiato.",
+                )
+            with p_col2:
+                scout_ttl_sel = st.number_input(
+                    "TTL spiata (minuti):",
+                    min_value=10, max_value=1440,
+                    value=int(getattr(mod_acc.farming, "scout_ttl_minutes", 120) or 120),
+                    key="farm_scout_ttl",
+                    help="Oltre questa soglia il report spia e' considerato scaduto "
+                         "e viene inviata una nuova missione.",
+                )
+            with p_col3:
+                scouts_qty_sel = st.number_input(
+                    "Esploratori per missione:",
+                    min_value=1, max_value=20,
+                    value=int(getattr(mod_acc.farming, "scouts_per_mission", 1) or 1),
+                    key="farm_scouts_qty",
+                )
+            p_col4, p_col5, p_col6 = st.columns(3)
+            with p_col4:
+                oasis_clear_sel = st.toggle(
+                    "Pulizia oasi con belve (auto-clear)",
+                    value=bool(getattr(mod_acc.farming, "oasis_auto_clear", True)),
+                    key="farm_oasis_clear",
+                    help="Se attivo, l'oasi presidiata viene razziata con il "
+                         "contingente calcolato; altrimenti viene saltata.",
+                )
+            with p_col5:
+                max_loss_sel = st.number_input(
+                    "Perdite max su pulizia oasi (%):",
+                    min_value=0.0, max_value=100.0, step=1.0,
+                    value=float(getattr(mod_acc.farming, "max_oasis_loss_pct", 0.0) or 0.0),
+                    key="farm_oasis_loss",
+                    help="0 = regola zero perdite (invio solo se la stima "
+                         "non perde nemmeno un'unita').",
+                )
+            with p_col6:
+                min_loot_sel = st.number_input(
+                    "Bottino minimo per raid:",
+                    min_value=0, max_value=100000, step=50,
+                    value=int(getattr(mod_acc.farming, "min_raid_loot", 150) or 150),
+                    key="farm_min_loot",
+                    help="Sotto questa soglia di risorse spiate il raid non parte.",
+                )
+
             st.markdown("#### Per-villaggio")
             for idx, vname in enumerate(mod_known):
                 vcfg = mod_acc.villages.get(vname, VillageConfig(name=vname))
@@ -2861,6 +2915,12 @@ if page == "Farming & Eroe":
             )
             mod_acc.farming.targets_per_wave = int(farm_wave_sel)
             mod_acc.farming.auto_scan = bool(farm_autoscan_sel)
+            mod_acc.farming.auto_scout_villages = bool(auto_scout_sel)
+            mod_acc.farming.scout_ttl_minutes = float(scout_ttl_sel)
+            mod_acc.farming.scouts_per_mission = int(scouts_qty_sel)
+            mod_acc.farming.oasis_auto_clear = bool(oasis_clear_sel)
+            mod_acc.farming.max_oasis_loss_pct = float(max_loss_sel)
+            mod_acc.farming.min_raid_loot = int(min_loot_sel)
 
             # Farming per-villaggio
             for idx, vname in enumerate(mod_known):
