@@ -495,10 +495,14 @@ class MapScanner:
             free_checked += 1
             if crop:
                 free_with_fields += 1
-            cache_batch.append(
-                {"x": tx, "y": ty, "occupied": False,
-                 "crop_fields": crop}
-            )
+            # Cache solo letture confermate: una scheda non renderizzata
+            # (ok assente) con 0 campi non deve avvelenare la cache per
+            # 48h. crop>0 e' di per se' conferma di lettura avvenuta.
+            if crop or info.get("ok"):
+                cache_batch.append(
+                    {"x": tx, "y": ty, "occupied": False,
+                     "crop_fields": crop}
+                )
             if crop not in CROPPER_FIELD_COUNTS:
                 logger.debug(
                     "%s CropperScanner: tile (%d|%d) ha %dc, non "

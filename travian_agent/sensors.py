@@ -378,6 +378,9 @@ class TravianParser:
         # Tab Residenza che l'ultima volta conteneva il riepilogo CP:
         # evita di riprovare tutte le tab a ogni ciclo.
         self._cp_tab: str | None = None
+        # Ordine dei path dettaglio tile appreso dal server: su Legends
+        # la scheda esce da /map?x=&y=, su T4.x da position_details.php.
+        self._tile_detail_order: tuple[str, ...] | None = None
         # Route edificio che l'ultima volta ha aperto la pagina CP:
         # 'slot?id=' (nuova UI) oppure 'build.php?id=' (UI classica).
         self._cp_base: str | None = None
@@ -2287,19 +2290,46 @@ class TravianParser:
     async def read_map_tile(self, x: int, y: int) -> dict:
         """Legge le info del tile mappa (x, y): occupato, tipo campi grano.
 
-        Naviga a position_details.php?x=X&y=Y (pagina dettagli tile in T4,
-        con distribuzione campi e link 'Fonda'); se il pannello dettagli non
-        viene trovato, fa un secondo tentativo su karte.php?x=X&y=Y.
+        Su Legends (es. ts30) la scheda tile esce dal pannello della pagina
+        mappa (``karte.php?x=X&y=Y`` / ``/map``); su T4.x da
+        ``position_details.php?x=X&y=Y``. I path vengono provati in
+        ordine — quello che funziona e' ricordato per il resto della
+        sessione — e prima di estrarre si attende che la scheda tile sia
+        davvero renderizzata: leggere il DOM appena dopo il goto produceva
+        falsi "occupato" (parole come "villaggio" nella sidebar).
 
-        Ritorna: {occupied, free, crop_fields, text, settle_link}
+        Ritorna: {occupied, free, crop_fields, text, settle_link, ok}
         """
         if not self.page:
             return {"occupied": True, "crop_fields": 0, "text": "", "settle_link": False}
+        paths = self._tile_detail_order or (
+            selectors.PATH_MAP, "position_details.php"
+        )
         data: dict | None = None
-        for path in ("position_details.php", selectors.PATH_MAP):
+        for path in paths:
             try:
                 await self._goto(
                     _abs_game_url(self.page.url or "", f"{path}?x={x}&y={y}"),
+                )
+            except Exception:
+                continue
+            # La scheda tile si monta via JS dopo il DOMContentLoaded:
+            # attende pannello dettagli, link 'Fonda' o marcatori tipici
+            # della scheda. Se non compaiono, il path non serve (su
+            # Legends position_details.php non esiste).
+            try:
+                await self.page.wait_for_function(
+                    """() => {
+                        const body = (document.body && document.body.innerText) || '';
+                        return !!document.querySelector(
+                            '#map_details, .map_details, #tileDetails, .tileDetails, ' +
+                            '#map_infobox, .infobox, #positionDetails, .position-details, ' +
+                            '.tile-details, #map_popup, #popupMap, .popupContent, ' +
+                            '.detailInfo, #tile_details, .mappanel'
+                        ) || !!document.querySelector('a[href*="settler"]')
+                        || /(?:campi?\\s*(?:di\\s+)?grano|crop\\s*fields?|getreidefelder|abitanti|inhabitants|popolazione|population|distribuzione\\s+del|land\\s+distribution|valle\\s+abbandonata|abandoned\\s+valley|non\\s+occupat|unoccupied)/i.test(body);
+                    }""",
+                    timeout=4000,
                 )
             except Exception:
                 continue
@@ -2307,25 +2337,63 @@ class TravianParser:
                 data = await self._eval_map_tile()
             except Exception:
                 data = None
-            # Se il pannello dettagli e' stato trovato il dato e' affidabile;
-            # altrimenti riprova sulla pagina mappa (position_details assente).
-            if data and data.get("panel"):
+            # Dato affidabile solo se la scheda e' stata isolata/letta.
+            if data and data.get("ok"):
+                # Il path che ha funzionato passa in testa per le letture
+                # successive (T4 -> position_details, Legends -> mappa).
+                self._tile_detail_order = (
+                    (path,) + tuple(p for p in paths if p != path)
+                )
                 break
-        if not data:
+        if not data or not data.get("ok"):
             return {"occupied": True, "crop_fields": 0, "text": "", "settle_link": False}
         data.pop("panel", None)
         return data
 
     async def _eval_map_tile(self) -> dict | None:
-        """Estrae occupazione/campi grano dalla pagina dettagli tile corrente."""
+        """Estrae occupazione/campi grano dalla scheda tile corrente.
+
+        Il testo viene letto dal pannello dettagli o, se non esiste un
+        contenitore noto (Legends), dal piu' piccolo elemento con i
+        marcatori della scheda risalendo ai genitori finche' resta di
+        dimensione "scheda": mai il body intero, dove le parole della
+        sidebar farebbero scattare falsi "occupato".
+        """
         return await self.page.evaluate("""
                 () => {
-                    const body = (document.body && document.body.innerText) || '';
+                    const MARK = /(?:campi?\\s*(?:di\\s+)?grano|crop\\s*fields?|getreidefelder|abitanti|inhabitants|popolazione|population|distribuzione\\s+del|land\\s+distribution|valle\\s+abbandonata|abandoned\\s+valley)/i;
                     const panel = document.querySelector(
-                        '#map_details, .map_details, #tileDetails, .tileDetails, #map_infobox, .infobox, ' +
-                        '#positionDetails, .position-details, .tile-details, #map_popup, #popupMap, .popupContent'
+                        '#map_details, .map_details, #tileDetails, .tileDetails, ' +
+                        '#map_infobox, .infobox, #positionDetails, .position-details, ' +
+                        '.tile-details, #map_popup, #popupMap, .popupContent, ' +
+                        '.detailInfo, #tile_details, .mappanel'
                     );
-                    const text = (panel && panel.innerText) || body;
+                    let text = (panel && panel.innerText) || '';
+                    if (!text) {
+                        // Piu' piccolo contenitore con marcatori scheda,
+                        // poi si risale ai genitori finche' il testo resta
+                        // sotto i 3000 caratteri (scheda intera, non la
+                        // pagina con sidebar e navbar).
+                        let best = null;
+                        const cand = document.querySelectorAll(
+                            'div, section, article, aside, table, td, li, p'
+                        );
+                        for (const el of cand) {
+                            const t = el.innerText || '';
+                            if (t && t.length <= 3000 && MARK.test(t)
+                                && (!best || t.length < (best.innerText || '').length)) {
+                                best = el;
+                            }
+                        }
+                        let node = best;
+                        while (node && node.parentElement
+                               && node.parentElement !== document.body
+                               && (node.parentElement.innerText || '').length <= 3000) {
+                            node = node.parentElement;
+                        }
+                        text = (node && node.innerText) || '';
+                    }
+                    const ok = !!text && (!!panel || MARK.test(text));
 
                     // Distribuzione campi "3-3-3-9" (9c) o "1-1-1-15" (15c).
                     // Su Legends i separatori possono essere celle/whitespace,
@@ -2335,7 +2403,8 @@ class TravianParser:
                     if (dist) {
                         cropFields = parseInt(dist[4], 10) || 0;
                     } else {
-                        const cm = text.match(/(\\d+)\\s*(?:campi? grano|crop(fields?)?|getreidefelder|campos? de cereal|champs? de c[eé]r[eé]ales?)/i);
+                        // ts30: "6\\tCampi di grano" — 'di' opzionale.
+                        const cm = text.match(/(\\d+)\\s*(?:campi?\\s*(?:di\\s+)?grano|crop\\s*fields?|getreidefelder|campos?\\s+de\\s+cereal|champs?\\s+de\\s+c[eé]r[eé]ales?)/i);
                         if (cm) cropFields = parseInt(cm[1], 10) || 0;
                         const c9 = text.match(/\\b(9|15)[ -]?[cç]\\b/i) || text.match(/\\b(9|15)[ ]?(?:cropper|croplog|grano)\\b/i);
                         if (!cropFields && c9) cropFields = parseInt(c9[1], 10) || 0;
@@ -2344,16 +2413,18 @@ class TravianParser:
                     const settle = !!document.querySelector(
                         'a[href*="a=settler"], a[href*="settler"]'
                     );
-                    const occupied = /(?:abitato|occupied|village|villaggio|player|giocatore|inhabitant|oasis|oasi)/i.test(text)
-                        && !settle;
-                    const freeTile = /(?:valley|valle|unoccupied|libero|libera|free|terra libera|abandoned|disabitata|non occupat|uninhabited)/i.test(text);
+                    // "villaggio"/"village" esclusi dai marcatori occupato:
+                    // compaiono nella sidebar di ogni pagina.
+                    const occupiedMark = /(?:abitanti|inhabitants|popolazione|population|giocatore|player|proprietario|owner|alleanza|alliance|trib[uù]|tribe|oasi\\s+occupat|occupied\\s+oasis|natura|natar)/i.test(text);
+                    const freeTile = /(?:valley|valle|unoccupied|libero|libera|free|terra libera|abandoned|disabitata|non occupat|uninhabited|distribuzione del territorio|land distribution|campi?\\s*(?:di\\s+)?grano|crop\\s*fields?|getreidefelder)/i.test(text);
 
                     return {
-                        occupied: occupied && !freeTile,
+                        occupied: occupiedMark && !freeTile && !settle,
                         free: freeTile || settle,
                         crop_fields: cropFields,
                         settle_link: settle,
                         panel: !!panel,
+                        ok: ok,
                         text: text.slice(0, 300),
                     };
                 }

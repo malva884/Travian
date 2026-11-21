@@ -239,6 +239,16 @@ def _handle_worker_action(action: str, body: dict) -> dict:
     if action == "LOGIN":
         # Login assistito: apre main.py --login in console separata per
         # catturare cookie/sessione dell'account (spec pagina Controllo).
+        if not _headed_available():
+            return {
+                "status": "rejected",
+                "reason": (
+                    "display non disponibile (container headless): il "
+                    "login manuale richiede una finestra browser. Usa "
+                    "username/password in accounts.json per il login "
+                    "automatico."
+                ),
+            }
         opened = []
         for acc in targets:
             try:
@@ -2199,6 +2209,7 @@ class _CommandCenterHandler(BaseHTTPRequestHandler):
             return
         if route == "/api/accounts":
             self._send_json({
+                "headed_available": _headed_available(),
                 "accounts": [
                     {
                         "account_id": a.account_id,
