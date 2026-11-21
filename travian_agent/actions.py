@@ -575,7 +575,10 @@ class ActionExecutor:
                     # che occupa lo slot (slot non vuoto) oppure il gid
                     # non e' in elenco (prerequisiti/categoria errata).
                     page_gid = await self._detect_page_gid(page)
-                    if page_gid is not None and page_gid != gid:
+                    # gid=0 = slot vuoto (Travian Legends moderni espongono
+                    # classe g0/gid0 anziche' -1): conta come libero, il blocco
+                    # INVALID_SLOT_OCCUPIED vale solo per gid > 0 diverso dal target.
+                    if page_gid is not None and page_gid > 0 and page_gid != gid:
                         logger.warning(
                             "Slot %s occupato da gid=%s (atteso vuoto per gid=%s): INVALID_SLOT_OCCUPIED",
                             slot_id,
