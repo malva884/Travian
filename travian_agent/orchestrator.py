@@ -3521,6 +3521,252 @@ async def monitor_all_villages(
                                 },
                             )
 
+            # 4.4 Feeder Role Push: un villaggio con role == "feeder" e
+            # target_village valorizzato alimenta costantemente il
+            # villaggio bersaglio appena supera la soglia di riserva
+            # (keep_ratio), cappando il carico allo spazio libero reale
+            # del destinatario (peer_villages) per evitare overflow.
+            vcfg_push = settings.village_config_for(village.name, target_vid)
+            push_target = (
+                str(vcfg_push.target_village or "").strip()
+                if (
+                    vcfg_push is not None
+                    and str(vcfg_push.role or "").strip().lower() == "feeder"
+                )
+                else ""
+            )
+            push_target_l = push_target.lower()
+            if (
+                push_target
+                and push_target_l != str(village.name or "").strip().lower()
+                and push_target != str(village.village_id or "")
+            ):
+                _pl = _module_pause_left(
+                    settings,
+                    str(village.village_id or village.name or "0"),
+                    "expansion",
+                    "FEEDER_PUSH",
+                    resources=state.resources,
+                )
+                if _pl > 0:
+                    _record_module_paused(
+                        settings,
+                        state=state,
+                        village=village,
+                        module="expansion",
+                        decision="FEEDER_PUSH",
+                        remaining=_pl,
+                    )
+                else:
+                    push_market = find_market(state.interior_fields())
+                    push_mslot = (
+                        int(vcfg_push.market_slot or 0)
+                        if vcfg_push.market_slot
+                        else (
+                            push_market.slot_id
+                            if push_market is not None
+                            else 0
+                        )
+                    )
+                    p_surplus = feeder_surplus(
+                        state, keep_ratio=0.55, crop_keep_ratio=0.25
+                    )
+                    # Destinatario per nome o newdid: le coordinate del
+                    # payload si leggono SOLO dal suo record, mai dal
+                    # villaggio mittente.
+                    t_village = next(
+                        (
+                            v for v in villages
+                            if v.name == push_target
+                            or str(v.village_id) == push_target
+                        ),
+                        None,
+                    )
+                    t_name = (
+                        str(t_village.name)
+                        if t_village is not None and t_village.name
+                        else push_target
+                    )
+                    t_res = (
+                        state.peer_villages.get(t_name)
+                        or state.peer_villages.get(push_target)
+                        or next(
+                            (
+                                res
+                                for n, res in state.peer_villages.items()
+                                if n.strip().lower() == push_target_l
+                            ),
+                            None,
+                        )
+                    )
+                    p_skip_logged = False
+                    if p_surplus:
+                        # Capping allo spazio libero del destinatario con
+                        # margine di sicurezza: mai oltre l'85% della sua
+                        # capienza massima, per non bloccare i premi task.
+                        if t_res is not None:
+                            free_wh = max(
+                                0,
+                                int((t_res.warehouse_capacity or 0) * 0.85)
+                                - max(
+                                    t_res.wood, t_res.clay, t_res.iron
+                                ),
+                            )
+                            free_gr = max(
+                                0,
+                                int((t_res.granary_capacity or 0) * 0.85)
+                                - t_res.crop,
+                            )
+                        else:
+                            # Capacita' ignota (target mai visitato):
+                            # default conservativo dei magazzini base.
+                            free_wh = free_gr = 800
+                        if free_wh + free_gr < 300:
+                            # Destinatario quasi pieno: salto l'invio per
+                            # evitare viaggi a vuoto o sprechi. SKIPPED
+                            # mette in pausa FEEDER_PUSH (cooldown).
+                            p_surplus = {}
+                            p_skip_logged = True
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="expansion",
+                                decision="FEEDER_PUSH",
+                                outcome=DECISION_OUTCOME_SKIPPED,
+                                reason=(
+                                    f"Invio surplus a '{t_name}' saltato: "
+                                    "destinatario quasi pieno (meno di "
+                                    "300 risorse di spazio libero)."
+                                ),
+                                context={"target": t_name},
+                            )
+                        else:
+                            solid = (
+                                p_surplus.get("wood", 0)
+                                + p_surplus.get("clay", 0)
+                                + p_surplus.get("iron", 0)
+                            )
+                            if solid > free_wh and solid > 0:
+                                scale = (
+                                    free_wh / solid if free_wh > 0 else 0.0
+                                )
+                                for k in ("wood", "clay", "iron"):
+                                    p_surplus[k] = int(
+                                        p_surplus.get(k, 0) * scale
+                                    )
+                            if "crop" in p_surplus:
+                                p_surplus["crop"] = min(
+                                    p_surplus["crop"], free_gr
+                                )
+                            p_surplus = {
+                                k: v
+                                for k, v in p_surplus.items()
+                                if v > 0
+                            }
+                    if p_surplus and push_mslot:
+                        p_params: dict = {
+                            "market_slot": push_mslot,
+                            "target_village": t_name,
+                            "target": t_name,
+                            "resources": p_surplus,
+                        }
+                        if (
+                            t_village is not None
+                            and t_village.x is not None
+                            and t_village.y is not None
+                        ):
+                            p_params["target_x"] = t_village.x
+                            p_params["target_y"] = t_village.y
+                        else:
+                            p_coords = village_coords_map.get(
+                                t_name.strip().lower()
+                            ) or village_coords_map.get(push_target_l)
+                            if p_coords:
+                                (
+                                    p_params["target_x"],
+                                    p_params["target_y"],
+                                ) = p_coords
+                            else:
+                                t_cfg = settings.village_config_for(
+                                    push_target
+                                )
+                                if (
+                                    t_cfg is not None
+                                    and t_cfg.x is not None
+                                    and t_cfg.y is not None
+                                ):
+                                    p_params["target_x"] = t_cfg.x
+                                    p_params["target_y"] = t_cfg.y
+                        if "target_x" not in p_params:
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="expansion",
+                                decision="FEEDER_PUSH",
+                                outcome=DECISION_OUTCOME_SKIPPED,
+                                reason=(
+                                    f"Invio surplus a '{t_name}' saltato: "
+                                    "coordinate del destinatario non note."
+                                ),
+                                context={"target": t_name},
+                            )
+                        else:
+                            push_action = Action(
+                                type=ActionType.SEND_RESOURCES,
+                                params=p_params,
+                                reason=(
+                                    f"Feeder '{village.name}' -> "
+                                    f"'{t_name}': invio surplus "
+                                    f"{p_surplus}"
+                                ),
+                            )
+                            push_res = await executor.execute(
+                                push_action, village_id=target_vid
+                            )
+                            logger.info(
+                                "%s Feeder push: %s -> '%s' (%s)",
+                                vprefix, p_surplus, t_name,
+                                push_res.message,
+                            )
+                            # BLOCKED (es. nessun mercante disponibile)
+                            # mette in pausa FEEDER_PUSH via decision log.
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="expansion",
+                                decision="FEEDER_PUSH",
+                                outcome=(
+                                    DECISION_OUTCOME_EXECUTED
+                                    if push_res.success
+                                    else DECISION_OUTCOME_BLOCKED
+                                ),
+                                reason=(
+                                    f"Feeder '{village.name}' -> "
+                                    f"'{t_name}': invio surplus "
+                                    f"{p_surplus}: {push_res.message}"
+                                ),
+                                context={
+                                    "resources": dict(p_surplus),
+                                    "target": t_name,
+                                },
+                            )
+                    elif not p_skip_logged:
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="expansion",
+                            decision="FEEDER_PUSH",
+                            outcome=DECISION_OUTCOME_SKIPPED,
+                            reason=(
+                                f"Invio surplus a '{t_name}' non "
+                                "partito: mercato assente"
+                                if not push_mslot
+                                else f"Invio surplus a '{t_name}' non "
+                                     "partito: nessun surplus spedibile"
+                            ),
+                            context={"target": t_name},
+                        )
+
             # 5. Pausa umana tra un villaggio e l'altro
             if v_idx < len(villages) - 1:
                 await asyncio.sleep(random.uniform(2.5, 5.0))
