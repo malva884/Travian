@@ -23,6 +23,29 @@ logger = logging.getLogger(__name__)
 
 _NEWDID = re.compile(r"newdid=(\d+)")
 
+
+def _is_building_url(url: str | None) -> bool:
+    """True se l'URL punta a una pagina edificio su qualunque routing Travian.
+
+    Copre il legacy ``build.php?id=N`` e i routing moderni di Travian
+    Legends (``/building?id=N`` query-string, ``/build/N`` path-style,
+    ``/slot?id=N`` nuova UI): usata dai guard 'siamo ancora
+    nell'edificio?' per non abortire falsamente sui server moderni.
+    """
+    u = (url or "").lower()
+    return any(
+        tok in u for tok in ("build.php", "/building", "/build/", "/slot")
+    )
+
+
+def _slot_url_check(slot_id: int) -> re.Pattern:
+    """Regex 'pagina dello slot N aperta' su tutti i routing Travian."""
+    return re.compile(
+        rf"(?:(?:/slot|/building|build\.php)\?[^#]*\bid={int(slot_id)}\b"
+        rf"|/build/{int(slot_id)}\b)"
+    )
+
+
 # Snippet JS condiviso: individua gli input quantita' del form di invio
 # mercato. Le UI con slider (T4.5+) possono usare nomi diversi da r1-r4:
 # si prendono i campi testo/numerici dentro il form che contiene il campo
@@ -503,9 +526,7 @@ class ActionExecutor:
                     build_url += f"&newdid={village_id}"
                 await self.browser.goto(build_url)
 
-                slot_check = re.compile(
-                    rf"(?:/slot|build\.php)\?[^#]*\bid={int(slot_id)}\b"
-                )
+                slot_check = _slot_url_check(slot_id)
                 if not slot_check.search(page.url or ""):
                     logger.debug(
                         "Slot %s: vista costruzione non aperta (url=%s)",
@@ -655,9 +676,7 @@ class ActionExecutor:
                 # FLUSSO B: Ampliamento (current_level >= 1)
                 # =============================================================
                 build_url = f"slot?id={int(slot_id)}"
-                slot_check = re.compile(
-                    rf"(?:/slot|build\.php)\?[^#]*\bid={int(slot_id)}\b"
-                )
+                slot_check = _slot_url_check(slot_id)
                 if village_id > 0:
                     build_url += f"&newdid={village_id}"
                 await self.browser.goto(build_url)
@@ -1680,7 +1699,7 @@ class ActionExecutor:
                 f"impossibile compilare ne' il nome villaggio ne' le coordinate per il target '{target}' ({tx}|{ty})",
             )
 
-        if "build.php" not in (page.url or ""):
+        if not _is_building_url(page.url):
             return ActionResult(False, "selezione destinazione uscita dal mercato - invio annullato")
 
         # Guard antironima: se il fill del target ha alterato un campo di

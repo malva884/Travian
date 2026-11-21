@@ -2,7 +2,41 @@
 
 from __future__ import annotations
 
-from travian_agent.actions import ActionExecutor
+import pytest
+
+from travian_agent.actions import ActionExecutor, _is_building_url
+
+
+class TestIsBuildingUrl:
+    """Compatibilita' routing edificio: legacy build.php + moderni /building, /build/."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://ts1.x1.travian.com/build.php?id=20&t=5",
+            "https://ts30.x3.europe.travian.com/building?id=17&t=5",
+            "https://ts30.x3.europe.travian.com/build/20",
+            "https://ts30.x3.europe.travian.com/slot?id=24",
+            "BUILD.PHP?ID=17&T=5",
+        ],
+    )
+    def test_building_urls_accepted(self, url):
+        assert _is_building_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://ts30.x3.europe.travian.com/village",
+            "https://ts30.x3.europe.travian.com/resources",
+            "https://ts30.x3.europe.travian.com/map?x=-10&y=20",
+            "https://ts1.x1.travian.com/dorf1.php",
+            "https://ts1.x1.travian.com/karte.php",
+            "",
+            None,
+        ],
+    )
+    def test_non_building_urls_rejected(self, url):
+        assert _is_building_url(url) is False
 
 
 def _data(wood=0, clay=0, iron=0, crop=0, units=None) -> dict:

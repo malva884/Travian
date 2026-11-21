@@ -62,7 +62,15 @@ async def sleep_human(min_seconds: float = 0.8, max_seconds: float = 2.5) -> Non
 # --- Navigazione 'umana' via click DOM -----------------------------------
 
 _RE_NEWDID = re.compile(r"newdid=(\d+)")
-_RE_BUILD_ID = re.compile(r"build\.php\?[^#\s]*?\bid=(\d+)")
+# Slot edificio su tutti i routing: legacy build.php?id=N, moderni
+# /building?id=N e /slot?id=N (query) oppure /build/N (path-style).
+_RE_BUILD_ID = re.compile(
+    r"(?:build\.php|building|slot)\?[^#\s]*?\bid=(\d+)"
+    r"|(?:^|/)build/(\d+)"
+)
+
+# Token path che identificano una pagina edificio (legacy + moderna).
+_BUILDING_URL_TOKENS = ("build.php", "/building", "/build/", "/slot")
 
 
 async def human_click(page: Page, locator, timeout: float = 5000) -> bool:
@@ -185,12 +193,16 @@ async def navigate_via_dom(page: Page, path: str) -> bool:
             ],
         )
 
-    # 2. build.php?id=N: click sullo slot della mappa villaggio
+    # 2. build.php?id=N (o /building?id=N, /slot?id=N, /build/N):
+    # click sullo slot della mappa villaggio
     b = _RE_BUILD_ID.search(path)
     if b:
-        slot = int(b.group(1))
+        slot = int(b.group(1) or b.group(2))
         cur_url = page.url or ""
-        if "build.php" in cur_url and f"id={slot}" in cur_url:
+        if (
+            any(t in cur_url for t in _BUILDING_URL_TOKENS)
+            and f"id={slot}" in cur_url
+        ):
             pass  # gia' sullo slot: gestisce solo i sub-param sotto
         else:
             dorf = selectors.PATH_DORF1 if slot <= 18 else selectors.PATH_DORF2
@@ -206,6 +218,12 @@ async def navigate_via_dom(page: Page, path: str) -> bool:
                 f'area[href$="build.php?id={slot}"]',
                 f'a[href*="id={slot}&"][href*="build.php"]',
                 f'a[href$="id={slot}"][href*="build.php"]',
+                f'a[href*="building?id={slot}&"]',
+                f'a[href$="building?id={slot}"]',
+                f'a[href*="slot?id={slot}&"]',
+                f'a[href$="slot?id={slot}"]',
+                f'a[href*="/build/{slot}&"]',
+                f'a[href$="/build/{slot}"]',
                 f'.buildingSlot.a{slot} a',
                 f'.buildingSlot.a{slot}',
                 f'[data-aid="{slot}"] a',

@@ -1825,10 +1825,13 @@ class TravianParser:
         # per le tab successive (cache _cp_base).
         bases = (
             [self._cp_base] if self._cp_base else []
-        ) + [b for b in ("slot?id=", f"{selectors.PATH_BUILD}?id=")
-             if b != self._cp_base]
+        ) + [b for b in (
+                "slot?id=", "building?id=", f"{selectors.PATH_BUILD}?id="
+            ) if b != self._cp_base]
         slot_check = re.compile(
-            rf"(?:/slot|build\.php)\?[^#]*\bid={int(residence_slot)}\b"
+            rf"(?:(?:/slot|/building|build\.php)\?[^#]*"
+            rf"\bid={int(residence_slot)}\b"
+            rf"|/build/{int(residence_slot)}\b)"
         )
 
         accepted = None   # (suffix, data) con campi specifici matchati
@@ -1837,9 +1840,11 @@ class TravianParser:
         tried = set()     # suffix gia' navigati
 
         for base in bases:
-            # Le tab &tt=N esistono solo su build.php: la nuova UI
-            # /slot espone il link alla pagina CP nella navbar.
-            tab_list = suffixes if base.startswith("build") else [""]
+            # Le tab &tt=N esistono solo su build.php: le UI nuove
+            # (/slot, /building) espongono il link CP nella navbar.
+            tab_list = (
+                suffixes if base.startswith(selectors.PATH_BUILD) else [""]
+            )
             for suffix in tab_list:
                 url = f"{base}{residence_slot}{suffix}"
                 if village_id:
