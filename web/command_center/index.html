@@ -827,7 +827,9 @@
           <!-- SCALETTA COSTRUZIONI: lavori attivi + proiezione code (spec Timeline & Previsione Code) -->
           <div class="space-y-2">
             <div class="flex items-center justify-between font-mono text-[11px]">
-              <span class="text-slate-300 font-bold">Scaletta Costruzioni <span class="text-slate-500">(Attive &amp; Prossime)</span></span>
+              <span class="text-slate-300 font-bold">Scaletta Costruzioni <span class="text-slate-500">(Attive &amp; Prossime)</span>
+                <span id="build-timeline-village" class="ml-2 px-2 py-0.5 rounded text-[10px] font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/35 align-middle"></span>
+              </span>
               <span id="build-timeline-meta" class="text-[10px] text-slate-500"></span>
             </div>
             <div class="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/60">
@@ -2292,11 +2294,55 @@
       }
     }
 
+    // Ricalcola dorf2Slots/dorf1Fields dai dati del villaggio attivo
+    // (appState.activeVillage). Fonte: village.slots del payload live
+    // (dorf1+dorf2 uniti) con alias dorf2_slots/interior_fields per
+    // tollerare payload alternativi. Se il villaggio non ha ancora un
+    // dato dorf2 (mai scansionato) si popola la griglia 19-40 con
+    // gid=-1 (sentinella "non scansionato"), MAI coi dati di un altro
+    // villaggio o del primo della lista.
+    function _hydrateActiveVillageSlots() {
+      const v = activeVillage();
+      const norm = s => ({
+        slot: Number(s.slot), gid: Number(s.gid), level: Number(s.level || 0)
+      });
+      const all = Array.isArray(v && v.slots) ? v.slots : [];
+      const d2Alias = (v && (v.dorf2_slots || v.interior_fields)) || null;
+      if (all.length) {
+        appState.dorf2Slots = all
+          .filter(s => Number(s.slot) >= 19).map(norm);
+        appState.dorf1Fields = all
+          .filter(s => Number(s.slot) < 19).map(norm);
+      } else if (Array.isArray(d2Alias) && d2Alias.length) {
+        appState.dorf2Slots = d2Alias.map(norm)
+          .filter(s => s.slot >= 19 && s.slot <= 40);
+        appState.dorf1Fields = [];
+      } else {
+        appState.dorf2Slots = [];
+        appState.dorf1Fields = [];
+      }
+      if (!appState.dorf2Slots.length) {
+        // Villaggio mai scansionato su dorf2: fallback "non scansionato"
+        // (gid -1) su tutti gli slot — la mappa resta della dimensione
+        // giusta ma segnala che non sono dati reali del villaggio.
+        appState.dorf2Slots = Array.from({ length: 22 }, (_, i) => ({
+          slot: 19 + i, gid: -1, level: 0
+        }));
+      }
+    }
+
     function selectVillageTab(villageName) {
       appState.activeVillage = villageName;
+      // Re-idrata subito i dati del villaggio selezionato: Mappa Dorf2,
+      // badge "N Liberi", livelli coda e Scaletta Costruzioni devono
+      // riflettere villages[vid] e non lo snapshot del villaggio attivo
+      // al momento dell'ultimo poll.
+      _hydrateActiveVillageSlots();
       renderVillageTabs();
       renderVillageCard();
       applyVillageConfigToForm();
+      renderConstructionTimeline();
+      renderDebugDiagnostics();
     }
 
     // =========================================================================
@@ -2543,7 +2589,9 @@
       container.innerHTML = '';
 
       const emptySlots = appState.dorf2Slots.filter(s => s.gid === 0);
-      document.getElementById('dorf2-free-count').textContent = `${emptySlots.length} Liberi`;
+      const unscanned = appState.dorf2Slots.every(s => Number(s.gid) < 0);
+      document.getElementById('dorf2-free-count').textContent =
+        unscanned ? 'Dorf2 n/d' : `${emptySlots.length} Liberi`;
 
       slotDropdown.innerHTML = `<option value="0">Slot 0 · Auto (Primo vuoto)</option>`;
       emptySlots.forEach(s => {
@@ -2559,7 +2607,18 @@
         const isSelected = appState.manualFocus.enabled && Number(appState.manualFocus.slot) === item.slot;
         const card = document.createElement('button');
         card.type = 'button';
-        if (isFree) {
+        if (Number(item.gid) < 0) {
+          // Slot non scansionato: nessun dato reale per questo
+          // villaggio — non cliccabile, non conteggiato come libero.
+          card.disabled = true;
+          card.className = 'p-2 rounded-xl bg-slate-950/50 border border-slate-800/60 text-left flex flex-col justify-between min-h-[54px] opacity-50';
+          card.innerHTML = `
+            <div class="flex justify-between w-full text-[10px]">
+              <span class="text-slate-500">#${item.slot}</span>
+              <span class="text-slate-500">n/d</span>
+            </div>
+            <div class="text-[10px] text-slate-600 truncate mt-1">non scansionato</div>`;
+        } else if (isFree) {
           card.onclick = () => {
             if (item.slot >= 19 && item.slot <= 38) {
               openSlotModal(item.slot);
@@ -2683,6 +2742,8 @@
               slotOpts.push(`<option value="${s}" ${isSelected ? 'selected' : ''}>#${s} (Libero)</option>`);
             } else if (isMatch) {
               slotOpts.push(`<option value="${s}" ${isSelected ? 'selected' : ''}>#${s} (${GID_LABELS[occ.gid] || 'G' + occ.gid} lv.${occ.level})</option>`);
+            } else if (occ && occ.gid < 0) {
+              slotOpts.push(`<option value="${s}" disabled>#${s} (n/d: dorf2 non scansionato)</option>`);
             } else {
               slotOpts.push(`<option value="${s}" disabled>#${s} (${GID_LABELS[occ.gid] || 'G' + occ.gid} lv.${occ.level}) [Occupato]</option>`);
             }
@@ -3351,13 +3412,14 @@
       if (tbody) {
         tbody.innerHTML = appState.dorf2Slots.map(s => {
           const isEmpty = s.gid === 0;
+          const isNA = Number(s.gid) < 0;
           return `
             <tr>
               <td class="py-1.5 font-bold">#${s.slot}</td>
               <td class="py-1.5 text-cyan-400">${s.gid}</td>
-              <td class="py-1.5">${isEmpty ? '— (Vuoto)' : (GID_LABELS[s.gid] || 'Sconosciuto')}</td>
+              <td class="py-1.5">${isNA ? '— (non scansionato)' : (isEmpty ? '— (Vuoto)' : (GID_LABELS[s.gid] || 'Sconosciuto'))}</td>
               <td class="py-1.5">${s.level}</td>
-              <td class="py-1.5 text-right font-bold ${isEmpty ? 'text-emerald-400' : 'text-amber-400'}">${isEmpty ? 'TRUE (Safe lv.0)' : 'FALSE (Occupato)'}</td>
+              <td class="py-1.5 text-right font-bold ${isNA ? 'text-slate-500' : (isEmpty ? 'text-emerald-400' : 'text-amber-400')}">${isNA ? 'n/d' : (isEmpty ? 'TRUE (Safe lv.0)' : 'FALSE (Occupato)')}</td>
             </tr>`;
         }).join('');
       }
@@ -4579,16 +4641,7 @@
       }
       // Slot map live (dorf1 campi + dorf2 edifici) dal payload telemetrico:
       // alimenta la Mappa Slot Dorf2 e i livelli correnti della coda.
-      const _act = activeVillage();
-      if (_act && Array.isArray(_act.slots) && _act.slots.length) {
-        const norm = s => ({
-          slot: Number(s.slot), gid: Number(s.gid), level: Number(s.level || 0)
-        });
-        appState.dorf2Slots = _act.slots
-          .filter(s => Number(s.slot) >= 19).map(norm);
-        appState.dorf1Fields = _act.slots
-          .filter(s => Number(s.slot) < 19).map(norm);
-      }
+      _hydrateActiveVillageSlots();
       setConnBadge(EMBEDDED ? 'embedded' : 'live');
       renderVillageTabs();
       renderVillageCard();
@@ -4621,11 +4674,49 @@
       const v = activeVillage();
       const tl = (v && v.projected_timeline) || null;
       const meta = document.getElementById('build-timeline-meta');
-      const items = (tl && Array.isArray(tl.timeline)) ? tl.timeline : [];
+      // Badge villaggio: la tabella e' filtrata sul villaggio attivo,
+      // quindi l'header deve sempre indicare a chi appartengono le righe
+      // (nome + coordinate + ruolo), come le tab in alto.
+      const vBadge = document.getElementById('build-timeline-village');
+      if (vBadge) {
+        if (v) {
+          vBadge.style.display = '';
+          vBadge.textContent = `${v.name} (${v.x ?? '—'}|${v.y ?? '—'}) [${v.role || 'standard'}]`;
+        } else {
+          vBadge.style.display = 'none';
+        }
+      }
+      let items = (tl && Array.isArray(tl.timeline)) ? tl.timeline : [];
+      if (!items.length && v && Array.isArray(v.building_queue) && v.building_queue.length) {
+        // Fallback: il planner non ha prodotto una proiezione (villaggio
+        // mai scansionato su dorf2 o timeline assente) ma la coda reale
+        // del server c'e' — mostra almeno i lavori in corso del
+        // villaggio selezionato invece di una tabella vuota.
+        const nowTs = Date.now() / 1000;
+        items = v.building_queue.map(q => ({
+          status: 'in_progress',
+          queue: q.is_resource_field ? 'dorf1' : 'dorf2',
+          slot: q.slot_id || 0,
+          name: q.name || '',
+          from_level: Math.max(0, (q.target_level || 0) - 1),
+          to_level: q.target_level || 0,
+          start_ts: null,
+          end_ts: nowTs + Math.max(0, q.seconds_remaining || 0),
+          duration_s: null,
+          source: 'queue',
+        }));
+      }
       if (meta) {
         const bits = [];
         if (tl && tl.server_speed) bits.push(`x${tl.server_speed}`);
-        if (tl && tl.main_building_level) bits.push(`Centro del Villaggio lv.${tl.main_building_level}`);
+        let mbLevel = tl && tl.main_building_level;
+        if (!mbLevel && v && Array.isArray(v.slots)) {
+          // Livello Centro del Villaggio (gid 15) del villaggio
+          // selezionato quando la proiezione non lo riporta.
+          const mb = v.slots.find(s => Number(s.gid) === 15);
+          if (mb) mbLevel = mb.level;
+        }
+        if (mbLevel) bits.push(`CD: Centro del Villaggio lv.${mbLevel}`);
         bits.push(tl && tl.parallel_build ? 'doppia coda' : 'coda singola');
         meta.textContent = bits.join(' · ');
       }
