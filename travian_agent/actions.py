@@ -17,7 +17,9 @@ from .models import (
     ActionType,
     STATIC_TROOP_LABELS,
 )
+from .server_profile import ServerProfile, profile_for_url
 from .stealth import resource_eta_seconds
+from .telemetry_capture import capture_anomaly
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +286,74 @@ class ActionExecutor:
     def __init__(self, browser: TravianBrowser, settings: Settings) -> None:
         self.browser = browser
         self.settings = settings
+        # Profilo per-server auto-calibrato (state/server_profile_<host>.json):
+        # gid degli slot vuoti, routing_mode, selettori promossi. Caricato
+        # lazy alla prima azione: niente accesso FS a costruzione (test).
+        self._profile: ServerProfile | None = None
+
+    @property
+    def profile(self) -> ServerProfile:
+        """Adaptive Server Profile dell'host corrente (lazy)."""
+        if self._profile is None:
+            try:
+                self._profile = profile_for_url(self.settings.server_url)
+            except Exception:  # noqa: BLE001
+                self._profile = ServerProfile(host="unknown")
+        return self._profile
+
+    async def _capture(
+        self,
+        page,
+        error_code: str,
+        *,
+        village_id: int | str = 0,
+        slot_id: int | None = None,
+        expected_gid: int | None = None,
+        detected_gid: int | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        """Cattura best-effort dell'HTML anomalo in tests/fixtures/captured/.
+
+        Mai bloccante: deduplicata 6h per <code>:<slot|gid> e
+        sanitizzata da telemetry_capture.
+        """
+        try:
+            await capture_anomaly(
+                page,
+                error_code,
+                village_id=village_id,
+                slot_id=slot_id,
+                expected_gid=expected_gid,
+                detected_gid=detected_gid,
+                profile=self.profile,
+                extra=extra,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _has_new_building_ui(self, page) -> bool:
+        """True se la pagina mostra l'UI 'nuova costruzione' (slot vuoto).
+
+        Marker: tab di categoria (category=1/2/3), blocchi contratto
+        #contract_building*, wrapper .contractNew/.newBuilding — la
+        pagina di uno slot OCCUPATO espone invece il dettaglio
+        dell'edificio esistente.
+        """
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    () => !!document.querySelector(
+                        'a[href*="category="], .tabItem[href*="category="], ' +
+                        '[id^="contract_building"], .buildingWrapper, ' +
+                        '.contractNew, .newBuilding, button.newBuilding, ' +
+                        '.contract .contractLink'
+                    )
+                    """
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     async def execute(self, action: Action, village_id: int | str = 0) -> ActionResult:
         logger.info("Azione %s -> %s", action.type.value, action.reason or "-")
@@ -521,12 +591,29 @@ class ActionExecutor:
                 # FLUSSO A: Costruzione iniziale (current_level == 0)
                 # =============================================================
                 cat_id = builder.building_category(gid)
-                build_url = f"{selectors.PATH_BUILD}?id={int(slot_id)}&category={cat_id}"
+                # Routing adattivo: il profilo del server decide se
+                # aprire prima il path moderno (/slot?id=N) o il
+                # legacy build.php?id=N; il secondo resta di fallback.
+                if self.profile.routing_mode == "legacy":
+                    build_url = (
+                        f"{selectors.PATH_BUILD}?id={int(slot_id)}"
+                        f"&category={cat_id}"
+                    )
+                    alt_url = f"slot?id={int(slot_id)}&category={cat_id}"
+                else:
+                    build_url = f"slot?id={int(slot_id)}&category={cat_id}"
+                    alt_url = (
+                        f"{selectors.PATH_BUILD}?id={int(slot_id)}"
+                        f"&category={cat_id}"
+                    )
                 if village_id > 0:
                     build_url += f"&newdid={village_id}"
+                    alt_url += f"&newdid={village_id}"
                 await self.browser.goto(build_url)
 
                 slot_check = _slot_url_check(slot_id)
+                if not slot_check.search(page.url or ""):
+                    await self.browser.goto(alt_url)
                 if not slot_check.search(page.url or ""):
                     logger.debug(
                         "Slot %s: vista costruzione non aperta (url=%s)",
@@ -575,15 +662,42 @@ class ActionExecutor:
                     # che occupa lo slot (slot non vuoto) oppure il gid
                     # non e' in elenco (prerequisiti/categoria errata).
                     page_gid = await self._detect_page_gid(page)
-                    # gid=0 = slot vuoto (Travian Legends moderni espongono
-                    # classe g0/gid0 anziche' -1): conta come libero, il blocco
-                    # INVALID_SLOT_OCCUPIED vale solo per gid > 0 diverso dal target.
-                    if page_gid is not None and page_gid > 0 and page_gid != gid:
+                    # Self-healing gid=0: sui server che marcano lo slot
+                    # libero con g0/gid0, l'UI di 'nuova costruzione'
+                    # (tab categoria/bottoni contract) certifica il vuoto
+                    # -> il profilo apprende gid=0 come marker di slot
+                    # libero e la costruzione prosegue senza abortire.
+                    slot_empty = self.profile.is_empty_gid(page_gid)
+                    if (
+                        not slot_empty
+                        and page_gid == 0
+                        and await self._has_new_building_ui(page)
+                    ):
+                        if self.profile.calibrate_empty_gid(0):
+                            logger.warning(
+                                "[SELF-HEAL] Calibrato gid=0 come slot "
+                                "libero per %s",
+                                self.profile.host,
+                            )
+                        slot_empty = True
+                    if (
+                        not slot_empty
+                        and page_gid is not None
+                        and page_gid != gid
+                    ):
                         logger.warning(
                             "Slot %s occupato da gid=%s (atteso vuoto per gid=%s): INVALID_SLOT_OCCUPIED",
                             slot_id,
                             page_gid,
                             gid,
+                        )
+                        await self._capture(
+                            page,
+                            "INVALID_SLOT_OCCUPIED",
+                            village_id=village_id,
+                            slot_id=int(slot_id),
+                            expected_gid=gid,
+                            detected_gid=page_gid,
                         )
                         continue
                     try:
@@ -605,6 +719,14 @@ class ActionExecutor:
                         slot_id,
                         err,
                     )
+                    await self._capture(
+                        page,
+                        err,
+                        village_id=village_id,
+                        slot_id=int(slot_id),
+                        expected_gid=gid,
+                        detected_gid=page_gid,
+                    )
                     continue
 
                 button = None
@@ -619,7 +741,11 @@ class ActionExecutor:
                     f".buildingWrapper.gid{gid} .contractLink button.green",
                     f"#contract_building{gid} button[type='button'].green",
                 ]
-                for sel in new_btn_selectors:
+                for _idx, sel in enumerate(
+                    self.profile.ordered_selectors(
+                        "new_building_button", new_btn_selectors
+                    )
+                ):
                     loc = page.locator(sel).first
                     try:
                         if await loc.count() == 0:
@@ -629,6 +755,10 @@ class ActionExecutor:
                         css = (await loc.get_attribute("class")) or ""
                         if "disabled" not in css and "gold" not in css:
                             button = loc
+                            if _idx > 0:
+                                self.profile.promote_selector(
+                                    "new_building_button", sel
+                                )
                             break
                     except Exception:
                         continue
@@ -658,6 +788,14 @@ class ActionExecutor:
                         slot_id,
                         err,
                     )
+                    if err == "BTN_NOT_FOUND":
+                        await self._capture(
+                            page,
+                            err,
+                            village_id=village_id,
+                            slot_id=int(slot_id),
+                            expected_gid=gid,
+                        )
                     if blocker_cost is None and cost:
                         _def = {
                             k: max(0, int(cost.get(k) or 0) - stock.get(k, 0))
@@ -678,17 +816,22 @@ class ActionExecutor:
                 # =============================================================
                 # FLUSSO B: Ampliamento (current_level >= 1)
                 # =============================================================
-                build_url = f"slot?id={int(slot_id)}"
                 slot_check = _slot_url_check(slot_id)
+                # Routing adattivo: 'legacy' prova prima build.php?id=N,
+                # gli altri (modern/unknown) la nuova UI /slot?id=N.
+                if self.profile.routing_mode == "legacy":
+                    build_url = f"{selectors.PATH_BUILD}?id={int(slot_id)}"
+                    alt_url = f"slot?id={int(slot_id)}"
+                else:
+                    build_url = f"slot?id={int(slot_id)}"
+                    alt_url = f"{selectors.PATH_BUILD}?id={int(slot_id)}"
                 if village_id > 0:
                     build_url += f"&newdid={village_id}"
+                    alt_url += f"&newdid={village_id}"
                 await self.browser.goto(build_url)
 
                 if not slot_check.search(page.url or ""):
-                    build_url = f"{selectors.PATH_BUILD}?id={int(slot_id)}"
-                    if village_id > 0:
-                        build_url += f"&newdid={village_id}"
-                    await self.browser.goto(build_url)
+                    await self.browser.goto(alt_url)
                     if not slot_check.search(page.url or ""):
                         logger.debug(
                             "Slot %s: contratto non aperto (url=%s), provo il prossimo",
@@ -720,7 +863,11 @@ class ActionExecutor:
                     last_cost = cost
 
                 button = None
-                for sel in selectors.UPGRADE_BUTTON:
+                for _idx, sel in enumerate(
+                    self.profile.ordered_selectors(
+                        "upgrade_button", selectors.UPGRADE_BUTTON
+                    )
+                ):
                     locator = page.locator(sel).first
                     try:
                         if await locator.count() == 0:
@@ -730,6 +877,10 @@ class ActionExecutor:
                         css_class = (await locator.get_attribute("class")) or ""
                         if "disabled" not in css_class and "gold" not in css_class:
                             button = locator
+                            if _idx > 0:
+                                self.profile.promote_selector(
+                                    "upgrade_button", sel
+                                )
                             break
                     except Exception:
                         continue
@@ -900,6 +1051,18 @@ class ActionExecutor:
                     queue_after,
                     confirm_kind,
                     page.url,
+                )
+                await self._capture(
+                    page,
+                    "QUEUE_UNCONFIRMED",
+                    village_id=village_id,
+                    slot_id=int(slot_id),
+                    expected_gid=gid,
+                    extra={
+                        "queue_before": queue_before,
+                        "queue_after": queue_after,
+                        "confirm_kind": confirm_kind,
+                    },
                 )
                 continue
 
@@ -1194,11 +1357,17 @@ class ActionExecutor:
             return True
 
         # 1. Prova prima con selettori specifici per la scheda send (t=5, ecc.)
-        for sel in selectors.MARKET_TAB_SEND:
+        for _idx, sel in enumerate(
+            self.profile.ordered_selectors(
+                "market_tab_send", selectors.MARKET_TAB_SEND
+            )
+        ):
             try:
                 tab_loc = page.locator(sel).first
                 if await tab_loc.count() > 0 and await tab_loc.is_visible():
                     await tab_loc.click(timeout=1500)
+                    if _idx > 0:
+                        self.profile.promote_selector("market_tab_send", sel)
                     return True
             except Exception:  # noqa: BLE001
                 continue
@@ -1502,6 +1671,13 @@ class ActionExecutor:
         # 2. STEP CRITICO: Clicca sul tab "Invia risorse" (secondo tab)
         clicked_tab = await self._select_send_resources_tab(page)
         if not clicked_tab:
+            await self._capture(
+                page,
+                "MARKET_TAB_MISSING",
+                village_id=village_id,
+                slot_id=int(market_slot) if str(market_slot).isdigit() else None,
+                expected_gid=17,
+            )
             return ActionResult(False, "impossibile trovare o cliccare il tab 'Invia risorse'")
 
         await sleep_human(0.8, 1.2)
@@ -1599,6 +1775,13 @@ class ActionExecutor:
             current_url = page.url if page else "N/A"
             page_title = await page.title() if page else "N/A"
             logger.error("DEBUG MERCATO FALLITO -> URL corrente: %s | Titolo pagina: %s", current_url, page_title)
+            await self._capture(
+                page,
+                "MARKET_FORM_MISSING",
+                village_id=village_id,
+                slot_id=int(market_slot) if str(market_slot).isdigit() else None,
+                expected_gid=17,
+            )
             try:
                 if hasattr(self, '_dump_market_html'):
                     await self._dump_market_html(page)
@@ -1615,7 +1798,11 @@ class ActionExecutor:
         # 3. COMPILAZIONE CONTESTUALE: NOME VILLAGGIO TARGET & COORDINATE (X, Y)
         # Compilazione nome villaggio (esclude categoricamente campi di rinomina)
         target_filled = False
-        for sel in selectors.MARKET_TARGET_INPUT:
+        for _idx, sel in enumerate(
+            self.profile.ordered_selectors(
+                "market_target_input", selectors.MARKET_TARGET_INPUT
+            )
+        ):
             if any(bad in sel.lower() for bad in ["rename", "dname", "renamer"]):
                 continue
             locator = page.locator(f"{send_scope} {sel}").first
@@ -1638,6 +1825,8 @@ class ActionExecutor:
                 await locator.fill("", timeout=500)
                 await locator.press_sequentially(str(target), delay=40, timeout=1500)
                 target_filled = True
+                if _idx > 0:
+                    self.profile.promote_selector("market_target_input", sel)
                 break
             except Exception:
                 continue
@@ -1821,6 +2010,14 @@ class ActionExecutor:
                     dump_note = f" (dump DOM: {dump_path})"
             except Exception:  # noqa: BLE001
                 pass
+            await self._capture(
+                page,
+                "MARKET_INPUTS_MISSING",
+                village_id=village_id,
+                slot_id=int(market_slot) if str(market_slot).isdigit() else None,
+                expected_gid=17,
+                extra={"target": str(target), "coords": [tx, ty]},
+            )
             return ActionResult(
                 False,
                 f"form di invio mercato non trovato o campi non compilabili "
@@ -1831,7 +2028,9 @@ class ActionExecutor:
 
         # 5. CONFERMA FINALE: Clic sul pulsante verde "Invia risorse" in fondo alla sezione
         send_buttons = [f"{send_scope} {s}" for s in selectors.MARKET_SEND_BUTTON] + selectors.MARKET_SEND_BUTTON
-        clicked_send = await self._click_first(page, send_buttons)
+        clicked_send = await self._click_first(
+            page, send_buttons, profile_key="market_send_button"
+        )
         if not clicked_send:
             # Fallback JavaScript mirato al pulsante con testo 'Invia risorse' o 'Send resources'
             clicked_send = await page.evaluate("""
@@ -1849,6 +2048,13 @@ class ActionExecutor:
                 }
             """)
         if not clicked_send:
+            await self._capture(
+                page,
+                "MARKET_SEND_BTN_NOT_FOUND",
+                village_id=village_id,
+                slot_id=int(market_slot) if str(market_slot).isdigit() else None,
+                expected_gid=17,
+            )
             return ActionResult(False, "pulsante di invio mercato non trovato")
         await sleep_human(1.0, 2.0)
 
@@ -3577,10 +3783,25 @@ class ActionExecutor:
         return ActionResult(True, f"addestramento avviato (slot {trainer_slot})")
 
     async def _click_first(
-        self, page, selectors_list: list[str], timeout_ms: int = 1500
+        self,
+        page,
+        selectors_list: list[str],
+        timeout_ms: int = 1500,
+        profile_key: str | None = None,
     ) -> bool:
-        """Clicca il primo selettore presente, visibile e non disabilitato."""
-        for sel in selectors_list:
+        """Clicca il primo selettore presente, visibile e non disabilitato.
+
+        Con ``profile_key`` la lista viene riordinata dal profilo del
+        server (il selettore promosso vince) e un match a indice > 0
+        promuove il selettore vincente per i cicli successivi.
+        """
+        if profile_key:
+            ordered = self.profile.ordered_selectors(
+                profile_key, selectors_list
+            )
+        else:
+            ordered = list(selectors_list)
+        for _idx, sel in enumerate(ordered):
             locator = page.locator(sel).first
             try:
                 if await locator.count() == 0:
@@ -3591,6 +3812,8 @@ class ActionExecutor:
                 css_class = (await locator.get_attribute("class", timeout=timeout_ms)) or ""
                 if disabled is None and "disabled" not in css_class:
                     await locator.click(timeout=timeout_ms)
+                    if profile_key and _idx > 0:
+                        self.profile.promote_selector(profile_key, sel)
                     return True
             except Exception:  # noqa: BLE001
                 continue

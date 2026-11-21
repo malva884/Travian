@@ -84,6 +84,7 @@ from .presets import (
 )
 from .replenishment import TroopReplenishmentManager
 from .sensors import GameObserver
+from .server_profile import calibrate_routing
 from .stealth import (
     ModulePauseRegistry,
     eta_pause_bounds,
@@ -1690,6 +1691,13 @@ async def monitor_all_villages(
     # Assicuriamoci di essere sul dorf1 prima di leggere la sidebar (così i box dei villaggi sono presenti)
     if selectors.PATH_DORF1 not in (browser.page.url or ""):
         await browser.goto(selectors.PATH_DORF1)
+
+    # Self-healing al boot: dal primo dorf1/dorf2 il profilo del server
+    # apprende il routing edificio (legacy build.php vs modern /slot).
+    try:
+        await calibrate_routing(browser.page)
+    except Exception:  # noqa: BLE001
+        pass
 
     # 1. Estrae la lista dei villaggi dell'account
     villages = await observer.get_all_villages()
@@ -3973,6 +3981,11 @@ async def run_single_account_loop(
 
                 await browser.ensure_logged_in()
                 await browser.goto(selectors.PATH_DORF1)
+                # Boot calibration: routing_mode nel profilo per-server.
+                try:
+                    await calibrate_routing(browser.page)
+                except Exception:  # noqa: BLE001
+                    pass
 
                 # Esegue il ciclo completo su tutti i villaggi dell'account
                 if settings.account_id not in _farming_managers:

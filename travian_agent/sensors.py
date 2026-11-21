@@ -14,6 +14,8 @@ from playwright.async_api import Page
 
 from . import selectors
 from .building_prereqs import FIELD_GID_TYPES
+from .server_profile import calibrate_routing
+from .telemetry_capture import capture_anomaly
 from .models import (
     BuildQueueItem,
     Field,
@@ -992,6 +994,12 @@ class TravianParser:
     async def read_fields(self) -> list[Field]:
         """Slot 1-18 dal dorf1 (campi risorsa)."""
         fields: list[Field] = []
+        # Auto-calibrazione routing: il primo dorf1 caricato classifica
+        # il server come legacy/modern nel profilo persistente.
+        try:
+            await calibrate_routing(self.page)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             raw_fields: list = await self.page.evaluate("""
                 () => {
@@ -1170,6 +1178,15 @@ class TravianParser:
             logger.warning(
                 "read_fields: 0 campi dorf1 letti. Probe DOM: %s", probe
             )
+            try:
+                await capture_anomaly(
+                    self.page,
+                    "FIELDS_EMPTY",
+                    village_id=self._current_newdid(),
+                    extra={"probe": probe},
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return fields
 
     async def read_interior_fields(self) -> list[Field]:
@@ -1189,6 +1206,13 @@ class TravianParser:
             if match:
                 target_url += f"?newdid={match.group(1)}"
             await self._goto(target_url)
+
+        # Auto-calibrazione routing anche dal dorf2 (href /slot|/building
+        # degli interni -> 'modern', build.php?id=N -> 'legacy').
+        try:
+            await calibrate_routing(page)
+        except Exception:  # noqa: BLE001
+            pass
 
         try:
             interior_data = await page.evaluate("""
