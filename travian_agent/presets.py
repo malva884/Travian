@@ -357,5 +357,36 @@ def roles_with_preset() -> list[str]:
     return sorted(ROLE_PRESETS)
 
 
+def trainer_gid_for_unit(tkey: str) -> int:
+    """gid dell'edificio che addestra l'unita' ``tN``.
+
+    Posizione nella scheda tribu' (1-10): 1-3 fanteria -> Caserma,
+    4-6 cavalleria -> Scuderia, 7-8 macchine -> Officina,
+    9-10 capo/colono -> Residenza (il Palazzo condivide lo stesso
+    ruolo). Ritorna 0 per chiavi non risolvibili.
+    """
+    try:
+        from .models import (
+            GID_BARRACKS,
+            GID_RESIDENCE,
+            GID_STABLE,
+            GID_WORKSHOP,
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+    k = str(tkey or "").strip().lower().lstrip("ut")
+    try:
+        pos = (int(k) - 1) % 10 + 1
+    except (TypeError, ValueError):
+        return 0
+    if pos <= 3:
+        return GID_BARRACKS
+    if pos <= 6:
+        return GID_STABLE
+    if pos <= 8:
+        return GID_WORKSHOP
+    return GID_RESIDENCE
+
+
 # Alias esposti per la dashboard (nomi parlanti nella config salvata).
 DEFAULT_SMITHY_PRESET = dict(_SMITHY_DEFAULT)

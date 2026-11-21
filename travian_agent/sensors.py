@@ -14,7 +14,7 @@ from playwright.async_api import Page
 
 from . import selectors
 from .building_prereqs import FIELD_GID_TYPES
-from .server_profile import calibrate_routing
+from .server_profile import calibrate_routing, profile_for_url
 from .telemetry_capture import capture_anomaly
 from .models import (
     BuildQueueItem,
@@ -198,6 +198,105 @@ def guess_resource_type(name: str) -> ResourceType | None:
         if any(kw in lowered for kw in keywords):
             return res_type
     return None
+
+
+# Parole che identificano il controllo "Ricerca" nella riga unita'
+# dell'Accademia (IT/EN/DE/FR/ES).
+_ACADEMY_RESEARCH_WORDS = re.compile(
+    r"ricerca|ricerc|research|erforsch|recherche|estudia|estudi", re.I
+)
+# Priorita' di merge quando lo stesso uN compare in piu' nodi (es. icona
+# nella coda + riga tabella): lo stato piu' informativo vince.
+_ACADEMY_STATUS_PRIORITY = {
+    "researched": 0,
+    "unknown": 1,
+    "blocked": 2,
+    "researchable": 3,
+    "in_progress": 4,
+}
+
+
+def _academy_row_status(rec: dict) -> str:
+    """Classifica una riga unita' del dump Accademia.
+
+    - ``in_progress``: timer nella riga (ricerca in corso);
+    - ``researchable``: almeno un controllo abilitato il cui testo/href
+      riconduce a 'Ricerca' (pulsante pronto);
+    - ``blocked``: controlli presenti ma tutti disabilitati (risorse
+      insufficienti o prerequisiti mancanti);
+    - ``unknown``: controlli abilitati non riconducibili a ricerca;
+    - ``researched``: riga senza controlli (unita' gia' sbloccata).
+    """
+    if rec.get("timer"):
+        return "in_progress"
+    controls = list(rec.get("controls") or [])
+    enabled = [c for c in controls if not c.get("disabled")]
+    for ctl in enabled:
+        text = str(ctl.get("text") or "")
+        href = str(ctl.get("href") or "")
+        if _ACADEMY_RESEARCH_WORDS.search(text) or re.search(
+            r"[?&](?:a|t)=\d+", href
+        ):
+            return "researchable"
+    if controls and not enabled:
+        return "blocked"
+    if enabled:
+        return "unknown"
+    return "researched"
+
+
+def normalize_academy_state(raw: dict | None) -> dict:
+    """Normalizza il dump JS ``_JS_ACADEMY_SNAPSHOT`` in uno stato utile.
+
+    Ritorna ``{"research_active": bool, "researching": [tN],
+    "units": {tN: {status,label,costs}}}`` oppure {} se il markup non
+    espone righe unita' riconoscibili.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        from .models import STATIC_TROOP_LABELS  # import ritardato: no cicli
+    except Exception:  # noqa: BLE001
+        STATIC_TROOP_LABELS = {}
+    units: dict[str, dict] = {}
+    for rec in raw.get("rows") or []:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            un = int(rec.get("u") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= un <= 30:
+            continue
+        key = f"t{un}"
+        status = _academy_row_status(rec)
+        costs = {
+            str(k): safe_int(v)
+            for k, v in (rec.get("costs") or {}).items()
+            if safe_int(v) > 0
+        }
+        entry = {
+            "status": status,
+            "label": STATIC_TROOP_LABELS.get(key, key),
+            "costs": costs,
+        }
+        prev = units.get(key)
+        if prev is None or _ACADEMY_STATUS_PRIORITY.get(
+            status, 0
+        ) > _ACADEMY_STATUS_PRIORITY.get(prev.get("status", ""), 0):
+            units[key] = entry
+    researching = sorted(
+        (k for k, u in units.items() if u.get("status") == "in_progress"),
+        key=lambda k: int(k[1:]),
+    )
+    active = bool(raw.get("active")) or bool(researching)
+    if not units and not active:
+        return {}
+    return {
+        "research_active": active,
+        "researching": researching,
+        "units": units,
+    }
 
 
 async def _first_locator(page: Page, selector_list: list[str]):
@@ -409,6 +508,23 @@ class TravianParser:
                 pass
         kwargs.setdefault("wait_until", "domcontentloaded")
         await self.page.goto(url, **kwargs)
+
+    def _building_url_path(self, slot_id: int) -> str:
+        """Path ``?id=<slot>`` coerente col routing rilevato del server.
+
+        I server moderni (Travian Legends nuova UI) servono gli edifici
+        su ``/building?id=N`` o ``/slot?id=N``; quelli legacy su
+        ``build.php?id=N``. La scelta segue ``routing_mode`` del profilo
+        calibrato; in dubbio si usa il path legacy che i server moderni
+        reindirizzano comunque.
+        """
+        try:
+            prof = profile_for_url(getattr(self.page, "url", "") or "")
+            if prof.routing_mode == "modern":
+                return f"building?id={int(slot_id)}"
+        except Exception:  # noqa: BLE001
+            pass
+        return f"{selectors.PATH_BUILD}?id={int(slot_id)}"
 
     async def _dump_page_text(self, tag: str) -> None:
         """Salva URL + innerText in debug/<tag>.txt per diagnosi parser."""
@@ -2270,6 +2386,209 @@ class TravianParser:
             return {str(k): safe_int(v) for k, v in (data or {}).items() if safe_int(v) > 0}
         except Exception:
             return {}
+
+    # Snapshot JS dell'Accademia (gid 22): per ogni riga con icona
+    # 'unit uN' raccoglie testo, timer, controlli (bottone/link Ricerca
+    # con stato enabled) e costi risorse; segnala inoltre se esiste un
+    # timer di ricerca attivo nel contenuto principale.
+    _JS_ACADEMY_SNAPSHOT = """
+        () => {
+            const num = (t) => {
+                const m = String(t || '').match(/(\\d[\\d.,\\s]*)/);
+                return m ? parseInt(m[1].replace(/[^\\d]/g, ''), 10) : 0;
+            };
+            const out = {rows: [], active: false};
+            const scope = document.querySelector(
+                '#content, #build, .buildingDetails, .content, main'
+            ) || document.body;
+            out.active = !!scope.querySelector(
+                '.timer, .dur, .clocks, [class*="timer" i]'
+            );
+            const seen = new Set();
+            const icons = scope.querySelectorAll(
+                '[class*="unit u"], [class*="unit_u"], ' +
+                'img.unit, i.unit, span.unit, a.unit'
+            );
+            for (const icon of icons) {
+                const m = (icon.getAttribute('class') || '')
+                    .match(/\\bu(\\d{1,2})\\b/);
+                if (!m) continue;
+                const uN = parseInt(m[1], 10);
+                if (uN < 1 || uN > 30) continue;
+                const row = icon.closest(
+                    'tr, li, .research, .troop, .unitRow, ' +
+                    '.details, .item, .researchRow'
+                ) || icon.closest('div') || icon.parentElement;
+                if (!row || seen.has(row)) continue;
+                seen.add(row);
+                const rec = {
+                    u: uN,
+                    text: (row.innerText || '')
+                        .replace(/\\s+/g, ' ').trim().slice(0, 500),
+                    timer: !!row.querySelector(
+                        '.timer, .dur, .clocks, [class*="timer" i]'
+                    ),
+                    controls: [],
+                    costs: {},
+                };
+                for (const c of row.querySelectorAll(
+                    'button, a[href], input[type="submit"], ' +
+                    'input[type="button"], [role="button"]'
+                )) {
+                    const dis = !!(
+                        c.disabled ||
+                        c.getAttribute('disabled') !== null ||
+                        /\\b(disabled|grey|inactive)\\b/i
+                            .test(c.className || '') ||
+                        c.getAttribute('aria-disabled') === 'true'
+                    );
+                    rec.controls.push({
+                        text: String(
+                            c.innerText || c.value || ''
+                        ).trim().slice(0, 80),
+                        href: c.getAttribute
+                            ? (c.getAttribute('href') || '') : '',
+                        disabled: dis,
+                    });
+                }
+                // Costi ricerca: icone/elementi risorsa nella riga
+                // (classi r1-r4 o keyword localizzate). Il numero si
+                // legge nel nodo, nel fratello o nel genitore (se
+                // corto, per non pescare cifre della riga intera).
+                const groups = [
+                    ['r1', 'lumber', 'wood', 'holz'],
+                    ['r2', 'clay', 'brick', 'lehm'],
+                    ['r3', 'iron', 'eisen'],
+                    ['r4', 'crop', 'wheat', 'getreide'],
+                ];
+                const resKeys = ['wood', 'clay', 'iron', 'crop'];
+                groups.forEach((names, i) => {
+                    const sel = names
+                        .map(n => `[class*="${n}" i]`)
+                        .join(',');
+                    for (const el of row.querySelectorAll(sel)) {
+                        let v = num(el.innerText || '');
+                        if (!v && el.nextElementSibling) {
+                            v = num(el.nextElementSibling.innerText || '');
+                        }
+                        if (!v && el.parentElement) {
+                            const pt = el.parentElement.innerText || '';
+                            if (pt.length <= 40) v = num(pt);
+                        }
+                        if (v > 0) { rec.costs[resKeys[i]] = v; return; }
+                    }
+                });
+                out.rows.push(rec);
+            }
+            return out;
+        }
+    """
+
+    async def read_academy_state(
+        self, academy_slot: int, village_id: int = 0
+    ) -> dict:
+        """Stato dell'Accademia (gid 22) del villaggio corrente.
+
+        Naviga allo slot con URL coerente col routing rilevato
+        (``build.php?id=N`` legacy, ``building?id=N`` modern) e legge:
+
+        - ``research_active``: True se una ricerca e' gia' in corso
+          (timer nel contenuto o riga con timer) — il planner non deve
+          sovrapporre azioni;
+        - ``units``: ``{"tN": {"status", "label", "costs"}}`` con
+          status in researched|researchable|blocked|in_progress —
+          'researchable' = pulsante Ricerca abilitato, 'blocked' =
+          risorse insufficienti/prerequisiti mancanti;
+        - ``researching``: chiavi tN in corso di ricerca.
+
+        Ritorna {} se la pagina non espone dati riconoscibili.
+        """
+        if not self.page or not academy_slot:
+            return {}
+        url = self._building_url_path(academy_slot)
+        if village_id:
+            url += f"&newdid={village_id}"
+        try:
+            await self._goto(_abs_game_url(self.page.url or "", url))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "read_academy_state: navigazione slot %s fallita: %s",
+                academy_slot, exc,
+            )
+            return {}
+        try:
+            raw = await self.page.evaluate(self._JS_ACADEMY_SNAPSHOT)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "read_academy_state: eval fallita su %s: %s",
+                (self.page.url or "")[:120], exc,
+            )
+            return {}
+        state = normalize_academy_state(raw)
+        if not state:
+            logger.debug(
+                "read_academy_state: markup non riconosciuto su %s",
+                (self.page.url or "")[:120],
+            )
+        return state
+
+    async def read_trainable_units(
+        self, trainer_slot: int, village_id: int = 0
+    ) -> set[str]:
+        """Chiavi 'tN' delle unita' sbloccate (addestrabili) nel trainer.
+
+        La form di addestramento (Caserma/Scuderia/Officina o
+        Residenza/Palazzo) espone gli input ``tN`` solo per le unita'
+        gia' ricercate in Accademia: e' la verita' operativa su
+        'sbloccata' usata dal planner quando il DOM dell'Accademia
+        omette l'unita' (es. UI legacy che nasconde le ricercate).
+        """
+        if not self.page or not trainer_slot:
+            return set()
+        url = self._building_url_path(trainer_slot)
+        if village_id:
+            url += f"&newdid={village_id}"
+        try:
+            await self._goto(_abs_game_url(self.page.url or "", url))
+        except Exception:  # noqa: BLE001
+            return set()
+        try:
+            keys = await self.page.evaluate("""
+                () => {
+                    const out = new Set();
+                    for (const inp of document.querySelectorAll(
+                        'form input[name^="t"], #trainUnits input, ' +
+                        '.trainUnits input, .innerTrainUnitBox input'
+                    )) {
+                        const m = String(inp.name || '')
+                            .match(/^t(\\d{1,2})$/);
+                        if (m) out.add('t' + m[1]);
+                    }
+                    if (!out.size) {
+                        const scope = document.querySelector(
+                            '#trainUnits, .trainUnits, ' +
+                            '.innerTrainUnitBox, form'
+                        );
+                        if (scope) {
+                            for (const icon of scope.querySelectorAll(
+                                '[class*="unit u"], img.unit, ' +
+                                'i.unit, span.unit'
+                            )) {
+                                const m = (icon.getAttribute('class') || '')
+                                    .match(/\\bu(\\d{1,2})\\b/);
+                                if (m) out.add('t' + m[1]);
+                            }
+                        }
+                    }
+                    return Array.from(out);
+                }
+            """)
+            return {
+                str(k) for k in (keys or [])
+                if str(k).startswith("t") and str(k)[1:].isdigit()
+            }
+        except Exception:  # noqa: BLE001
+            return set()
 
     async def read_farm_lists(
         self, rally_slot: int, village_id: int = 0

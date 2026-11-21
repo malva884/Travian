@@ -393,6 +393,8 @@ class ActionExecutor:
                 return await self._train_settlers(action, village_id=vid_int)
             case ActionType.UPGRADE_UNITS:
                 return await self._upgrade_smithy_units(action, village_id=vid_int)
+            case ActionType.RESEARCH_UNIT:
+                return await self._research_unit(action, village_id=vid_int)
             case ActionType.START_CELEBRATION:
                 return await self._start_celebration(action, village_id=vid_int)
             case ActionType.CLAIM_VIDEO_BONUS:
@@ -3248,6 +3250,191 @@ class ActionExecutor:
             True,
             f"upgrade fucina avviato per {outcome.get('unit')} "
             f"(liv. {outcome.get('level')})",
+        )
+
+    def _building_path_for(self, slot_id: int) -> str:
+        """Path ``?id=<slot>`` coerente col routing rilevato del server.
+
+        Mirror del sensore: profilo 'modern' -> ``building?id=N``,
+        altrimenti ``build.php?id=N`` (i server moderni reindirizzano).
+        """
+        try:
+            page = getattr(self.browser, "page", None)
+            prof = profile_for_url(
+                (page.url if page is not None else "")
+                or self.settings.server_url
+            )
+            if prof.routing_mode == "modern":
+                return f"building?id={int(slot_id)}"
+        except Exception:  # noqa: BLE001
+            pass
+        return f"{selectors.PATH_BUILD}?id={int(slot_id)}"
+
+    async def _research_unit(
+        self, action: Action, village_id: int = 0
+    ) -> ActionResult:
+        """Avvia la ricerca di un'unita' in Accademia (gid 22).
+
+        ``params``: ``academy_slot`` (slot dorf2 dell'Accademia),
+        ``unit`` (chiave 'tN'/'uN' o nome) e ``label`` opzionale. Apre
+        la pagina dello slot con URL compatibile col routing rilevato,
+        individua la riga dell'unita' (icona 'unit uN' o testo label),
+        clicca il pulsante 'Ricerca' e verifica la comparsa del timer
+        di ricerca attiva.
+        """
+        params = action.params or {}
+        try:
+            academy_slot = int(
+                params.get("academy_slot") or params.get("slot_id") or 0
+            )
+        except (TypeError, ValueError):
+            academy_slot = 0
+        if academy_slot <= 0:
+            return ActionResult(
+                False, "slot Accademia mancante (academy_slot)"
+            )
+        unit = str(
+            params.get("unit") or params.get("unit_code") or ""
+        ).strip()
+        unit_label = str(
+            params.get("label") or params.get("unit_label") or ""
+        ).strip()
+        if not unit and not unit_label:
+            return ActionResult(
+                False, "unita' da ricercare mancante (unit)"
+            )
+
+        page = self.browser.page
+        assert page is not None
+
+        url = self._building_path_for(academy_slot)
+        if village_id > 0:
+            url += f"&newdid={village_id}"
+        await self.browser.goto(url)
+        await sleep_human(0.8, 1.4)
+
+        outcome = await page.evaluate(
+            """
+            (args) => {
+                const want = String(args.unit || '')
+                    .toLowerCase().trim();
+                const wantLabel = String(args.label || '')
+                    .toLowerCase().trim();
+                const dm = want.match(/^[ut](\\d{1,2})$/);
+                const num = dm ? parseInt(dm[1], 10) : 0;
+                const RE = new RegExp(
+                    'ricerca|ricerc|research|erforsch|recherche|' +
+                    'estudia|estudi', 'i');
+                const scope = document.querySelector(
+                    '#content, #build, .buildingDetails, .content, main'
+                ) || document.body;
+                const enabledCtl = (row) => Array.from(
+                    row.querySelectorAll(
+                        'button, a[href], input[type="submit"], ' +
+                        'input[type="button"], [role="button"]'
+                    )
+                ).filter(c => !(
+                    c.disabled ||
+                    c.getAttribute('disabled') !== null ||
+                    /\\b(disabled|grey|inactive)\\b/i
+                        .test(c.className || '') ||
+                    c.getAttribute('aria-disabled') === 'true'
+                ));
+                const researchCtl = (row) => enabledCtl(row).find(c =>
+                    RE.test(String(c.innerText || c.value || '')) ||
+                    /[?&](a|t)=\\d+/.test(c.getAttribute('href') || '')
+                );
+                const rows = [];
+                for (const icon of scope.querySelectorAll(
+                    '[class*="unit u"], [class*="unit_u"], ' +
+                    'img.unit, i.unit, span.unit'
+                )) {
+                    const m = (icon.getAttribute('class') || '')
+                        .match(/\\bu(\\d{1,2})\\b/);
+                    if (!m) continue;
+                    const uN = parseInt(m[1], 10);
+                    const row = icon.closest(
+                        'tr, li, .research, .troop, .unitRow, ' +
+                        '.details, .item, .researchRow'
+                    ) || icon.closest('div');
+                    if (row) rows.push({uN, row});
+                }
+                let found = false;
+                for (const {uN, row} of rows) {
+                    if (num) {
+                        if (uN !== num) continue;
+                    } else if (wantLabel) {
+                        const txt = (row.innerText || '').toLowerCase();
+                        if (!txt.includes(wantLabel)) continue;
+                    } else {
+                        continue;
+                    }
+                    found = true;
+                    const ctl = researchCtl(row);
+                    if (!ctl) {
+                        return {
+                            ok: false,
+                            why: 'pulsante Ricerca assente o ' +
+                                'disabilitato (risorse/prerequisiti)',
+                        };
+                    }
+                    ctl.click();
+                    return {ok: true, u: uN};
+                }
+                if (!found) {
+                    return {
+                        ok: false,
+                        why: 'riga unita non trovata in Accademia',
+                    };
+                }
+                return {ok: false, why: 'ricerca non avviabile'};
+            }
+            """,
+            {"unit": unit, "label": unit_label},
+        ) or {}
+
+        if not outcome.get("ok"):
+            return ActionResult(
+                False,
+                str(outcome.get("why") or "ricerca non avviabile"),
+            )
+
+        await sleep_human(1.0, 1.6)
+
+        # Verifica: il timer della ricerca deve comparire nell'Accademia.
+        try:
+            active = await page.evaluate(
+                """
+                () => {
+                    const scope = document.querySelector(
+                        '#content, #build, .buildingDetails, ' +
+                        '.content, main'
+                    ) || document.body;
+                    return !!scope.querySelector(
+                        '.timer, .dur, .clocks, [class*="timer" i]'
+                    );
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            active = False
+        unit_ref = unit_label or unit
+        if not active:
+            logger.warning(
+                "Accademia: click ricerca %s eseguito ma timer "
+                "non rilevato (pagina %s)",
+                unit_ref, (page.url or "")[:120],
+            )
+            return ActionResult(
+                False,
+                f"ricerca {unit_ref}: timer non rilevato dopo il click",
+            )
+        logger.info(
+            "Accademia: ricerca avviata per %s (slot %s, villaggio %s)",
+            unit_ref, academy_slot, village_id,
+        )
+        return ActionResult(
+            True, f"ricerca avviata in Accademia: {unit_ref}"
         )
 
     async def _train_troops(self, action: Action, village_id: int = 0) -> ActionResult:

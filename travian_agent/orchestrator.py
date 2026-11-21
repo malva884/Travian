@@ -35,6 +35,7 @@ from .builder import (
 )
 from .building_prereqs import (
     FIELD_GID_TYPES,
+    GID_ACADEMY,
     GID_CRANNY,
     GID_MAIN_BUILDING,
     GID_SMITHY,
@@ -74,6 +75,8 @@ from .models import (
     GID_WAREHOUSE,
     GID_WORKSHOP,
     Resources,
+    STATIC_TROOP_LABELS,
+    UNIT_ACADEMY_LEVELS,
     Village,
 )
 from .presets import (
@@ -81,8 +84,14 @@ from .presets import (
     detect_tribe_from_labels,
     resolve_role,
     resolve_troop_preset,
+    resolve_troop_slot,
+    trainer_gid_for_unit,
 )
-from .replenishment import TroopReplenishmentManager
+from .replenishment import (
+    TroopReplenishmentManager,
+    normalize_unit_key,
+    unit_label_to_key,
+)
 from .sensors import GameObserver
 from .server_profile import calibrate_routing
 from .stealth import (
@@ -127,6 +136,9 @@ _last_known_fields: dict[str, list[Field]] = {}
 # Throttle del ciclo Fucina auto (villaggio -> ts ultimo tentativo).
 _last_smithy_try: dict[str, float] = {}
 SMITHY_RETRY_SECONDS = 1800.0  # un tentativo ogni ~30 min per villaggio
+# Throttle del ciclo Accademia auto (villaggio -> ts ultimo tentativo).
+_last_academy_try: dict[str, float] = {}
+ACADEMY_RETRY_SECONDS = 900.0  # un controllo ricerche ogni ~15 min per villaggio
 # Pause anti-detection: moduli in SKIPPED/BLOCKED non riprovano al
 # ciclo successivo ma dopo 15-30 min (o al cambio delle risorse).
 _module_pauses = ModulePauseRegistry()
@@ -1643,11 +1655,104 @@ _ACTION_MODULE_MAP = {
     ActionType.TRAIN_TROOPS: "replenishment",
     ActionType.SEND_CUSTOM_RAID: "farming",
     ActionType.UPGRADE_UNITS: "smithy",
+    ActionType.RESEARCH_UNIT: "academy",
 }
 
 
 def _action_module(action: Action) -> str:
     return _ACTION_MODULE_MAP.get(action.type, "builder")
+
+
+def _academy_pending_units(
+    wanted: list[str],
+    ac_state: dict,
+    academy_level: int,
+    trainable: set[str] | None = None,
+) -> list[dict]:
+    """Unita' autorizzate che richiedono ancora una ricerca in Accademia.
+
+    Confronta ``wanted`` (chiavi tN, ordine = priorita' dashboard) con
+    lo stato letto da ``read_academy_state``:
+
+    - ``researchable`` -> ``actionable``: il pulsante Ricerca e'
+      abilitato (prerequisiti e risorse gia' valutati lato DOM);
+    - ``researched`` o assente dal DOM senza prerequisito noto ->
+      omessa (gia' sbloccata o non soggetta a ricerca: truppa base,
+      coloni);
+    - assente dal DOM ma presente in ``UNIT_ACADEMY_LEVELS`` ->
+      verita' sul trainer (``trainable`` = chiavi addestrabili lette
+      dalla form del building che la addestra);
+    - ``blocked``/``unknown`` -> non actionable, ``reason`` motiva il
+      blocco (livello Accademia insufficiente secondo la tabella).
+
+    Le unita' 'in_progress' restano in coda come promemoria ma non
+    sono actionable (la guard ``research_active`` le filtra a monte).
+    """
+    units = (ac_state or {}).get("units") or {}
+    trainable = trainable or set()
+    out: list[dict] = []
+    for raw_key in wanted or []:
+        key = normalize_unit_key(raw_key)
+        if not key or not (key[1:].isdigit()):
+            continue
+        label = STATIC_TROOP_LABELS.get(key, key)
+        req_level = int(UNIT_ACADEMY_LEVELS.get(key, 0) or 0)
+        entry = units.get(key)
+        if entry is None:
+            # Assente dal DOM dell'Accademia: su alcune UI le unita'
+            # ricercate spariscono dalla tabella. Se la scheda tribu'
+            # non la prevede in Accademia non serve ricerca; altrimenti
+            # decide il trainer (input tN presente = gia' sbloccata).
+            if not req_level or key in trainable:
+                continue
+            reason = "stato ricerca non leggibile in Accademia"
+            if req_level and academy_level < req_level:
+                reason = (
+                    f"Accademia liv.{academy_level} < {req_level} "
+                    f"richiesto per {label}"
+                )
+            out.append({
+                "unit": key,
+                "label": label,
+                "actionable": False,
+                "required_level": req_level,
+                "reason": reason,
+            })
+            continue
+        status = str(entry.get("status") or "")
+        if status == "researchable":
+            out.append({
+                "unit": key,
+                "label": label,
+                "actionable": True,
+                "required_level": req_level,
+                "costs": dict(entry.get("costs") or {}),
+            })
+        elif status == "researched":
+            continue
+        elif status == "in_progress":
+            out.append({
+                "unit": key,
+                "label": label,
+                "actionable": False,
+                "required_level": req_level,
+                "reason": f"ricerca di {label} gia' in corso",
+            })
+        else:  # blocked | unknown
+            reason = f"ricerca di {label} non disponibile (prerequisiti o risorse)"
+            if req_level and academy_level < req_level:
+                reason = (
+                    f"Accademia liv.{academy_level} < {req_level} "
+                    f"richiesto per {label}"
+                )
+            out.append({
+                "unit": key,
+                "label": label,
+                "actionable": False,
+                "required_level": req_level,
+                "reason": reason,
+            })
+    return out
 
 
 INITIAL_BACKOFF = 10.0
@@ -2897,6 +3002,286 @@ async def monitor_all_villages(
                     village.village_id or state.village_id
                 )
             )
+
+            # 4.1.b3 Accademia (gid 22) — Auto-Ricerca Truppe: un'unita'
+            # autorizzata in allowed_units ma non ancora sbloccata viene
+            # ricercata automaticamente prima di ogni addestramento, se
+            # prerequisiti e risorse sono soddisfatti. Rispetta la Grain
+            # Safety Net, la riserva grano configurata e il freeze
+            # espansione; throttled e pausato come gli altri moduli.
+            try:
+                vcfg_ac = settings.village_config_for(
+                    village.name, target_vid
+                )
+                academy = next(
+                    (
+                        f for f in state.interior_fields()
+                        if f.gid == GID_ACADEMY and f.level > 0
+                    ),
+                    None,
+                )
+                wanted_units: list[str] = []
+                for _u in (
+                    (vcfg_ac.allowed_units or vcfg_ac.priority_units)
+                    if vcfg_ac is not None
+                    else []
+                ):
+                    _k = unit_label_to_key(_u) or resolve_troop_slot(
+                        str(_u), str(settings.tribe or "")
+                    )
+                    if _k and _k not in wanted_units:
+                        wanted_units.append(_k)
+                last_ac = _last_academy_try.get(vname, 0.0)
+                if (
+                    wanted_units
+                    and academy is not None
+                    and not emergency_locked
+                    and (time.time() - last_ac) >= ACADEMY_RETRY_SECONDS
+                    and _module_pause_left(
+                        settings,
+                        str(village.village_id or village.name or "0"),
+                        "academy",
+                        resources=state.resources,
+                    )
+                    <= 0
+                ):
+                    _last_academy_try[vname] = time.time()
+                    ac_state = await observer.read_academy_state(
+                        academy.slot_id, village.village_id
+                    )
+                    if not ac_state:
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="academy",
+                            decision="UNIT_RESEARCH",
+                            outcome=DECISION_OUTCOME_SKIPPED,
+                            reason=(
+                                "Accademia: stato ricerche non "
+                                "leggibile dalla pagina"
+                            ),
+                        )
+                    elif ac_state.get("research_active"):
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="academy",
+                            decision="UNIT_RESEARCH",
+                            outcome=DECISION_OUTCOME_SKIPPED,
+                            reason=(
+                                "Accademia: ricerca gia' in corso "
+                                f"({', '.join(ac_state.get('researching') or [])})"
+                            ),
+                        )
+                    else:
+                        # Tie-breaker 'gia' sbloccata': le unita' assenti
+                        # dal DOM Accademia ma soggette a ricerca si
+                        # verificano sugli input tN del trainer.
+                        _absent = {
+                            k
+                            for k in wanted_units
+                            if k in UNIT_ACADEMY_LEVELS
+                            and k not in (ac_state.get("units") or {})
+                        }
+                        trainable: set[str] = set()
+                        if _absent:
+                            for _f in state.interior_fields():
+                                _gid = int(_f.gid or 0)
+                                if _gid in (
+                                    GID_BARRACKS,
+                                    GID_STABLE,
+                                    GID_WORKSHOP,
+                                    GID_RESIDENCE,
+                                    GID_PALACE,
+                                ) and any(
+                                    trainer_gid_for_unit(k)
+                                    in (_gid, GID_RESIDENCE)
+                                    for k in _absent
+                                ):
+                                    trainable |= (
+                                        await observer.read_trainable_units(
+                                            _f.slot_id, village.village_id
+                                        )
+                                    )
+                        pending = _academy_pending_units(
+                            wanted_units,
+                            ac_state,
+                            int(academy.level or 0),
+                            trainable=trainable,
+                        )
+                        pick = next(
+                            (p for p in pending if p.get("actionable")),
+                            None,
+                        )
+                        if pick is None:
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="academy",
+                                decision="UNIT_RESEARCH",
+                                outcome=DECISION_OUTCOME_SKIPPED,
+                                reason=(
+                                    pending[0]["reason"]
+                                    if pending
+                                    else "Tutte le unita' autorizzate "
+                                         "sono gia' ricercate"
+                                ),
+                                context={
+                                    "pending": [
+                                        p.get("unit") for p in pending
+                                    ],
+                                },
+                            )
+                        elif expansion_freeze(state, settings):
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="academy",
+                                decision="UNIT_RESEARCH",
+                                outcome=DECISION_OUTCOME_BLOCKED,
+                                reason=(
+                                    "Freeze espansione: ricerca "
+                                    f"{pick['label']} sospesa finche' "
+                                    "i 3 coloni non sono pronti"
+                                ),
+                            )
+                        else:
+                            # Guard risorse: il costo letto non deve
+                            # superare lo stock; il grano rispetta la
+                            # riserva configurata e la soglia netta.
+                            costs = {
+                                str(k): int(v or 0)
+                                for k, v in (
+                                    pick.get("costs") or {}
+                                ).items()
+                            }
+                            stock_ok = all(
+                                int(getattr(state.resources, r, 0) or 0)
+                                >= int(costs.get(r) or 0)
+                                for r in ("wood", "clay", "iron", "crop")
+                            )
+                            net = net_crop(state)
+                            thr = float(
+                                crop_threshold(state, settings) or 0.0
+                            )
+                            granary = int(
+                                state.resources.granary_capacity or 0
+                            )
+                            crop_reserve = int(
+                                granary
+                                * max(
+                                    0.0,
+                                    settings.replenishment.crop_reserve_pct,
+                                )
+                            )
+                            crop_after = (
+                                int(state.resources.crop or 0)
+                                - int(costs.get("crop") or 0)
+                            )
+                            if not stock_ok:
+                                _record_decision(
+                                    settings,
+                                    state=state, village=village,
+                                    module="academy",
+                                    decision="UNIT_RESEARCH",
+                                    outcome=DECISION_OUTCOME_SKIPPED,
+                                    reason=(
+                                        f"Ricerca {pick['label']} "
+                                        "rinviata: risorse "
+                                        "insufficienti "
+                                        f"(costo {costs})"
+                                    ),
+                                    context={"costs": costs},
+                                )
+                            elif (
+                                net is not None
+                                and thr > 0
+                                and float(net) < thr
+                            ):
+                                _record_decision(
+                                    settings,
+                                    state=state, village=village,
+                                    module="academy",
+                                    decision="UNIT_RESEARCH",
+                                    outcome=DECISION_OUTCOME_SKIPPED,
+                                    reason=(
+                                        f"Ricerca {pick['label']} "
+                                        "sospesa: bilancio grano "
+                                        "sotto soglia "
+                                        f"({net} < {thr})"
+                                    ),
+                                    context={
+                                        "net_crop": float(net),
+                                        "threshold": float(thr),
+                                    },
+                                )
+                            elif crop_after < crop_reserve:
+                                _record_decision(
+                                    settings,
+                                    state=state, village=village,
+                                    module="academy",
+                                    decision="UNIT_RESEARCH",
+                                    outcome=DECISION_OUTCOME_SKIPPED,
+                                    reason=(
+                                        f"Ricerca {pick['label']} "
+                                        "sospesa: intaccherebbe la "
+                                        "riserva grano "
+                                        f"({crop_after} < {crop_reserve})"
+                                    ),
+                                    context={
+                                        "crop_reserve": crop_reserve,
+                                    },
+                                )
+                            else:
+                                ac_res = await executor.execute(
+                                    Action(
+                                        type=ActionType.RESEARCH_UNIT,
+                                        params={
+                                            "academy_slot": academy.slot_id,
+                                            "unit": pick["unit"],
+                                            "label": pick["label"],
+                                        },
+                                        reason=(
+                                            "Auto-ricerca Accademia: "
+                                            f"{pick['label']} "
+                                            "(unita' autorizzata "
+                                            "non ancora sbloccata)"
+                                        ),
+                                    ),
+                                    village_id=target_vid,
+                                )
+                                logger.info(
+                                    "%s Accademia: %s",
+                                    vprefix, ac_res.message,
+                                )
+                                _record_decision(
+                                    settings,
+                                    state=state, village=village,
+                                    module="academy",
+                                    decision="UNIT_RESEARCH",
+                                    outcome=(
+                                        DECISION_OUTCOME_EXECUTED
+                                        if ac_res.success
+                                        else DECISION_OUTCOME_BLOCKED
+                                    ),
+                                    reason=(
+                                        f"Ricerca {pick['label']} in "
+                                        f"Accademia: {ac_res.message}"
+                                    ),
+                                    context={
+                                        "unit": pick["unit"],
+                                        "academy_level": int(
+                                            academy.level or 0
+                                        ),
+                                        "costs": costs,
+                                    },
+                                )
+            except Exception as ac_exc:
+                logger.warning(
+                    "%s Errore automazione Accademia: %s",
+                    vprefix, ac_exc,
+                )
+
             if emergency_locked:
                 logger.info(
                     "%s Replenishment congelato: emergenza difesa attiva.",

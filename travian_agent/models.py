@@ -169,6 +169,43 @@ STATIC_TROOP_LABELS: dict[str, str] = {
 }
 
 
+# Livello Accademia (gid 22) richiesto per ricercare ciascuna unita' T4.x.
+# Le unita' assenti dalla tabella NON richiedono ricerca: truppa base di
+# tribu' (t1/t11/t21, sbloccata di default) e coloni (t10/t20/t30, sempre
+# addestrabili in Residenza/Palazzo). La pagina dell'Accademia resta
+# l'autorita' finale: il flag 'ricercabile' letto dal DOM prevale sempre
+# sui valori della tabella, usata solo per motivare i skip del planner.
+UNIT_ACADEMY_LEVELS: dict[str, int] = {
+    # --- ROMANI ---
+    "t2": 1,    # Pretoriano
+    "t3": 5,    # Imperiano
+    "t4": 5,    # Equites Legatus
+    "t5": 5,    # Equites Imperatoris
+    "t6": 15,   # Equites Caesaris
+    "t7": 10,   # Ariete
+    "t8": 15,   # Catapulta da fuoco
+    "t9": 20,   # Senatore
+    # --- TEUTONI ---
+    "t12": 1,   # Lanciere
+    "t13": 3,   # Guerriero con l'ascia
+    "t14": 1,   # Spia
+    "t15": 15,  # Paladino
+    "t16": 15,  # Cavaliere Teutonico
+    "t17": 10,  # Ariete
+    "t18": 15,  # Catapulta
+    "t19": 20,  # Capotribu'
+    # --- GALLI ---
+    "t22": 1,   # Spadaccino
+    "t23": 1,   # Tracciatore
+    "t24": 5,   # Fulmine di Teutates
+    "t25": 5,   # Cavaliere Druido
+    "t26": 15,  # Eduano
+    "t27": 10,  # Ariete
+    "t28": 15,  # Trabucco
+    "t29": 20,  # Comandante
+}
+
+
 # gid degli edifici Travian rilevanti per la logica di storage
 GID_EMPTY = 0       # area di costruzione vuota (dorf2)
 GID_WAREHOUSE = 10  # magazzino (legno/argilla/ferro)
@@ -317,6 +354,7 @@ class ActionType(str, Enum):
     SEND_CUSTOM_RAID = "send_custom_raid"  # invio raid dinamico a coordinate libere (AI Scout Brain)
     SEND_SCOUT = "send_scout"          # missione di spionaggio (esploratori) pre-raid
     UPGRADE_UNITS = "upgrade_units"  # potenziamento unita' in Fucina (smithy_auto_upgrade)
+    RESEARCH_UNIT = "research_unit"  # ricerca unita' in Accademia (gid 22)
     FOUND_VILLAGE = "found_village"  # fondazione nuovo villaggio via mappa
     START_CELEBRATION = "start_celebration"  # festa al Municipio (punti cultura)
     ALERT = "alert"          # es. attacco in arrivo: notifica senza agire
