@@ -1796,11 +1796,36 @@ class TravianParser:
             const stripInv = (s) => (s || '').replace(
                 /[‎‏‪-‮ ­﻿−]/g, ''
             );
-            const box = document.querySelector(
+            let box = document.querySelector(
                 '#movements, .troopMovements, ' +
                 '[id*="troopMovement" i], #sidebarBoxMovements, ' +
                 '.movement'
             );
+            if (!box) {
+                // Fallback strutturale T4.6: qualunque contenitore con
+                // una riga timer e testo movimenti truppe (es. '1
+                // Attacco'), esclusa la coda di costruzione.
+                const scope = document.querySelector(
+                    '#content, .village1, #village1'
+                ) || document.body;
+                const reMv = new RegExp(
+                    'truppe in|attacco|rinforz|raid|troops|attack|' +
+                    'incoming|outgoing|in arrivo|in partenza', 'i'
+                );
+                box = Array.from(scope.querySelectorAll(
+                    'table, .box, [class*="troop" i], ' +
+                    '[class*="outgoing" i], [class*="incoming" i]'
+                )).find(el => {
+                    if (el.closest('.buildingList, #building_contract')) {
+                        return false;
+                    }
+                    if (!el.querySelector(
+                        '.timer, span.timer, .dur')) {
+                        return false;
+                    }
+                    return reMv.test(stripInv(el.innerText || ''));
+                }) || null;
+            }
             if (!box) return { incoming: [], outgoing: [] };
             const incoming = [];
             const outgoing = [];
@@ -1854,11 +1879,13 @@ class TravianParser:
                     mtype = 'reinforce';
                 }
                 // Direzione: classi icona att1/def1 (arrivo) vs
-                // att3/def3 (partenza), testo 'in arrivo'/'verso',
-                // o classe riga.
+                // att2/att3/def2/def3 (partenza), classe riga, testo
+                // 'in arrivo'/'verso' o intestazione della sezione.
                 let dir = '';
                 if (/att1|def1|in\\b/.test(imgKey)) dir = 'in';
-                else if (/att3|def3|out\\b/.test(imgKey)) dir = 'out';
+                else if (/att[23]|def[23]|out\\b/.test(imgKey)) {
+                    dir = 'out';
+                }
                 if (!dir) {
                     const cls = ' ' +
                         (row.className || '').toLowerCase() + ' ';
@@ -1871,6 +1898,33 @@ class TravianParser:
                     } else if (/verso|nach|to |outgoing|partenz/.test(
                         txtLow)) {
                         dir = 'out';
+                    }
+                }
+                if (!dir) {
+                    // Intestazione della sezione genitore: 'truppe in
+                    // uscita'/'outgoing'/'in partenza' -> out;
+                    // 'truppe in arrivo'/'incoming' -> in.
+                    const sec = row.closest(
+                        'table, ul, .box, ' +
+                        '[class*="outgoing" i], [class*="incoming" i]'
+                    ) || box;
+                    const secCls = ' ' +
+                        (sec.className || '').toLowerCase() + ' ';
+                    const headEl = sec.querySelector(
+                        'thead, th, .title, h4, h5'
+                    );
+                    const prevEl = sec.previousElementSibling;
+                    const headTxt = stripInv(
+                        (headEl ? (headEl.innerText || '') : '') + ' ' +
+                        (prevEl ? (prevEl.innerText || '') : '')
+                    ).toLowerCase();
+                    const reOut = /truppe in uscita|outgoing|in partenza|in viaggio/;
+                    const reIn = /truppe in arrivo|incoming|in arrivo|ankomm/;
+                    if (/outgoing/.test(secCls) || reOut.test(headTxt)) {
+                        dir = 'out';
+                    } else if (/incoming/.test(secCls) ||
+                               reIn.test(headTxt)) {
+                        dir = 'in';
                     }
                 }
                 if (!dir) dir = 'in';
@@ -1947,23 +2001,51 @@ class TravianParser:
         outg = [r for r in (raw.get("outgoing") or [])
                 if isinstance(r, dict)]
         if not inc and not outg:
-            # Diagnostica selettori: il box movimenti e' presente ma il
-            # parser non ha estratto righe — dump snippet DOM per
-            # allineare i selettori al markup reale del server.
+            # Diagnostica selettori: la pagina contiene testo movimenti
+            # ('truppe in '/'troops') ma il parser non ha estratto righe
+            # — dump HTML del nodo che lo contiene per allineare i
+            # selettori al markup reale del server.
             try:
                 _snip = await self.page.evaluate(
                     """() => {
-                        const el = document.querySelector(
-                            '#movements, .movements, ' +
-                            '[class*="movement"]'
+                        const txt = (document.body.innerText || '')
+                            .toLowerCase();
+                        if (!txt.includes('truppe in') &&
+                            !txt.includes('troops')) {
+                            return '';
+                        }
+                        let best = document.querySelector(
+                            '#movements, .troopMovements, ' +
+                            '[id*="troopMovement" i], ' +
+                            '#sidebarBoxMovements, .movement'
                         );
-                        return el ? (el.outerHTML || '').slice(0, 800)
-                                  : '';
+                        if (!best) {
+                            document.querySelectorAll(
+                                'table, .box, [class*="troop" i], ' +
+                                '[class*="incoming" i], ' +
+                                '[class*="outgoing" i], ' +
+                                'section, aside, div'
+                            ).forEach(el => {
+                                const t = (el.innerText || '')
+                                    .toLowerCase();
+                                if (!t.includes('truppe in') &&
+                                    !t.includes('troops')) {
+                                    return;
+                                }
+                                if (!best ||
+                                    t.length <
+                                        (best.innerText || '').length) {
+                                    best = el;
+                                }
+                            });
+                        }
+                        return best
+                            ? (best.outerHTML || '').slice(0, 800) : '';
                     }"""
                 )
                 if _snip:
                     logger.warning(
-                        "Radar: box movimenti dorf1 presente ma 0 righe "
+                        "Radar: testo 'truppe in' presente ma 0 righe "
                         "parse — snippet DOM: %s", _snip,
                     )
             except Exception:  # noqa: BLE001
@@ -2209,36 +2291,93 @@ class TravianParser:
         # copre i mercanti (che il rally overview non elenca).
         dorf1_in, dorf1_out = await self.read_dorf1_movements()
         if not rally_slot:
-            now_only = time.time()
-
-            def _build_only(items: list[dict]) -> list[IncomingAttack]:
-                moves: list[IncomingAttack] = []
-                for item in items or []:
-                    secs = safe_int(item.get("seconds") or 0)
-                    cx = item.get("cx")
-                    cy = item.get("cy")
-                    moves.append(
-                        IncomingAttack(
-                            movement_type=str(
-                                item.get("type") or "unknown"
-                            ),
-                            seconds_remaining=secs,
-                            troop_count=safe_int(item.get("count") or 0),
-                            arrival_ts=now_only + secs,
-                            attacker=str(item.get("attacker") or ""),
-                            label=str(item.get("label") or ""),
-                            counterpart_x=(
-                                safe_int(cx) if cx is not None else None
-                            ),
-                            counterpart_y=(
-                                safe_int(cy) if cy is not None else None
-                            ),
-                        )
+            # Auto-resolve slot Piazza d'Armi dal DOM: link gid=16 o
+            # area/link dorf2 con titolo 'Punto di Raduno'/'Rally'.
+            try:
+                rally_slot = int(
+                    await self.page.evaluate(
+                        """() => {
+                            const a16 = document.querySelector(
+                                'a[href*="gid=16"]'
+                            );
+                            if (a16) {
+                                const m = (a16.getAttribute('href') || '')
+                                    .match(/id=(\\d+)/);
+                                if (m) return parseInt(m[1], 10);
+                                return 39;  // slot classico rally T4
+                            }
+                            const area = Array.from(
+                                document.querySelectorAll(
+                                    'a[href*="id="], area[href*="id="]'
+                                )
+                            ).find(a => {
+                                const label = (
+                                    (a.getAttribute('title') || '') +
+                                    ' ' + (a.getAttribute('alt') || '')
+                                ).toLowerCase();
+                                return /raduno|rally|versammlung/
+                                    .test(label);
+                            });
+                            if (area) {
+                                const m = (
+                                    area.getAttribute('href') || ''
+                                ).match(/id=(\\d+)/);
+                                if (m) return parseInt(m[1], 10);
+                            }
+                            return 0;
+                        }"""
                     )
-                return moves
+                    or 0
+                )
+            except Exception:  # noqa: BLE001
+                rally_slot = 0
 
-            return _build_only(dorf1_in), _build_only(dorf1_out)
-        url = f"{selectors.PATH_BUILD}?id={rally_slot}"
+        _now_only = time.time()
+
+        def _build_only(items: list[dict]) -> list[IncomingAttack]:
+            moves: list[IncomingAttack] = []
+            for item in items or []:
+                secs = safe_int(item.get("seconds") or 0)
+                cx = item.get("cx")
+                cy = item.get("cy")
+                moves.append(
+                    IncomingAttack(
+                        movement_type=str(
+                            item.get("type") or "unknown"
+                        ),
+                        seconds_remaining=secs,
+                        troop_count=safe_int(item.get("count") or 0),
+                        arrival_ts=_now_only + secs,
+                        attacker=str(item.get("attacker") or ""),
+                        label=str(item.get("label") or ""),
+                        counterpart_x=(
+                            safe_int(cx) if cx is not None else None
+                        ),
+                        counterpart_y=(
+                            safe_int(cy) if cy is not None else None
+                        ),
+                    )
+                )
+            return moves
+
+        _coordless = any(
+            r.get("cx") is None or r.get("cy") is None
+            for r in (dorf1_in or []) + (dorf1_out or [])
+        )
+        _use_gid_url = False
+        if not rally_slot:
+            if not _coordless:
+                # Nessuno slot risolto e nessun vantaggio atteso dal
+                # rally overview -> solo righe dorf1.
+                return _build_only(dorf1_in), _build_only(dorf1_out)
+            # Righe senza coordinate e slot ignoto: ultimo tentativo
+            # via build.php?gid=16&tt=1 (routing per gid, espone le
+            # tabelle con link mappa (x|y) e nomi target).
+            _use_gid_url = True
+        if _use_gid_url:
+            url = f"{selectors.PATH_BUILD}?gid=16&tt=1"
+        else:
+            url = f"{selectors.PATH_BUILD}?id={rally_slot}"
         if village_id:
             url += f"&newdid={village_id}"
         try:
@@ -2247,14 +2386,13 @@ class TravianParser:
             # espone i link mappa (x|y) e i nomi dei target — la visita
             # e' forzata anche se l'URL punta gia' all'edificio ma su un
             # altro tab (es. tt=1 'Invia truppe' dopo un'azione bot).
-            _coordless = any(
-                r.get("cx") is None or r.get("cy") is None
-                for r in (dorf1_in or []) + (dorf1_out or [])
-            )
-            _need_nav = (
-                f"id={rally_slot}" not in _url_now
-                or (_coordless and "tt=" in _url_now)
-            )
+            if _use_gid_url:
+                _need_nav = "gid=16" not in _url_now
+            else:
+                _need_nav = (
+                    f"id={rally_slot}" not in _url_now
+                    or (_coordless and "tt=" in _url_now)
+                )
             if _need_nav:
                 await self._goto(
                     _abs_game_url(self.page.url or "", url),
