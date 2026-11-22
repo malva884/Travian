@@ -282,6 +282,49 @@ def _hero_payload(hero_mgr: Any, account_id: str = "") -> dict:
     }
 
 
+def _radar_payload(
+    account_id: str,
+    village: Village,
+    *,
+    now: float | None = None,
+) -> list[dict]:
+    """Vettori movimento live del villaggio per il RADAR SETTORE.
+
+    Legge il RadarStore persistito (mercanti, avventure, raid/attacchi)
+    e completa le coordinate mancanti con quelle del villaggio radar:
+    un inbound senza origine punta comunque verso il centro (to_* =
+    villaggio) e l'edge-projection resta compito del frontend.
+    """
+    if account_id is None:
+        return []
+    try:
+        from .radar_store import radar_store
+
+        rs = radar_store(str(account_id))
+        rs.prune()
+        moves = rs.movements_for(str(village.name or village.village_id))
+    except Exception:  # noqa: BLE001
+        return []
+    vx = getattr(village, "x", None)
+    vy = getattr(village, "y", None)
+    out: list[dict] = []
+    for mv in moves:
+        m = dict(mv)
+        direction = str(m.get("direction") or "")
+        if direction == "inbound":
+            if m.get("to_x") is None:
+                m["to_x"] = vx
+            if m.get("to_y") is None:
+                m["to_y"] = vy
+        else:  # outbound | return
+            if m.get("from_x") is None:
+                m["from_x"] = vx
+            if m.get("from_y") is None:
+                m["from_y"] = vy
+        out.append(m)
+    return out
+
+
 def _village_payload(
     village: Village,
     state: GameState | None,
@@ -408,6 +451,11 @@ def _village_payload(
         },
         "incoming_attacks": incoming_payload,
         "outgoing_attacks": [_mv(m) for m in moves_out],
+        # Vettori movimento live del RADAR SETTORE (RadarStore
+        # persistente: mercanti, avventure eroe, raid/attacchi).
+        "radar_movements": _radar_payload(
+            str(getattr(settings, "account_id", "") or ""), village
+        ),
         "building_queue": queue,
         "projected_timeline": timeline_payload,
         "slots": slots,

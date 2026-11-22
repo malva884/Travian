@@ -377,6 +377,12 @@ class IncomingAttack:
     arrival_ts: float = 0.0        # epoch previsto di impatto
     attacker: str = ""             # nome attaccante/origine, se leggibile
     label: str = ""                # testo grezzo della riga (debug)
+    # Coordinate della controparte lette dalla riga movimento (link
+    # karte.php?x=..&y=.. o testo '(x|y)'): origine attaccante per gli
+    # 'in', destinazione per gli 'out'. None = non leggibile (radar
+    # proietta il vettore dal bordo esterno).
+    counterpart_x: int | None = None
+    counterpart_y: int | None = None
 
     def is_likely_fake(self, troop_threshold: int = 5) -> bool:
         """True se l'allarme e' probabilmente un fake/basso rischio.

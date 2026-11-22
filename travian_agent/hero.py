@@ -518,7 +518,9 @@ class HeroManager:
                 and state["health"] >= cfg.min_health_to_adventure
             )
             if can_send:
-                sent = await self._send_to_adventure(browser, prefix)
+                sent = await self._send_to_adventure(
+                    browser, prefix, settings=settings
+                )
                 self.snapshot["last_action"] = (
                     "spedito in avventura" if sent else "spedizione avventura fallita"
                 )
@@ -758,7 +760,13 @@ class HeroManager:
     # ------------------------------------------------------------------
     # Spedizione avventura
     # ------------------------------------------------------------------
-    async def _send_to_adventure(self, browser: "TravianBrowser", prefix: str) -> bool:
+    async def _send_to_adventure(
+        self,
+        browser: "TravianBrowser",
+        prefix: str,
+        *,
+        settings: "Settings | None" = None,
+    ) -> bool:
         """Tab avventure -> prima avventura disponibile -> conferma invio."""
         page = browser.page
         assert page is not None
@@ -766,6 +774,53 @@ class HeroManager:
             # 1. Naviga esplicitamente alla pagina pulita delle avventure
             await self._goto_hero_tab(browser, _TABS_ADVENTURES)
             await sleep_human(1.5, 2.2)
+
+            # Radar Settore: coordinate e durata della riga avventura
+            # scelta — catturati PRIMA del click (il DOM cambia dopo).
+            adv_info: dict = {}
+            try:
+                adv_info = await page.evaluate("""
+                    () => {
+                        const rows = Array.from(document.querySelectorAll(
+                            '#adventures tr, .adventureList tr, ' +
+                            'table.adventures tr, .adventureList .adventure, ' +
+                            'tr.adventureRow'
+                        ));
+                        const btnRe = /esplora|explore|inizia|start|vai|go/i;
+                        let row = rows.find(r => {
+                            const els = Array.from(r.querySelectorAll(
+                                'button, a.button, a.textButtonV1, ' +
+                                'input[type="submit"], input[type="button"]'
+                            ));
+                            return els.some(e =>
+                                !e.disabled && e.offsetParent !== null &&
+                                (btnRe.test(e.innerText || e.value || '') ||
+                                 btnRe.test(e.getAttribute('href') || '') ||
+                                 e.classList.contains('textButtonV1'))
+                            );
+                        });
+                        if (!row && rows.length) row = rows[0];
+                        if (!row) return {};
+                        const txt = (row.innerText || '').replace(/\\s+/g, ' ');
+                        const cm = txt.match(/\\((-?\\d{1,3})\\s*\\|\\s*(-?\\d{1,3})\\)/);
+                        const tm = txt.match(
+                            /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
+                        );
+                        return {
+                            x: cm ? parseInt(cm[1], 10) : null,
+                            y: cm ? parseInt(cm[2], 10) : null,
+                            secs: tm
+                                ? (parseInt(tm[1] || 0, 10) * 86400) +
+                                  (parseInt(tm[2] || 0, 10) * 3600) +
+                                  (parseInt(tm[3] || 0, 10) * 60) +
+                                  parseInt(tm[4] || 0, 10)
+                                : 0,
+                            label: txt.slice(0, 120),
+                        };
+                    }
+                """) or {}
+            except Exception:  # noqa: BLE001
+                adv_info = {}
 
             # 2. Cerca e clicca sul pulsante 'Esplora' / 'Inizia' nella tabella delle avventure
             clicked = await page.evaluate("""
@@ -825,6 +880,83 @@ class HeroManager:
                                 """)
             await sleep_human(1.0, 1.8)
             logger.info("%s Eroe spedito in avventura con successo!", prefix)
+
+            # Radar Settore: vettore avventura eroe (andata + rientro).
+            # Coordinate/ETA dalla riga catturata pre-click; il villaggio
+            # base dell'eroe si risolve dallo snapshot ('current_village')
+            # o dal nome del prefisso di log.
+            try:
+                secs = float(adv_info.get("secs") or 0.0)
+                adv_x = adv_info.get("x")
+                adv_y = adv_info.get("y")
+                if secs > 0:
+                    vname = str(
+                        (self.snapshot or {}).get("current_village") or ""
+                    )
+                    sx = sy = None
+                    if not vname:
+                        vname = prefix.strip("[] ").split()[0] \
+                            if prefix.strip("[] ") else ""
+                    if settings is not None and vname:
+                        try:
+                            vcfg = settings.village_config_for(vname)
+                            if vcfg and vcfg.x is not None:
+                                sx, sy = vcfg.x, vcfg.y
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if vname:
+                        from .radar_store import (
+                            CAT_HERO_ADVENTURE,
+                            radar_store,
+                        )
+                        rs = radar_store(
+                            getattr(settings, "account_id", "")
+                            or self.account_id
+                        )
+                        now = time.time()
+                        label = (
+                            f"Avventura ({adv_x}|{adv_y})"
+                            if adv_x is not None
+                            else "Avventura eroe"
+                        )
+                        rs.register(
+                            vname,
+                            {
+                                "category": CAT_HERO_ADVENTURE,
+                                "direction": "outbound",
+                                "from_x": sx,
+                                "from_y": sy,
+                                "to_x": adv_x,
+                                "to_y": adv_y,
+                                "counterpart": label,
+                                "label": label,
+                                "started_at": now,
+                                "arrives_at": now + secs,
+                                "details": {"troops_summary": "Eroe"},
+                            },
+                        )
+                        # Rientro automatico verso il villaggio base.
+                        rs.register(
+                            vname,
+                            {
+                                "category": CAT_HERO_ADVENTURE,
+                                "direction": "return",
+                                "from_x": adv_x,
+                                "from_y": adv_y,
+                                "to_x": sx,
+                                "to_y": sy,
+                                "counterpart": "Rientro eroe",
+                                "label": "Rientro eroe",
+                                "started_at": now + secs,
+                                "arrives_at": now + secs * 2,
+                                "details": {"troops_summary": "Eroe"},
+                            },
+                        )
+            except Exception as _rad_exc:  # noqa: BLE001
+                logger.debug(
+                    "%s Registrazione radar avventura fallita: %s",
+                    prefix, _rad_exc,
+                )
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("%s Spedizione avventura fallita: %s", prefix, exc)

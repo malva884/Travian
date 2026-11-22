@@ -1820,12 +1820,42 @@ class TravianParser:
                             other = (pLink.innerText || '').trim();
                         }
 
+                        // Coordinate controparte: href karte.php?x=..&y=..
+                        // (o /karte?x=) poi pattern '(x|y)' nella riga.
+                        let cx = null, cy = null;
+                        const mapLink = row.querySelector(
+                            'a[href*="karte"], a[href*="/map?x="]'
+                        );
+                        if (mapLink) {
+                            const href = mapLink.getAttribute('href') || '';
+                            const hm = href.match(
+                                /[?&]x=(-?\\d+)[^0-9-]*(?:[?&]|\\&)y=(-?\\d+)|x=(-?\\d+).*?y=(-?\\d+)/
+                            );
+                            if (hm) {
+                                cx = parseInt(hm[1] || hm[3], 10);
+                                cy = parseInt(hm[2] || hm[4], 10);
+                            }
+                        }
+                        if (cx === null || isNaN(cx)) {
+                            const cm = rowText.match(
+                                /\\((-?\\d{1,3})\\s*\\|\\s*(-?\\d{1,3})\\)/
+                            );
+                            if (cm) {
+                                cx = parseInt(cm[1], 10);
+                                cy = parseInt(cm[2], 10);
+                            }
+                        }
+                        if (isNaN(cx)) cx = null;
+                        if (isNaN(cy)) cy = null;
+
                         return {
                             type: mtype,
                             seconds: secs,
                             count: count,
                             attacker: other,
                             label: rowText.slice(0, 160),
+                            cx: cx,
+                            cy: cy,
                         };
                     };
                     const incoming = [];
@@ -1867,6 +1897,8 @@ class TravianParser:
             moves: list[IncomingAttack] = []
             for item in items or []:
                 secs = safe_int(item.get("seconds") or 0)
+                cx = item.get("cx")
+                cy = item.get("cy")
                 moves.append(
                     IncomingAttack(
                         movement_type=str(item.get("type") or "unknown"),
@@ -1875,6 +1907,12 @@ class TravianParser:
                         arrival_ts=now + secs,
                         attacker=str(item.get("attacker") or ""),
                         label=str(item.get("label") or ""),
+                        counterpart_x=(
+                            safe_int(cx) if cx is not None else None
+                        ),
+                        counterpart_y=(
+                            safe_int(cy) if cy is not None else None
+                        ),
                     )
                 )
             return moves

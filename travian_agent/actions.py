@@ -17,9 +17,16 @@ from .models import (
     ActionType,
     STATIC_TROOP_LABELS,
 )
+from .radar_store import (
+    CAT_MERCHANT,
+    CAT_OUTGOING_ATTACK,
+    CAT_OUTGOING_RAID,
+    radar_store,
+)
 from .server_profile import ServerProfile, profile_for_url
 from .stealth import resource_eta_seconds
 from .telemetry_capture import capture_anomaly
+from .war import map_distance, travel_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -1646,9 +1653,11 @@ class ActionExecutor:
         # Identita' del mittente per i log (nome + coordinate se note)
         sender_name = await self._active_village_name(page) or f"newdid {village_id}"
         sender_coords = ""
+        sx = sy = None
         try:
             s_cfg = self.settings.village_config_for(village_id=village_id)
             if s_cfg and s_cfg.x is not None and s_cfg.y is not None:
+                sx, sy = s_cfg.x, s_cfg.y
                 sender_coords = f"({s_cfg.x}|{s_cfg.y})"
         except Exception:  # noqa: BLE001
             pass
@@ -2074,6 +2083,27 @@ class ActionExecutor:
         await self._click_first(page, selectors.MARKET_CONFIRM_BUTTON)
         await sleep_human(0.5, 1.0)
 
+        # Radar Settore: vettore mercanti immediato (outbound + ritorno).
+        # La pagina corrente mostra gia' la conferma/tabella 'Mercanti in
+        # viaggio' — la lettura ETA non costa navigazioni extra.
+        try:
+            await self._register_merchant_moves(
+                page,
+                village_key=str(
+                    sender_name or village_id
+                ),
+                sx=sx,
+                sy=sy,
+                tx=int(tx) if tx is not None else None,
+                ty=int(ty) if ty is not None else None,
+                target_label=str(target or ""),
+                resources=resources_dict,
+            )
+        except Exception as _rad_exc:
+            logger.debug(
+                "Registrazione radar mercanti fallita: %s", _rad_exc
+            )
+
         logger.info(
             "Risorse inviate con successo a '%s' (%s|%s) dal mercato slot %s",
             target, tx, ty, market_slot
@@ -2319,6 +2349,36 @@ class ActionExecutor:
 
         # Alcune versioni mostrano una pagina di conferma prima del lancio
         await self._click_first(page, selectors.MAP_SETTLE_CONFIRM, timeout_ms=1500)
+
+        # Radar Settore: le righe 'tr.out' visibili dopo il lancio
+        # alimentano i vettori raid in uscita (ETA reale dal DOM).
+        try:
+            vname_rad = (
+                await self._active_village_name(page)
+                or f"newdid {village_id}"
+            )
+            _sx = _sy = None
+            try:
+                _scfg = self.settings.village_config_for(
+                    village_id=village_id
+                )
+                if _scfg and _scfg.x is not None:
+                    _sx, _sy = _scfg.x, _scfg.y
+            except Exception:  # noqa: BLE001
+                pass
+            _rows = await self._scrape_outgoing_rows(page)
+            if _rows:
+                self._register_outgoing_radar(
+                    village_key=str(vname_rad),
+                    sx=_sx,
+                    sy=_sy,
+                    rows=_rows,
+                    category=CAT_OUTGOING_RAID,
+                )
+        except Exception as _rad_exc:
+            logger.debug(
+                "Registrazione radar raid fallita: %s", _rad_exc
+            )
 
         logger.info(
             "Raid avviato da farm list (%s/%s target) nel villaggio %s",
@@ -2841,6 +2901,73 @@ class ActionExecutor:
                     "Raid dinamico confermato a (%s|%s) con truppe %s",
                     tx, ty, troops,
                 )
+                # Radar Settore: vettore raid in uscita. L'ETA si legge
+                # dalle righe 'tr.out' se la pagina mostra gia' la
+                # panoramica movimenti; altrimenti si stima da
+                # distanza/velocita' truppe (scalata server_speed).
+                try:
+                    vname_rad = (
+                        await self._active_village_name(page)
+                        or f"newdid {village_id}"
+                    )
+                    _sx = _sy = None
+                    try:
+                        _scfg = self.settings.village_config_for(
+                            village_id=village_id
+                        )
+                        if _scfg and _scfg.x is not None:
+                            _sx, _sy = _scfg.x, _scfg.y
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _rows = await self._scrape_outgoing_rows(page)
+                    _secs = 0.0
+                    for _r in _rows:
+                        if _r.get("cx") == int(tx) and _r.get("cy") == int(ty):
+                            _secs = float(_r.get("secs") or 0.0)
+                            break
+                    if _secs <= 0 and _sx is not None:
+                        _secs = travel_seconds(
+                            troops, _sx, _sy, int(tx), int(ty)
+                        ) / max(
+                            0.5,
+                            float(getattr(
+                                self.settings, "server_speed", 1.0
+                            ) or 1.0),
+                        )
+                    if _secs > 0:
+                        _troops_sum = ", ".join(
+                            f"{v} {STATIC_TROOP_LABELS.get(k, k)}"
+                            for k, v in troops.items()
+                            if int(v or 0) > 0
+                        )
+                        _rs = self._radar()
+                        if _rs is not None:
+                            _rs.register(
+                                str(vname_rad),
+                                {
+                                    "category": (
+                                        CAT_OUTGOING_ATTACK
+                                        if move_type == "3"
+                                        else CAT_OUTGOING_RAID
+                                    ),
+                                    "direction": "outbound",
+                                    "from_x": _sx,
+                                    "from_y": _sy,
+                                    "to_x": int(tx),
+                                    "to_y": int(ty),
+                                    "counterpart": f"({tx}|{ty})",
+                                    "label": f"({tx}|{ty})",
+                                    "started_at": time.time(),
+                                    "arrives_at": time.time() + _secs,
+                                    "details": {
+                                        "troops_summary": _troops_sum,
+                                    },
+                                },
+                            )
+                except Exception as _rad_exc:
+                    logger.debug(
+                        "Registrazione radar raid fallita: %s", _rad_exc
+                    )
                 await sleep_human(1.0, 2.5)
 
             except Exception as exc:
@@ -3250,6 +3377,263 @@ class ActionExecutor:
             True,
             f"upgrade fucina avviato per {outcome.get('unit')} "
             f"(liv. {outcome.get('level')})",
+        )
+
+    def _radar(self):
+        """RadarStore dell'account corrente (None se non inizializzabile)."""
+        try:
+            return radar_store(self.settings.account_id)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    async def _scrape_outgoing_rows(page) -> list[dict]:
+        """Righe 'tr.out' della panoramica movimenti sulla pagina corrente.
+
+        Ritorna [{secs, cx, cy, count, label}] — usato dopo un invio di
+        truppe (raid/attacco) per registrare il vettore sul radar senza
+        navigazioni aggiuntive. Lista vuota se il DOM non le espone.
+        """
+        try:
+            rows = await page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    const parseRow = (row) => {
+                        const rowText = (row.innerText || '').trim();
+                        const timerEl = row.querySelector(
+                            '.timer, span.timer, .dur'
+                        );
+                        const ttxt = timerEl
+                            ? (timerEl.textContent || '') : rowText;
+                        const m = ttxt.match(
+                            /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
+                        );
+                        let secs = 0;
+                        if (m) {
+                            secs =
+                                (parseInt(m[1] || 0, 10) * 86400) +
+                                (parseInt(m[2] || 0, 10) * 3600) +
+                                (parseInt(m[3] || 0, 10) * 60) +
+                                parseInt(m[4] || 0, 10);
+                        }
+                        let cx = null, cy = null;
+                        const mapLink = row.querySelector(
+                            'a[href*="karte"]'
+                        );
+                        if (mapLink) {
+                            const href =
+                                mapLink.getAttribute('href') || '';
+                            const hm = href.match(
+                                /x=(-?\\d+)[^0-9-]*y=(-?\\d+)/
+                            );
+                            if (hm) {
+                                cx = parseInt(hm[1], 10);
+                                cy = parseInt(hm[2], 10);
+                            }
+                        }
+                        if (cx === null) {
+                            const cm = rowText.match(
+                                /\\((-?\\d{1,3})\\s*\\|\\s*(-?\\d{1,3})\\)/
+                            );
+                            if (cm) {
+                                cx = parseInt(cm[1], 10);
+                                cy = parseInt(cm[2], 10);
+                            }
+                        }
+                        let count = 0;
+                        row.querySelectorAll('td, span').forEach(el => {
+                            const t = (el.innerText || '').trim();
+                            if (/^\\d+$/.test(t) && t.length < 7) {
+                                count += parseInt(t, 10);
+                            }
+                        });
+                        const pLink = row.querySelector(
+                            'a[href*="spieler"], a[href*="profile"], ' +
+                            'a[href*="karte"]'
+                        );
+                        out.push({
+                            secs: secs,
+                            cx: isNaN(cx) ? null : cx,
+                            cy: isNaN(cy) ? null : cy,
+                            count: count,
+                            label: rowText.slice(0, 140),
+                            who: pLink ? (pLink.innerText || '').trim()
+                                       : '',
+                        });
+                    };
+                    document.querySelectorAll(
+                        'table.troop_details tr.out, ' +
+                        '.troop_details tr.out, #content tr.out, ' +
+                        '#content table.troop_details tr.out'
+                    ).forEach(parseRow);
+                    return out;
+                }
+                """
+            )
+            return [r for r in (rows or []) if isinstance(r, dict)]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _register_outgoing_radar(
+        self,
+        *,
+        village_key: str,
+        sx,
+        sy,
+        rows: list[dict],
+        category: str,
+        troops_summary: str = "",
+    ) -> None:
+        """Registra i vettori in partenza nel RadarStore."""
+        rs = self._radar()
+        if rs is None:
+            return
+        now = time.time()
+        for row in rows or []:
+            secs = float(row.get("secs") or 0.0)
+            if secs <= 0:
+                continue
+            who = str(row.get("who") or row.get("label") or "")[:80]
+            summary = troops_summary or (
+                f"{int(row.get('count') or 0)} truppe"
+                if int(row.get("count") or 0) > 0
+                else ""
+            )
+            rs.register(
+                village_key,
+                {
+                    "category": category,
+                    "direction": "outbound",
+                    "from_x": sx,
+                    "from_y": sy,
+                    "to_x": row.get("cx"),
+                    "to_y": row.get("cy"),
+                    "counterpart": who,
+                    "label": who,
+                    "started_at": now,
+                    "arrives_at": now + secs,
+                    "details": {"troops_summary": summary},
+                },
+            )
+
+    async def _register_merchant_moves(
+        self,
+        page,
+        *,
+        village_key: str,
+        sx,
+        sy,
+        tx,
+        ty,
+        target_label: str,
+        resources: dict | None = None,
+    ) -> None:
+        """Vettore Mercanti outbound + segmento di ritorno sul radar.
+
+        L'ETA si legge dalla riga di conferma / tabella 'Mercanti in
+        viaggio' (primo .timer del contenuto); se assente si stima dalla
+        distanza e dalla velocita' mercanti della tribu' (campi/ora,
+        scalata per server_speed). Il segmento di ritorno dura il doppio
+        dell'andata come da spec radar.
+        """
+        rs = self._radar()
+        if rs is None:
+            return
+        eta_secs = 0.0
+        try:
+            eta_secs = float(
+                await page.evaluate(
+                    """
+                    () => {
+                        const scope = document.querySelector(
+                            '#content, .content, main, .buildingDetails'
+                        ) || document.body;
+                        const timers = Array.from(scope.querySelectorAll(
+                            '.timer, span.timer, td.timer, .dur'
+                        ));
+                        const pick = timers.length
+                            ? (timers[0].textContent || '')
+                            : (scope.innerText || '');
+                        const m = pick.match(
+                            /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
+                        );
+                        return m
+                            ? (parseInt(m[1] || 0, 10) * 86400) +
+                              (parseInt(m[2] || 0, 10) * 3600) +
+                              (parseInt(m[3] || 0, 10) * 60) +
+                              parseInt(m[4] || 0, 10)
+                            : 0;
+                    }
+                    """
+                )
+                or 0.0
+            )
+        except Exception:  # noqa: BLE001
+            eta_secs = 0.0
+        if eta_secs <= 0:
+            # Stima: velocita' mercanti per tribu' (campi/ora, server x1).
+            speed = {
+                "romans": 16.0, "teutons": 12.0, "gauls": 24.0,
+            }.get(str(self.settings.tribe or "").lower(), 16.0)
+            try:
+                if sx is not None and sy is not None and tx is not None:
+                    eta_secs = (
+                        map_distance(sx, sy, tx, ty) / speed * 3600.0
+                    )
+                    eta_secs /= max(
+                        0.5,
+                        float(getattr(
+                            self.settings, "server_speed", 1.0
+                        ) or 1.0),
+                    )
+            except Exception:  # noqa: BLE001
+                eta_secs = 0.0
+        if eta_secs <= 0:
+            return
+        now = time.time()
+        arrives = now + eta_secs
+        label = str(target_label or "")
+        if tx is not None and ty is not None and f"({tx}" not in label:
+            label = f"{label} ({tx}|{ty})".strip()
+        res_details = {
+            str(k): int(v)
+            for k, v in (resources or {}).items()
+            if isinstance(v, (int, float)) and int(v) > 0
+        }
+        rs.register(
+            village_key,
+            {
+                "category": CAT_MERCHANT,
+                "direction": "outbound",
+                "from_x": sx,
+                "from_y": sy,
+                "to_x": tx,
+                "to_y": ty,
+                "counterpart": label,
+                "label": label,
+                "started_at": now,
+                "arrives_at": arrives,
+                "details": {"resources": res_details},
+            },
+        )
+        # Segmento di ritorno dei mercanti: parte quando arrivano e
+        # impiega la stessa durata dell'andata.
+        rs.register(
+            village_key,
+            {
+                "category": CAT_MERCHANT,
+                "direction": "return",
+                "from_x": tx,
+                "from_y": ty,
+                "to_x": sx,
+                "to_y": sy,
+                "counterpart": label,
+                "label": f"Ritorno mercanti {label}".strip(),
+                "started_at": arrives,
+                "arrives_at": arrives + eta_secs,
+                "details": {"resources": {}},
+            },
         )
 
     def _building_path_for(self, slot_id: int) -> str:

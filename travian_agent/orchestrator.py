@@ -87,6 +87,12 @@ from .presets import (
     resolve_troop_slot,
     trainer_gid_for_unit,
 )
+from .radar_store import (
+    CAT_INCOMING_ATTACK,
+    CAT_OUTGOING_ATTACK,
+    CAT_OUTGOING_RAID,
+    radar_store,
+)
 from .replenishment import (
     TroopReplenishmentManager,
     normalize_unit_key,
