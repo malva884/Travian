@@ -29,6 +29,7 @@ import json
 import logging
 import mimetypes
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -73,6 +74,21 @@ _start_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Controllo worker via file flag / PID file (condiviso con app.py e main.py)
 # ---------------------------------------------------------------------------
+def _headed_available() -> bool:
+    """True se il browser puo' aprire una finestra visibile (login assistito).
+
+    Windows ha sempre un desktop; su Linux serve DISPLAY/WAYLAND_DISPLAY
+    oppure xvfb-run come fallback.
+    """
+    if os.name == "nt":
+        return True
+    return bool(
+        os.environ.get("DISPLAY")
+        or os.environ.get("WAYLAND_DISPLAY")
+        or shutil.which("xvfb-run")
+    )
+
+
 def _load_accounts_safe() -> list:
     try:
         from .config import load_accounts
