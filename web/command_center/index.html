@@ -3075,8 +3075,16 @@
     }
 
     function toggleBrainFocus(enabled) {
-      appState.manualFocus.enabled = enabled;
-      document.getElementById('brain-focus-pill').textContent = enabled ? 'Attivo (Slot libero)' : 'Disattivato';
+      // OFF = stesso percorso del pulsante '✕ Rimuovi Focus Manuale':
+      // azzera slot, audit event, notify e salvataggio immediato su
+      // /api/config (building_focus_enabled=false + step focus tolto
+      // dal plan). Cosi' il focus non resta attivo lato backend.
+      if (!enabled) {
+        clearManualFocus();
+        return;
+      }
+      appState.manualFocus.enabled = true;
+      document.getElementById('brain-focus-pill').textContent = 'Attivo (Slot libero)';
       renderDorf2Map();
       saveMicroBrainConfig();
     }

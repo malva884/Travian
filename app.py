@@ -1496,6 +1496,10 @@ if page == "Villaggi":
                             help="OFF: la coda resta salvata ma viene ignorata — "
                                  "il bot torna a ruolo ed economia.",
                         )
+                        st.caption(
+                            "ℹ️ OFF = Focus rimosso: effettivo lato bot solo "
+                            "dopo '💾 Salva Ruoli & Strategia'."
+                        )
 
                         # Coda per-villaggio in session_state, seedata dalla
                         # config (step dict o chiavi legacy -> target 0).
