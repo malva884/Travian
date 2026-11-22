@@ -2443,10 +2443,40 @@ class TravianParser:
                 '.timer, .dur, .clocks, [class*="timer" i]'
             );
             const seen = new Set();
-            const icons = scope.querySelectorAll(
-                '[class*="unit u"], [class*="unit_u"], ' +
-                'img.unit, i.unit, span.unit, a.unit'
+            // Selettori moderni: qualsiasi tag (img/i/span/div/svg) con
+            // classe contenente u1..u30 — le UI nuove non usano piu'
+            // 'unit uN' ma solo 'uN'. Il regex \\bu(\\d{1,2})\\b filtra
+            // i falsi positivi ('menu1', 'sub2'…).
+            const uSels = [];
+            for (let n = 1; n <= 30; n++) {
+                uSels.push('[class*="u' + n + '"]');
+            }
+            uSels.push(
+                '[class*="unit u"]', '[class*="unit_u"]',
+                'img.unit', 'i.unit', 'span.unit', 'a.unit'
             );
+            const iconSel = uSels.join(',');
+            // Scope multipli: .research/.information (layout moderni)
+            // oltre ai contenitori classici; la barra menu superiore
+            // viene esclusa icona per icona.
+            const scopes = document.querySelectorAll(
+                '.research, .information, .buildingDetails, #build, ' +
+                '#content, .content, main'
+            );
+            const roots = scopes.length ? Array.from(scopes) : [document.body];
+            const iconSeen = new Set();
+            const icons = [];
+            for (const s of roots) {
+                for (const icon of s.querySelectorAll(iconSel)) {
+                    if (iconSeen.has(icon)) continue;
+                    iconSeen.add(icon);
+                    if (icon.closest(
+                        '.headerBar, #headerBar, .topBar, #topBar, ' +
+                        '#topnav, header, nav, .navigation'
+                    )) continue;
+                    icons.push(icon);
+                }
+            }
             for (const icon of icons) {
                 const m = (icon.getAttribute('class') || '')
                     .match(/\\bu(\\d{1,2})\\b/);
@@ -2543,8 +2573,12 @@ class TravianParser:
         """
         if not self.page or not academy_slot:
             return {}
+        # Nessun redirect: se il villaggio attivo e' gia' village_id il
+        # parametro newdid non serve (evita il round-trip server-side);
+        # se diverso il newdid forza il cambio contesto.
+        cur_did = self._current_newdid()
         url = self._building_url_path(academy_slot)
-        if village_id:
+        if village_id and cur_did != int(village_id):
             url += f"&newdid={village_id}"
         try:
             await self._goto(_abs_game_url(self.page.url or "", url))
@@ -2554,6 +2588,20 @@ class TravianParser:
                 academy_slot, exc,
             )
             return {}
+        # Guard: l'URL finale deve restare una pagina edificio — un
+        # redirect fuori contesto (dorf1/index) renderebbe la lettura
+        # inattendibile.
+        try:
+            from .actions import _is_building_url  # no cicli
+
+            if not _is_building_url(self.page.url or ""):
+                logger.debug(
+                    "read_academy_state: URL finale non edificio: %s",
+                    (self.page.url or "")[:120],
+                )
+                return {}
+        except Exception:  # noqa: BLE001
+            pass
         try:
             raw = await self.page.evaluate(self._JS_ACADEMY_SNAPSHOT)
         except Exception as exc:  # noqa: BLE001
@@ -2568,6 +2616,18 @@ class TravianParser:
                 "read_academy_state: markup non riconosciuto su %s",
                 (self.page.url or "")[:120],
             )
+            # Cattura l'HTML reale dell'Accademia per blindarlo nei
+            # test parametrici (fixture replay harness).
+            try:
+                await capture_anomaly(
+                    self.page,
+                    "ACADEMY_UNREADABLE",
+                    slot_id=academy_slot,
+                    expected_gid=22,
+                    village_id=village_id,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return state
 
     async def read_trainable_units(
