@@ -3635,6 +3635,45 @@ class ActionExecutor:
                 "details": {"resources": {}},
             },
         )
+        # Vettore speculare inbound: se la destinazione e' un villaggio
+        # proprio dell'account, il radar lo visualizza anche quando
+        # l'utente seleziona il villaggio ricevente.
+        try:
+            for _key, _vcfg in (
+                getattr(self.settings, "villages", {}) or {}
+            ).items():
+                if (
+                    tx is not None
+                    and ty is not None
+                    and getattr(_vcfg, "x", None) == int(tx)
+                    and getattr(_vcfg, "y", None) == int(ty)
+                ):
+                    dest_key = (
+                        str(getattr(_vcfg, "name", "") or "") or str(_key)
+                    )
+                    if dest_key == village_key:
+                        break
+                    rs.register(
+                        dest_key,
+                        {
+                            "category": CAT_MERCHANT,
+                            "direction": "inbound",
+                            "from_x": sx,
+                            "from_y": sy,
+                            "to_x": tx,
+                            "to_y": ty,
+                            "counterpart": village_key,
+                            "label": (
+                                f"Mercanti da {village_key} {label}"
+                            ).strip(),
+                            "started_at": now,
+                            "arrives_at": arrives,
+                            "details": {"resources": res_details},
+                        },
+                    )
+                    break
+        except Exception:  # noqa: BLE001
+            pass
 
     def _building_path_for(self, slot_id: int) -> str:
         """Path ``?id=<slot>`` coerente col routing rilevato del server.

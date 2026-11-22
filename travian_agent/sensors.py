@@ -376,7 +376,7 @@ class TravianParser:
                 cpLabel + '\\\\s+prodotti\\\\s+finora' +
                 '[^0-9]{0,15}' + num, 'i')) ||
                 text.match(
-                /(?:produced\s+(?:so\s+far|until\s+now)|bisher\s+produziert)[^0-9]{0,15}([0-9][0-9.,\s]*)/i);
+                /(?:produced\\s+(?:so\\s+far|until\\s+now)|bisher\\s+produziert)[^0-9]{0,15}([0-9][0-9.,\\s]*)/i);
             if (m) {
                 out.have = clean(m[1]);
                 out.matched = true;
@@ -385,7 +385,7 @@ class TravianParser:
             // need: "Il prossimo villaggio sara' disponibile
             //        a 2000"
             m = text.match(
-                /(?:prossimo\s+villaggio\s+sar.{0,10}disponibile\s+a|prossimo\s+villaggio\s+.{0,25}richiede|next\s+village.{0,20}(?:available|requires)|n.chstes\s+dorf.{0,25}(?:verf.gbar|ben.tigt))[^0-9]{0,10}([0-9][0-9.,\s]*)/i
+                /(?:prossimo\\s+villaggio\\s+sar.{0,10}disponibile\\s+a|prossimo\\s+villaggio\\s+.{0,25}richiede|next\\s+village.{0,20}(?:available|requires)|n.chstes\\s+dorf.{0,25}(?:verf.gbar|ben.tigt))[^0-9]{0,10}([0-9][0-9.,\\s]*)/i
             );
             if (m) {
                 out.need = clean(m[1]);
@@ -401,9 +401,9 @@ class TravianParser:
             //        a new RegExp collasserebbe a [sS] (escape non
             //        valido in stringa): daily resterebbe sempre 0.
             m = text.match(
-                /(?:punti\s+(?:di\s+)?cultura|punti\s+culturali|culture\s+points?|kulturpunkte|puntos?\s+de\s+cultura|points?\s+de\s+culture)[^0-9]{0,40}?(?:al\s+giorno|quotidian[oi]|giornalier[oi])[\s\S]{0,400}?(?:totale|total|gesamt|somma)[^0-9]{0,10}([0-9][0-9.,\s]*)/i
+                /(?:punti\\s+(?:di\\s+)?cultura|punti\\s+culturali|culture\\s+points?|kulturpunkte|puntos?\\s+de\\s+cultura|points?\\s+de\\s+culture)[^0-9]{0,40}?(?:al\\s+giorno|quotidian[oi]|giornalier[oi])[\\s\\S]{0,400}?(?:totale|total|gesamt|somma)[^0-9]{0,10}([0-9][0-9.,\\s]*)/i
             ) || text.match(
-                /(?:culture\s+points?\s+per\s+day|kulturpunkte\s+pro\s+tag)[\s\S]{0,400}?(?:total|gesamt|sum|totale|somma)[^0-9]{0,10}([0-9][0-9.,\s]*)/i);
+                /(?:culture\\s+points?\\s+per\\s+day|kulturpunkte\\s+pro\\s+tag)[\\s\\S]{0,400}?(?:total|gesamt|sum|totale|somma)[^0-9]{0,10}([0-9][0-9.,\\s]*)/i);
             if (m) {
                 out.daily = clean(m[1]);
                 out.matched = true;
@@ -413,7 +413,7 @@ class TravianParser:
             // tabella "Villaggio PC/Giorno Party Truppe Slots" con riga
             // "Somma 57". Non mostra i totali assoluti dello slot.
             m = text.match(
-                /(?:PC|CP)\s*\/\s*(?:giorno|day|tag|jour|d[ií]a|dia)[\s\S]{0,900}?(?:somma|totale|total|gesamt)[^0-9]{0,10}([0-9][0-9.,\s]*)/i
+                /(?:PC|CP)\\s*\\/\\s*(?:giorno|day|tag|jour|d[ií]a|dia)[\\s\\S]{0,900}?(?:somma|totale|total|gesamt)[^0-9]{0,10}([0-9][0-9.,\\s]*)/i
             );
             if (m && !out.daily) {
                 out.daily = clean(m[1]);
@@ -424,14 +424,14 @@ class TravianParser:
             // (slot insediamento usati/totali) e frase "prossimo slot
             // insediamento il DD.MM.YY, HH:MM".
             m = text.match(
-                /(?:somma|totale|total|gesamt)\s+[0-9][0-9.,\s]*[\s\S]{0,80}?(\d+)\s*\/\s*(\d+)/i
+                /(?:somma|totale|total|gesamt)\\s+[0-9][0-9.,\\s]*[\\s\\S]{0,80}?(\\d+)\\s*\\/\\s*(\\d+)/i
             );
             if (m) {
                 out.slots_used = clean(m[1]);
                 out.slots_total = clean(m[2]);
             }
             m = text.match(
-                /slot[^0-9]{0,60}?(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4}[^|±(\\n\\r]{0,15})/i
+                /slot[^0-9]{0,60}?(\\d{1,2}[.\\/-]\\d{1,2}[.\\/-]\\d{2,4}[^|±(\\n\\r]{0,15})/i
             );
             if (m) {
                 out.next_slot = String(m[1]).trim();
@@ -442,9 +442,9 @@ class TravianParser:
             // diverso dalla sezione attesa o render asincrono).
             if (!out.daily) {
                 const d = text.match(
-                    /([0-9][0-9.,\s]*)[^0-9]{0,20}(?:al giorno|per day|a day|pro tag|par jour|al d[ií]a|daily)/i
+                    /([0-9][0-9.,\\s]*)[^0-9]{0,20}(?:al giorno|per day|a day|pro tag|par jour|al d[ií]a|daily)/i
                 ) || text.match(
-                    /(?:produzione|production|producci.n)[^0-9]{0,25}([0-9][0-9.,\s]*)[^0-9]{0,15}(?:punti|points|cultur)/i
+                    /(?:produzione|production|producci.n)[^0-9]{0,25}([0-9][0-9.,\\s]*)[^0-9]{0,15}(?:punti|points|cultur)/i
                 );
                 if (d) out.daily = clean(d[1]);
             }
@@ -463,7 +463,7 @@ class TravianParser:
                 // \b impedisce "serve" dentro "server" (l'ora del
                 // server veniva letta come CP richiesti).
                 const n = text.match(
-                    /\b(?:richiesti|necessari|servono|serve|needed|required|ben.tigt|requis|erforderlich)\b[^0-9]{0,25}([0-9][0-9.,\s]*)/i
+                    /\\b(?:richiesti|necessari|servono|serve|needed|required|ben.tigt|requis|erforderlich)\\b[^0-9]{0,25}([0-9][0-9.,\\s]*)/i
                 );
                 if (n) {
                     out.need = clean(n[1]);

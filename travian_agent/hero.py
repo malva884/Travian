@@ -363,6 +363,79 @@ _JS_HERO_STATE = """
             if (slots.length) isMounted = false;
         }
 
+        // --- Villaggio in cui risiede l'eroe -------------------------
+        // Fonti, in ordine di affidabilita':
+        //  1. entry della lista villaggi marcata con icona eroe
+        //     (Travian mostra l'eroe sul villaggio dove risiede);
+        //  2. link newdid dentro il box/status eroe;
+        //  3. niente -> '' (mai indovinare: un fallback a parole del
+        //     prefisso ha gia' prodotto chiavi radar errate).
+        let heroVillageName = '';
+        let heroVillageId = 0;
+        let heroVX = null, heroVY = null;
+        const stripInv = (s) => (s || '').replace(
+            /[‎‏‎‏‪-‮ ­﻿−]/g, ''
+        );
+        const entries = document.querySelectorAll(
+            '#sidebarBoxVillagelist a[href*="newdid="], ' +
+            '#sidebarBoxVillageList a[href*="newdid="], ' +
+            '[id*="villagelist" i] a[href*="newdid="], ' +
+            '.villageList a[href*="newdid="], a[href*="newdid="]'
+        );
+        const heroBox = document.querySelector(
+            '#sidebarBoxHero, .heroStatus, .statusMessage, ' +
+            '#heroStatus, .heroAttributes'
+        );
+        const boxLink = heroBox
+            ? heroBox.querySelector('a[href*="newdid="]')
+            : null;
+        const boxDid = boxLink
+            ? ((boxLink.href || '').match(/newdid=(\\d+)/) || [])[1]
+            : null;
+        for (const a of entries) {
+            const dm = (a.href || '').match(/newdid=(\\d+)/);
+            if (!dm) continue;
+            const holder = a.closest(
+                'li, .village, [class*="village" i], [data-did]'
+            ) || a;
+            const hasHero = !!holder.querySelector(
+                '.hero, [class*="hero" i], ' +
+                'img[src*="hero" i], svg[class*="hero" i]'
+            );
+            const isBoxVillage = boxDid && dm[1] === boxDid;
+            if (!hasHero && !isBoxVillage) continue;
+            const nm = holder.querySelector(
+                '.name, [class*="name" i], [class*="villageName" i]'
+            );
+            heroVillageName = stripInv(
+                (nm ? nm.innerText : '') || a.innerText || ''
+            ).trim();
+            heroVillageId = parseInt(dm[1], 10);
+            // Coordinate dalla stessa entry: (x|y) o nodi coordinati
+            const cx = holder.querySelector(
+                '.coordinateX, [class*="coordinateX" i]'
+            );
+            const cy = holder.querySelector(
+                '.coordinateY, [class*="coordinateY" i]'
+            );
+            if (cx && cy) {
+                const px = stripInv(cx.innerText).match(/-?\\d+/);
+                const py = stripInv(cy.innerText).match(/-?\\d+/);
+                if (px) heroVX = parseInt(px[0], 10);
+                if (py) heroVY = parseInt(py[0], 10);
+            }
+            if (heroVX === null) {
+                const cm = stripInv(holder.innerText).match(
+                    /\\((-?\\d{1,3})\\s*[|｜,]\\s*(-?\\d{1,3})\\)/
+                );
+                if (cm) {
+                    heroVX = parseInt(cm[1], 10);
+                    heroVY = parseInt(cm[2], 10);
+                }
+            }
+            if (hasHero) break;
+        }
+
         return {
             health: Math.min(100, Math.max(0, health)),
             status: status,
@@ -370,6 +443,10 @@ _JS_HERO_STATE = """
             free_points: freePoints,
             level: level,
             is_mounted: isMounted,
+            current_village: heroVillageName,
+            current_village_id: heroVillageId,
+            village_x: heroVX,
+            village_y: heroVY,
         };
     }
 """
@@ -425,6 +502,7 @@ class HeroManager:
         browser: "TravianBrowser",
         settings: Settings,
         prefix: str = "",
+        villages: list | None = None,
     ) -> bool:
         """Esegue il check dell'eroe rispettando il cooldown."""
         now = time.time()
@@ -519,7 +597,7 @@ class HeroManager:
             )
             if can_send:
                 sent = await self._send_to_adventure(
-                    browser, prefix, settings=settings
+                    browser, prefix, settings=settings, villages=villages
                 )
                 self.snapshot["last_action"] = (
                     "spedito in avventura" if sent else "spedizione avventura fallita"
@@ -766,6 +844,7 @@ class HeroManager:
         prefix: str,
         *,
         settings: "Settings | None" = None,
+        villages: list | None = None,
     ) -> bool:
         """Tab avventure -> prima avventura disponibile -> conferma invio."""
         page = browser.page
@@ -801,14 +880,64 @@ class HeroManager:
                         });
                         if (!row && rows.length) row = rows[0];
                         if (!row) return {};
-                        const txt = (row.innerText || '').replace(/\\s+/g, ' ');
-                        const cm = txt.match(/\\((-?\\d{1,3})\\s*\\|\\s*(-?\\d{1,3})\\)/);
+                        // Coordinate target in cascata — su UI moderne
+                        // (ts30) sono spezzate in .coordinateX/Y con
+                        // caratteri direzionali Unicode invisibili, o
+                        // nell'href del link mappa; il regex sul testo
+                        // resta ultimo fallback.
+                        const stripInv = (s) => (s || '').replace(
+                            /[‎‏‪-‮ ­﻿−]/g, ''
+                        );
+                        const num = (s) => {
+                            const m = stripInv(s).match(/-?\\d+/);
+                            return m ? parseInt(m[0], 10) : null;
+                        };
+                        let x = null, y = null;
+                        // 1) nodi .coordinateX / .coordinateY
+                        const cx = row.querySelector(
+                            '.coordinateX, [class*="coordinateX" i]'
+                        );
+                        const cy = row.querySelector(
+                            '.coordinateY, [class*="coordinateY" i]'
+                        );
+                        if (cx && cy) {
+                            x = num(cx.innerText);
+                            y = num(cy.innerText);
+                        }
+                        // 2) link mappa karte.php?x=..&y=..
+                        if (x === null || y === null) {
+                            const km = row.querySelector(
+                                'a[href*="karte.php"], a[href*="x="]'
+                            );
+                            if (km) {
+                                const href = km.href || '';
+                                const mx = href.match(/[?&]x=(-?\\d+)/);
+                                const my = href.match(/[?&]y=(-?\\d+)/);
+                                if (x === null && mx)
+                                    x = parseInt(mx[1], 10);
+                                if (y === null && my)
+                                    y = parseInt(my[1], 10);
+                            }
+                        }
+                        // 3) regex (x|y) sul testo ripulito
+                        const txt = stripInv(
+                            row.innerText || ''
+                        ).replace(/\\s+/g, ' ');
+                        if (x === null || y === null) {
+                            const cm = txt.match(
+                                /\\((-?\\d{1,3})\\s*[|｜,]\\s*(-?\\d{1,3})\\)/
+                            );
+                            if (cm) {
+                                if (x === null) x = parseInt(cm[1], 10);
+                                if (y === null) y = parseInt(cm[2], 10);
+                            }
+                        }
                         const tm = txt.match(
                             /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
                         );
                         return {
-                            x: cm ? parseInt(cm[1], 10) : null,
-                            y: cm ? parseInt(cm[2], 10) : null,
+                            x: x,
+                            y: y,
                             secs: tm
                                 ? (parseInt(tm[1] || 0, 10) * 86400) +
                                   (parseInt(tm[2] || 0, 10) * 3600) +
@@ -890,17 +1019,27 @@ class HeroManager:
                 adv_x = adv_info.get("x")
                 adv_y = adv_info.get("y")
                 if secs > 0:
-                    vname = str(
-                        (self.snapshot or {}).get("current_village") or ""
-                    )
-                    sx = sy = None
-                    if not vname:
-                        vname = prefix.strip("[] ").split()[0] \
-                            if prefix.strip("[] ") else ""
-                    if settings is not None and vname:
+                    # Chiave radar = nome REALE del villaggio in cui
+                    # risiede l'eroe (letto dal DOM in _sense). Il vecchio
+                    # fallback prefix.split()[0] salvava i vettori sotto
+                    # la prima parola dell'account ("Europa") rendendoli
+                    # invisibili alla telemetria per-villaggio.
+                    snap = self.snapshot or {}
+                    vname = str(snap.get("current_village") or "")
+                    sx = snap.get("village_x")
+                    sy = snap.get("village_y")
+                    # Coordinate dalla lista villaggi/config quando il
+                    # DOM non le espone accanto al nome.
+                    if vname and (sx is None or sy is None):
+                        for _v in villages or []:
+                            if str(getattr(_v, "name", "") or "") == vname:
+                                sx = getattr(_v, "x", sx)
+                                sy = getattr(_v, "y", sy)
+                                break
+                    if vname and (sx is None or sy is None) and settings:
                         try:
                             vcfg = settings.village_config_for(vname)
-                            if vcfg and vcfg.x is not None:
+                            if vcfg is not None and vcfg.x is not None:
                                 sx, sy = vcfg.x, vcfg.y
                         except Exception:  # noqa: BLE001
                             pass

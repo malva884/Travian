@@ -4259,7 +4259,12 @@ async def monitor_all_villages(
         )
     if hero_mgr is not None and settings.hero.enabled and _pl <= 0:
         try:
-            await hero_mgr.run(browser=browser, settings=settings, prefix=prefix)
+            await hero_mgr.run(
+                browser=browser,
+                settings=settings,
+                prefix=prefix,
+                villages=villages,
+            )
         except Exception as h_exc:
             logger.warning("%s Errore modulo eroe: %s", prefix, h_exc)
 
