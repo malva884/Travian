@@ -2435,71 +2435,150 @@ class TravianParser:
             raw = await self.page.evaluate(
                 """
                 () => {
-                    const parseRow = (row) => {
-                        const img = row.querySelector('img');
-                        const imgKey = (
-                            ((img && img.getAttribute('class')) || '') +
-                            ' ' + ((img && img.alt) || '')
-                        ).toLowerCase();
-                        let mtype = 'unknown';
-                        if (/att\\d?|attack/.test(imgKey)) mtype = 'attack';
-                        else if (/def\\d?|defense|reinforce/.test(imgKey)) {
-                            mtype = 'reinforce';
-                        }
-                        const rowCls = (row.className || '').toLowerCase();
-                        if (/def/.test(rowCls) && mtype === 'unknown') {
-                            mtype = 'reinforce';
-                        }
-                        if (/att/.test(rowCls) && mtype === 'unknown') {
-                            mtype = 'attack';
-                        }
-
-                        // Countdown all'impatto (.timer o pattern h:mm:ss)
-                        const rowText = (row.innerText || '').trim();
-                        const timerEl = row.querySelector(
-                            '.timer, span.timer, .dur'
-                        );
-                        const ttxt = timerEl
-                            ? (timerEl.textContent || '')
-                            : rowText;
-                        const m = ttxt.match(/(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/);
-                        let secs = 0;
-                        if (m) {
-                            secs =
-                                parseInt(m[1] || 0, 10) * 86400 +
-                                parseInt(m[2] || 0, 10) * 3600 +
-                                parseInt(m[3] || 0, 10) * 60 +
-                                parseInt(m[4] || 0, 10);
-                        }
-
-                        // Truppe leggibili: cifre accanto alle icone unit.
-                        // In T4.x la composizione nemica e' '?' => 0 = ignoto.
-                        let count = 0;
-                        row.querySelectorAll('td, span').forEach(el => {
-                            const t = (el.innerText || '').trim();
-                            if (/^\\d+$/.test(t) && t.length < 7) {
-                                count += parseInt(t, 10);
+                    // T4.6: ogni movimento e' UNA table.troop_details.
+                    // thead = titolo ('Attacco contro Oasi occupata
+                    // (75|-12)') + link mappa/giocatore; tbody.units =
+                    // icone + conteggi truppe; tbody.infos = .timer.
+                    const parseTable = (table) => {
+                        const tokens = (
+                            table.className || ''
+                        ).toLowerCase().split(/\\s+/);
+                        // Direzione: classe table (out*/in*) oppure
+                        // intestazione della sezione genitore.
+                        const OUT_SET = ['out', 'outattack', 'outraid',
+                            'outsupply', 'outspy', 'outreturn'];
+                        const IN_SET = ['in', 'inattack', 'inraid',
+                            'insupply', 'inspy', 'inreturn'];
+                        let dir = '';
+                        for (const t of tokens) {
+                            if (OUT_SET.indexOf(t) >= 0) {
+                                dir = 'out'; break;
                             }
-                        });
+                            if (IN_SET.indexOf(t) >= 0) {
+                                dir = 'in'; break;
+                            }
+                        }
+                        if (!dir) {
+                            let node = table.previousElementSibling;
+                            let steps = 0;
+                            while (node && steps < 12 && !dir) {
+                                const tag = (node.tagName || '')
+                                    .toLowerCase();
+                                const ncls = (node.className || '')
+                                    .toLowerCase();
+                                const htxt = (node.innerText ||
+                                    node.textContent || '').toLowerCase();
+                                if (/^h[1-5]$/.test(tag) ||
+                                    /sectionheader|headline|spacer/
+                                        .test(ncls)) {
+                                    if (/in partenza|in uscita|outgoing/
+                                        .test(htxt)) {
+                                        dir = 'out';
+                                    } else if (/in arrivo|incoming/
+                                        .test(htxt)) {
+                                        dir = 'in';
+                                    }
+                                }
+                                node = node.previousElementSibling;
+                                steps++;
+                            }
+                        }
+                        if (!dir) {
+                            const par = table.closest(
+                                'div, section, .box, .content'
+                            );
+                            const hEl = par ? par.querySelector(
+                                'h4, h3, .sectionHeader, .headline'
+                            ) : null;
+                            const htxt = (
+                                hEl ? (hEl.innerText || '') : ''
+                            ).toLowerCase();
+                            if (/in partenza|in uscita|outgoing/
+                                .test(htxt)) {
+                                dir = 'out';
+                            } else if (/in arrivo|incoming/.test(htxt)) {
+                                dir = 'in';
+                            }
+                        }
+                        if (!dir) dir = 'in';
 
-                        // Controparte: attaccante per 'in', destinazione
-                        // per 'out' (link giocatore/villaggio/mappa).
+                        // Tipo dal suffisso della classe table, poi
+                        // icona del thead come fallback.
+                        let mtype = 'unknown';
+                        for (const t of tokens) {
+                            if (/attack/.test(t)) {
+                                mtype = 'attack'; break;
+                            }
+                            if (/raid/.test(t) || /spy/.test(t)) {
+                                mtype = 'raid'; break;
+                            }
+                            if (/supply|reinforc/.test(t)) {
+                                mtype = 'reinforce'; break;
+                            }
+                            if (/return/.test(t)) {
+                                mtype = 'return'; break;
+                            }
+                        }
+                        if (mtype === 'unknown') {
+                            const img = table.querySelector(
+                                'thead img, img'
+                            );
+                            const imgKey = (
+                                ((img && img.getAttribute('class')) ||
+                                    '') + ' ' +
+                                ((img && img.alt) || '')
+                            ).toLowerCase();
+                            if (/att\\d?|attack/.test(imgKey)) {
+                                mtype = 'attack';
+                            } else if (
+                                /def\\d?|defense|reinforce/.test(imgKey)
+                            ) {
+                                mtype = 'reinforce';
+                            }
+                        }
+
+                        // Intestazione: 'Attacco contro Oasi occupata
+                        // (75|-12)' / 'Ritorno da ...'.
+                        const headEl = table.querySelector('thead');
+                        const headTxt = (
+                            headEl ? (
+                                headEl.innerText ||
+                                headEl.textContent || ''
+                            ) : (table.innerText || '')
+                        ).trim();
+
+                        // Controparte: link villaggio/giocatore/mappa
+                        // nel thead; fallback sul testo dell'intestaz.
                         let other = '';
-                        const pLink = row.querySelector(
-                            'a[href*="spieler"], a[href*="profile"], a[href*="karte"]'
+                        const pLink = table.querySelector(
+                            'thead a[href*="karte"], ' +
+                            'thead a[href*="spieler"], ' +
+                            'thead a[href*="profile"], a[href*="karte"]'
                         );
                         if (pLink) {
                             other = (pLink.innerText || '').trim();
                         }
+                        if (!other) {
+                            const om = headTxt.match(
+                                /contro\\s+(.+?)\\s*\\(|da\\s+(.+?)\\s*\\(|to\\s+(.+?)\\s*\\(|from\\s+(.+?)\\s*\\(/
+                            );
+                            if (om) {
+                                other = (
+                                    om[1] || om[2] || om[3] || om[4] ||
+                                    ''
+                                ).trim();
+                            }
+                        }
 
-                        // Coordinate controparte: href karte.php?x=..&y=..
-                        // (o /karte?x=) poi pattern '(x|y)' nella riga.
+                        // Coordinate (x|y): href karte prima, poi
+                        // pattern nel testo dell'intestazione.
                         let cx = null, cy = null;
-                        const mapLink = row.querySelector(
+                        const mapLink = table.querySelector(
                             'a[href*="karte"], a[href*="/map?x="]'
                         );
                         if (mapLink) {
-                            const href = mapLink.getAttribute('href') || '';
+                            const href =
+                                mapLink.getAttribute('href') || '';
                             const hm = href.match(
                                 /[?&]x=(-?\\d+)[^0-9-]*(?:[?&]|\\&)y=(-?\\d+)|x=(-?\\d+).*?y=(-?\\d+)/
                             );
@@ -2509,7 +2588,7 @@ class TravianParser:
                             }
                         }
                         if (cx === null || isNaN(cx)) {
-                            const cm = rowText.match(
+                            const cm = headTxt.match(
                                 /\\((-?\\d{1,3})\\s*\\|\\s*(-?\\d{1,3})\\)/
                             );
                             if (cm) {
@@ -2520,45 +2599,143 @@ class TravianParser:
                         if (isNaN(cx)) cx = null;
                         if (isNaN(cy)) cy = null;
 
+                        // Truppe: tbody.units — l'ultima riga contiene
+                        // i conteggi (prima cella = icona; '?' nemico).
+                        let count = 0;
+                        let summary = '';
+                        const unitsTb = table.querySelector(
+                            'tbody.units, .units'
+                        );
+                        if (unitsTb) {
+                            const uRows = unitsTb.querySelectorAll('tr');
+                            const lastRow = uRows[uRows.length - 1];
+                            const parts = [];
+                            if (lastRow) {
+                                lastRow.querySelectorAll('td').forEach(
+                                    (td, i) => {
+                                        const t = (
+                                            td.innerText || ''
+                                        ).trim();
+                                        if (i === 0 && !/^\\d+$/.test(t)) {
+                                            return;
+                                        }
+                                        if (/^\\d+$/.test(t) &&
+                                            t.length < 7) {
+                                            count += parseInt(t, 10);
+                                            parts.push(t);
+                                        } else if (t === '?') {
+                                            parts.push('?');
+                                        }
+                                    }
+                                );
+                            }
+                            summary = parts.join(' ');
+                        }
+                        if (!summary) {
+                            // Skin senza tbody.units: somma le celle
+                            // numeriche dell'intera table.
+                            table.querySelectorAll('td, span').forEach(
+                                el => {
+                                    const t = (
+                                        el.innerText || ''
+                                    ).trim();
+                                    if (/^\\d+$/.test(t) &&
+                                        t.length < 7) {
+                                        count += parseInt(t, 10);
+                                    }
+                                }
+                            );
+                        }
+
+                        // Countdown: tbody.infos .timer, poi qualunque
+                        // .timer della table.
+                        const timerEl = table.querySelector(
+                            'tbody.infos .timer, .timer, span.timer'
+                        );
+                        const ttxt = timerEl
+                            ? (timerEl.textContent || '')
+                            : '';
+                        const m = ttxt.match(
+                            /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
+                        );
+                        let secs = 0;
+                        if (m) {
+                            secs =
+                                parseInt(m[1] || 0, 10) * 86400 +
+                                parseInt(m[2] || 0, 10) * 3600 +
+                                parseInt(m[3] || 0, 10) * 60 +
+                                parseInt(m[4] || 0, 10);
+                        }
+
                         return {
+                            dir: dir,
                             type: mtype,
                             seconds: secs,
                             count: count,
                             attacker: other,
-                            label: rowText.slice(0, 160),
+                            label: (headTxt ||
+                                table.innerText || '').slice(0, 160),
+                            summary: summary,
                             cx: cx,
                             cy: cy,
                         };
                     };
                     const incoming = [];
                     const outgoing = [];
-                    // In T4.x le righe dei movimenti portano la classe
-                    // 'in' (arrivo) o 'out' (partenza). La variante
-                    // '#content .troop_details tr' copre le skin senza
-                    // marcatura esplicita: restano nel bucket 'in'
-                    // (comportamento storico del parser).
                     document.querySelectorAll(
-                        '#content table.troop_details tr.in, ' +
-                        '#content tr.in, table.troop_details tr.in, ' +
-                        '.troop_details tr.in, #content .troop_details tr'
-                    ).forEach(row => {
-                        const cls = ' ' +
-                            (row.className || '').toLowerCase() + ' ';
-                        if (/\\bout\\b/.test(cls)) {
-                            outgoing.push(parseRow(row));
-                        } else {
-                            incoming.push(parseRow(row));
-                        }
+                        'table.troop_details'
+                    ).forEach(table => {
+                        const r = parseTable(table);
+                        // Salta tabelle senza countdown (es. 'truppe nel
+                        // villaggio' nella stessa panoramica).
+                        if (r.seconds <= 0) return;
+                        const d = r.dir;
+                        delete r.dir;
+                        (d === 'out' ? outgoing : incoming).push(r);
                     });
-                    document.querySelectorAll(
-                        '#content table.troop_details tr.out, ' +
-                        '#content tr.out, table.troop_details tr.out, ' +
-                        '.troop_details tr.out'
-                    ).forEach(row => outgoing.push(parseRow(row)));
-                    return { incoming: incoming, outgoing: outgoing };
+                    return {
+                        incoming: incoming,
+                        outgoing: outgoing
+                    };
                 }
                 """
             )
+            if not (raw or {}).get("incoming") and not (
+                raw or {}
+            ).get("outgoing"):
+                # Diagnostico: la panoramica mostra sezioni truppe ma
+                # il parser non ha estratto movimenti — snippet #content
+                # per allineare i selettori al markup reale.
+                try:
+                    _snip = await self.page.evaluate(
+                        """() => {
+                            const c = document.querySelector('#content');
+                            const hasTbl = document.querySelector(
+                                '#content table.troop_details, ' +
+                                'table.troop_details'
+                            );
+                            const txt = (
+                                (c || document.body).innerText || ''
+                            ).toLowerCase();
+                            const hasTxt =
+                                txt.includes('truppe in arrivo') ||
+                                txt.includes('truppe in partenza') ||
+                                txt.includes('incoming troops') ||
+                                txt.includes('outgoing troops');
+                            if (!hasTbl && !hasTxt) return '';
+                            return (
+                                (c || document.body).innerHTML || ''
+                            ).slice(0, 800);
+                        }"""
+                    )
+                    if _snip:
+                        logger.warning(
+                            "Radar: panoramica rally con sezioni "
+                            "truppe ma 0 movimenti parse — snippet "
+                            "DOM: %s", _snip,
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
             self._movements_rally_ok = True
         except Exception as exc:
             logger.debug("Parse movimenti Piazza d'Armi fallito: %s", exc)
