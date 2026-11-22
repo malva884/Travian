@@ -1786,6 +1786,305 @@ class TravianParser:
         )
         return incoming
 
+    _JS_DORF1_MOVEMENTS = """
+        () => {
+            // Box 'Movimenti truppe' della sidebar (dorf1/dorf2):
+            // righe aggregate (es. "1 Attacco", "2 Mercanti") con icona
+            // tipo+direzione e countdown .timer. Le coordinate target
+            // non sono quasi mai esposte qui: si leggono solo se la
+            // riga contiene un link karte o il pattern (x|y).
+            const stripInv = (s) => (s || '').replace(
+                /[‎‏‪-‮ ­﻿−]/g, ''
+            );
+            const box = document.querySelector(
+                '#movements, .troopMovements, ' +
+                '[id*="troopMovement" i], #sidebarBoxMovements, ' +
+                '.movement'
+            );
+            if (!box) return { incoming: [], outgoing: [] };
+            const incoming = [];
+            const outgoing = [];
+            box.querySelectorAll(
+                'tr, li, .row, [class*="movement" i]'
+            ).forEach(row => {
+                const rowText = stripInv(
+                    row.innerText || row.textContent || ''
+                ).trim();
+                if (!rowText || rowText.length < 3) return;
+                // Salta header/footer del box.
+                if (/movimenti|troop movements|bewegung/i.test(rowText) &&
+                    rowText.length < 40) return;
+                const timerEl = row.querySelector(
+                    '.timer, span.timer, .dur'
+                );
+                const ttxt = stripInv(
+                    timerEl ? (timerEl.textContent || '') : rowText
+                );
+                const m = ttxt.match(
+                    /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
+                );
+                let secs = 0;
+                if (m) {
+                    secs =
+                        parseInt(m[1] || 0, 10) * 86400 +
+                        parseInt(m[2] || 0, 10) * 3600 +
+                        parseInt(m[3] || 0, 10) * 60 +
+                        parseInt(m[4] || 0, 10);
+                }
+                if (secs <= 0) return;
+                // Tipo: icona (classi att/def/merc/disp) o testo.
+                const img = row.querySelector('img, i, svg');
+                const imgKey = (
+                    ((img && img.getAttribute('class')) || '') + ' ' +
+                    ((img && img.getAttribute('alt')) || '') + ' ' +
+                    ((img && img.getAttribute('title')) || '')
+                ).toLowerCase();
+                const txtLow = rowText.toLowerCase();
+                let mtype = 'unknown';
+                if (/merc|trade|h.ndler|commerc/.test(imgKey) ||
+                    /mercant|commerc|händler/.test(txtLow)) {
+                    mtype = 'merchant';
+                } else if (/raid|sacchegg|plunder/.test(txtLow)) {
+                    mtype = 'raid';
+                } else if (/att|attack/.test(imgKey) ||
+                           /attac|attack|angriff/.test(txtLow)) {
+                    mtype = 'attack';
+                } else if (/def|reinforce/.test(imgKey) ||
+                           /rinfor|reinfor|unterst/.test(txtLow)) {
+                    mtype = 'reinforce';
+                }
+                // Direzione: classi icona att1/def1 (arrivo) vs
+                // att3/def3 (partenza), testo 'in arrivo'/'verso',
+                // o classe riga.
+                let dir = '';
+                if (/att1|def1|in\\b/.test(imgKey)) dir = 'in';
+                else if (/att3|def3|out\\b/.test(imgKey)) dir = 'out';
+                if (!dir) {
+                    const cls = ' ' +
+                        (row.className || '').toLowerCase() + ' ';
+                    if (/\\bin\\b/.test(cls)) dir = 'in';
+                    else if (/\\bout\\b/.test(cls)) dir = 'out';
+                }
+                if (!dir) {
+                    if (/in arriv|ankomm|incoming|arrives/.test(txtLow)) {
+                        dir = 'in';
+                    } else if (/verso|nach|to |outgoing|partenz/.test(
+                        txtLow)) {
+                        dir = 'out';
+                    }
+                }
+                if (!dir) dir = 'in';
+                // Coordinate target dalla riga (link mappa o (x|y)).
+                let cx = null, cy = null;
+                const mapLink = row.querySelector(
+                    'a[href*="karte"], a[href*="/map?x="]'
+                );
+                if (mapLink) {
+                    const href = mapLink.getAttribute('href') || '';
+                    const hm = href.match(/x=(-?\\d+)[^0-9-]*y=(-?\\d+)/);
+                    if (hm) {
+                        cx = parseInt(hm[1], 10);
+                        cy = parseInt(hm[2], 10);
+                    }
+                }
+                if (cx === null) {
+                    const cm = rowText.match(
+                        /\\((-?\\d{1,3})\\s*\\|\\s*(-?\\d{1,3})\\)/
+                    );
+                    if (cm) {
+                        cx = parseInt(cm[1], 10);
+                        cy = parseInt(cm[2], 10);
+                    }
+                }
+                let count = 0;
+                row.querySelectorAll('td, span').forEach(el => {
+                    const t = (el.innerText || '').trim();
+                    if (/^\\d+$/.test(t) && t.length < 7) {
+                        count += parseInt(t, 10);
+                    }
+                });
+                const whoEl = row.querySelector(
+                    'a[href*="spieler"], a[href*="profile"], a[href*="karte"]'
+                );
+                const item = {
+                    type: mtype,
+                    seconds: secs,
+                    count: count,
+                    attacker: whoEl
+                        ? (whoEl.innerText || '').trim() : '',
+                    label: rowText.slice(0, 160),
+                    cx: (cx === null || isNaN(cx)) ? null : cx,
+                    cy: (cy === null || isNaN(cy)) ? null : cy,
+                };
+                (dir === 'out' ? outgoing : incoming).push(item);
+            });
+            return { incoming: incoming, outgoing: outgoing };
+        }
+    """
+
+    async def read_dorf1_movements(
+        self,
+    ) -> tuple[list[dict], list[dict]]:
+        """Righe grezze del box '#movements' della pagina corrente.
+
+        Ritorna ``(incoming, outgoing)`` di dict JS — integra la
+        panoramica Punto di Raduno coprendo anche i mercanti e i
+        villaggi senza Piazza d'Armi. I dict hanno type/seconds/count/
+        attacker/label/cx/cy; i mercanti usano ``type='merchant'``.
+        """
+        if not self.page:
+            return [], []
+        try:
+            raw = await self.page.evaluate(self._JS_DORF1_MOVEMENTS)
+            self._movements_dorf1_ok = True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Parse box #movements dorf1 fallito: %s", exc)
+            self._movements_dorf1_ok = False
+            return [], []
+        raw = raw or {}
+        return (
+            [r for r in (raw.get("incoming") or [])
+             if isinstance(r, dict)],
+            [r for r in (raw.get("outgoing") or [])
+             if isinstance(r, dict)],
+        )
+
+    async def read_market_movements(self) -> list[dict]:
+        """Righe 'Mercanti in viaggio' della pagina Mercato corrente.
+
+        Il tab 'Invia risorse' (build.php?id=<slot>&t=5 / market) mostra
+        le spedizioni attive: mercanti propri in viaggio (outbound) e
+        mercanti in arrivo (inbound), con villaggio controparte (x|y),
+        risorse trasportate e countdown .timer. Ritorna dict grezzi:
+        ``{direction, secs, cx, cy, resources, counterpart, label}``.
+        """
+        if not self.page:
+            return []
+        try:
+            raw = await self.page.evaluate(
+                """
+                () => {
+                    const stripInv = (s) => (s || '').replace(
+                        /[‎‏‪-‮ ­﻿−]/g, ''
+                    );
+                    const out = [];
+                    const scope = document.querySelector(
+                        '#content, .content, main'
+                    ) || document.body;
+                    // Tabelle della sezione mercanti: la direzione si
+                    // ricava dall'header ('in arrivo'/'ankomm') o dal
+                    // testo della riga stessa.
+                    scope.querySelectorAll('table').forEach(tbl => {
+                        const head = stripInv(
+                            tbl.innerText || ''
+                        ).slice(0, 300).toLowerCase();
+                        let dir = '';
+                        if (/in arriv|ankomm|incoming|en route to you|
+                             verso di te/i.test(head)) dir = 'inbound';
+                        else if (/in viagg|unterwegs|on the way|
+                                  outgoing|partenz/i.test(head)) {
+                            dir = 'outbound';
+                        }
+                        tbl.querySelectorAll('tr').forEach(row => {
+                            const rowText = stripInv(
+                                row.innerText || ''
+                            ).trim();
+                            if (!rowText || rowText.length < 6) return;
+                            if (/mercanti in|traders|händler/i.test(
+                                rowText) &&
+                                row.querySelectorAll('td').length <= 1) {
+                                return;  // header di sezione
+                            }
+                            const timerEl = row.querySelector(
+                                '.timer, span.timer, .dur'
+                            );
+                            const ttxt = timerEl
+                                ? (timerEl.textContent || '') : rowText;
+                            const m = ttxt.match(
+                                /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
+                            );
+                            if (!m) return;
+                            const secs =
+                                parseInt(m[1] || 0, 10) * 86400 +
+                                parseInt(m[2] || 0, 10) * 3600 +
+                                parseInt(m[3] || 0, 10) * 60 +
+                                parseInt(m[4] || 0, 10);
+                            if (secs <= 0) return;
+                            let cx = null, cy = null;
+                            const mapLink = row.querySelector(
+                                'a[href*="karte"], a[href*="/map?x="]'
+                            );
+                            if (mapLink) {
+                                const href =
+                                    mapLink.getAttribute('href') || '';
+                                const hm = href.match(
+                                    /x=(-?\\d+)[^0-9-]*y=(-?\\d+)/
+                                );
+                                if (hm) {
+                                    cx = parseInt(hm[1], 10);
+                                    cy = parseInt(hm[2], 10);
+                                }
+                            }
+                            if (cx === null) {
+                                const cm = rowText.match(
+                                    /\\((-?\\d{1,3})\\s*\\|\\s*(-?\\d{1,3})\\)/
+                                );
+                                if (cm) {
+                                    cx = parseInt(cm[1], 10);
+                                    cy = parseInt(cm[2], 10);
+                                }
+                            }
+                            // Risorse trasportate: numeri accanto alle
+                            // icone legno/argilla/ferro/grano.
+                            const res = {};
+                            const resKeys = ['wood', 'clay', 'iron', 'crop'];
+                            let ridx = 0;
+                            row.querySelectorAll(
+                                'td, span'
+                            ).forEach(el => {
+                                const t = (el.innerText || '').trim();
+                                if (/^\\d{1,6}$/.test(t) &&
+                                    ridx < resKeys.length) {
+                                    res[resKeys[ridx]] = parseInt(t, 10);
+                                    ridx += 1;
+                                }
+                            });
+                            const whoEl = row.querySelector(
+                                'a[href*="spieler"], a[href*="profile"], ' +
+                                'a[href*="karte"], a[href*="newdid"]'
+                            );
+                            let rdir = dir;
+                            if (!rdir) {
+                                if (/arriv|ankomm|zu dir/i.test(rowText)) {
+                                    rdir = 'inbound';
+                                } else {
+                                    rdir = 'outbound';
+                                }
+                            }
+                            out.push({
+                                direction: rdir,
+                                secs: secs,
+                                cx: (cx === null || isNaN(cx))
+                                    ? null : cx,
+                                cy: (cy === null || isNaN(cy))
+                                    ? null : cy,
+                                resources: res,
+                                counterpart: whoEl
+                                    ? (whoEl.innerText || '').trim()
+                                    : '',
+                                label: rowText.slice(0, 160),
+                            });
+                        });
+                    });
+                    return out;
+                }
+                """
+            )
+            return [r for r in (raw or []) if isinstance(r, dict)]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Parse 'Mercanti in viaggio' fallito: %s", exc)
+            return []
+
     async def get_troop_movements(
         self, rally_slot: int = 0, village_id: int = 0
     ) -> tuple[list[IncomingAttack], list[IncomingAttack]]:
@@ -1799,8 +2098,43 @@ class TravianParser:
         Restituisce due liste vuote se il Punto di Raduno non esiste o
         il parse fallisce.
         """
-        if not self.page or not rally_slot:
+        if not self.page:
             return [], []
+        # Il box '#movements' della sidebar e' presente su OGNI pagina:
+        # lo leggiamo prima della navigazione al Punto di Raduno cosi'
+        # la telemetria resta completa anche senza Piazza d'Armi e
+        # copre i mercanti (che il rally overview non elenca).
+        dorf1_in, dorf1_out = await self.read_dorf1_movements()
+        if not rally_slot:
+            now_only = time.time()
+
+            def _build_only(items: list[dict]) -> list[IncomingAttack]:
+                moves: list[IncomingAttack] = []
+                for item in items or []:
+                    secs = safe_int(item.get("seconds") or 0)
+                    cx = item.get("cx")
+                    cy = item.get("cy")
+                    moves.append(
+                        IncomingAttack(
+                            movement_type=str(
+                                item.get("type") or "unknown"
+                            ),
+                            seconds_remaining=secs,
+                            troop_count=safe_int(item.get("count") or 0),
+                            arrival_ts=now_only + secs,
+                            attacker=str(item.get("attacker") or ""),
+                            label=str(item.get("label") or ""),
+                            counterpart_x=(
+                                safe_int(cx) if cx is not None else None
+                            ),
+                            counterpart_y=(
+                                safe_int(cy) if cy is not None else None
+                            ),
+                        )
+                    )
+                return moves
+
+            return _build_only(dorf1_in), _build_only(dorf1_out)
         url = f"{selectors.PATH_BUILD}?id={rally_slot}"
         if village_id:
             url += f"&newdid={village_id}"
@@ -1937,8 +2271,10 @@ class TravianParser:
                 }
                 """
             )
+            self._movements_rally_ok = True
         except Exception as exc:
             logger.debug("Parse movimenti Piazza d'Armi fallito: %s", exc)
+            self._movements_rally_ok = False
             return [], []
 
         now = time.time()
@@ -1970,6 +2306,29 @@ class TravianParser:
         raw = raw or {}
         incoming = _build(raw.get("incoming") or [])
         outgoing = _build(raw.get("outgoing") or [])
+        # Merge box '#movements' dorf1: aggiunge mercanti e qualunque
+        # movimento non coperto dalla panoramica rally (o senza rally).
+        # Dedup per stesso tipo + ETA entro 15s: i movimenti truppe
+        # compaiono in entrambe le fonti con countdown quasi identico.
+        extra_in = _build(dorf1_in)
+        extra_out = _build(dorf1_out)
+
+        def _merge(dst: list[IncomingAttack],
+                   extra: list[IncomingAttack]) -> None:
+            for mv in extra:
+                dup = any(
+                    existing.movement_type == mv.movement_type
+                    and abs(
+                        existing.seconds_remaining
+                        - mv.seconds_remaining
+                    ) <= 15
+                    for existing in dst
+                )
+                if not dup:
+                    dst.append(mv)
+
+        _merge(incoming, extra_in)
+        _merge(outgoing, extra_out)
         if incoming:
             logger.info(
                 "Piazza d'Armi: %d movimenti in arrivo (%s)",

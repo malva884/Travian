@@ -3674,6 +3674,91 @@ class ActionExecutor:
                     break
         except Exception:  # noqa: BLE001
             pass
+        # Sync live della tabella 'Mercanti in viaggio': la pagina del
+        # Mercato elenca TUTTE le spedizioni attive, comprese quelle
+        # avviate manualmente dal giocatore. Per i mercanti in partenza
+        # si sincronizza anche il segmento di ritorno (stessa durata).
+        try:
+            from .sensors import TravianParser
+
+            rows = await TravianParser(page).read_market_movements()
+            if rows:
+                now2 = time.time()
+                synced: list[dict] = []
+                for row in rows:
+                    secs2 = float(row.get("secs") or 0.0)
+                    if secs2 <= 0:
+                        continue
+                    arr2 = now2 + secs2
+                    cx = row.get("cx")
+                    cy = row.get("cy")
+                    who = str(
+                        row.get("counterpart") or row.get("label") or ""
+                    )[:80]
+                    rres = {
+                        str(k): int(v)
+                        for k, v in (row.get("resources") or {}).items()
+                        if isinstance(v, (int, float)) and int(v) > 0
+                    }
+                    if str(row.get("direction") or "") == "inbound":
+                        synced.append(
+                            {
+                                "category": CAT_MERCHANT,
+                                "direction": "inbound",
+                                "from_x": cx,
+                                "from_y": cy,
+                                "to_x": sx,
+                                "to_y": sy,
+                                "counterpart": who,
+                                "label": who or "Mercanti in arrivo",
+                                "arrives_at": arr2,
+                                "details": {"resources": rres},
+                            }
+                        )
+                    else:
+                        synced.append(
+                            {
+                                "category": CAT_MERCHANT,
+                                "direction": "outbound",
+                                "from_x": sx,
+                                "from_y": sy,
+                                "to_x": cx,
+                                "to_y": cy,
+                                "counterpart": who,
+                                "label": who or "Mercanti in viaggio",
+                                "arrives_at": arr2,
+                                "details": {"resources": rres},
+                            }
+                        )
+                        # Rientro previsto: parte all'arrivo e dura
+                        # quanto l'andata (spec radar mercanti).
+                        synced.append(
+                            {
+                                "category": CAT_MERCHANT,
+                                "direction": "return",
+                                "from_x": cx,
+                                "from_y": cy,
+                                "to_x": sx,
+                                "to_y": sy,
+                                "counterpart": who,
+                                "label": (
+                                    f"Ritorno mercanti {who}".strip()
+                                ),
+                                "started_at": arr2,
+                                "arrives_at": arr2 + secs2,
+                                "details": {"resources": {}},
+                            }
+                        )
+                if synced:
+                    rs.sync_categories(
+                        village_key,
+                        synced,
+                        frozenset({CAT_MERCHANT}),
+                    )
+        except Exception as _mkt_exc:  # noqa: BLE001
+            logger.debug(
+                "Sync radar tabella mercanti fallita: %s", _mkt_exc
+            )
 
     def _building_path_for(self, slot_id: int) -> str:
         """Path ``?id=<slot>`` coerente col routing rilevato del server.

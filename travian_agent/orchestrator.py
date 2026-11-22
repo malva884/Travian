@@ -89,8 +89,10 @@ from .presets import (
 )
 from .radar_store import (
     CAT_INCOMING_ATTACK,
+    CAT_MERCHANT,
     CAT_OUTGOING_ATTACK,
     CAT_OUTGOING_RAID,
+    CAT_REINFORCEMENT,
     radar_store,
 )
 from .replenishment import (
@@ -1774,6 +1776,146 @@ def _calculate_backoff(attempt: int, base: float = INITIAL_BACKOFF, maximum: flo
     return delay * random.uniform(JITTER_MIN, JITTER_MAX)
 
 
+# Mappa tipo-movimento -> categoria radar per i sync passivi.
+_RADAR_CAT_IN = {
+    "attack": CAT_INCOMING_ATTACK,
+    "raid": CAT_INCOMING_ATTACK,
+    "scout": CAT_INCOMING_ATTACK,
+    "unknown": CAT_INCOMING_ATTACK,
+    "reinforce": CAT_REINFORCEMENT,
+    "merchant": CAT_MERCHANT,
+}
+_RADAR_CAT_OUT = {
+    "attack": CAT_OUTGOING_ATTACK,
+    "raid": CAT_OUTGOING_RAID,
+    "scout": CAT_OUTGOING_RAID,
+    "unknown": CAT_OUTGOING_ATTACK,
+    "reinforce": CAT_REINFORCEMENT,
+    "merchant": CAT_MERCHANT,
+}
+# Categorie la cui assenza nella pagina corrente e' verita' (il rally
+# overview e il box #movements elencano TUTTI i movimenti truppe).
+# CAT_MERCHANT esclusa: viene sincronizzata dalla tabella Mercato, che
+# e' la fonte definitiva — le righe '#movements' aggiungono vettori ma
+# non ne dichiarano la completezza.
+_RADAR_SYNC_CATS = frozenset({
+    CAT_INCOMING_ATTACK,
+    CAT_OUTGOING_ATTACK,
+    CAT_OUTGOING_RAID,
+    CAT_REINFORCEMENT,
+})
+
+
+def _mv_get(mv, key: str, default=None):
+    """Accessor duck-typed: IncomingAttack o dict del box #movements."""
+    if isinstance(mv, dict):
+        return mv.get(key, default)
+    return getattr(mv, key, default)
+
+
+def _sync_radar_movements(
+    settings: Settings,
+    vname: str,
+    sx,
+    sy,
+    inc: list,
+    outg: list,
+    *,
+    prefix: str = "",
+) -> None:
+    """Sincronizza i movimenti osservati nel RadarStore dell'account.
+
+    ``inc``/``outg`` accettano ``IncomingAttack`` (panoramica rally +
+    box #movements fusi dal sensore) oppure dict grezzi. Il dedup dei
+    vettori registrati dalle azioni bot avviene nello store (stessa
+    categoria+direzione+arrives_at entro 15s).
+    """
+    vkey = str(vname or "")
+    if not vkey:
+        return
+    try:
+        rs = radar_store(settings.account_id)
+        moves: list[dict] = []
+        now = time.time()
+        for mv in inc or []:
+            mtype = str(_mv_get(mv, "movement_type",
+                                _mv_get(mv, "type") or "unknown"))
+            cat = _RADAR_CAT_IN.get(mtype, CAT_INCOMING_ATTACK)
+            arr = float(_mv_get(mv, "arrival_ts", 0.0) or 0.0)
+            if arr <= 0:
+                arr = now + float(
+                    _mv_get(mv, "seconds_remaining",
+                            _mv_get(mv, "seconds") or 0) or 0
+                )
+            if arr <= now:
+                continue
+            cx = _mv_get(mv, "counterpart_x", _mv_get(mv, "cx"))
+            cy = _mv_get(mv, "counterpart_y", _mv_get(mv, "cy"))
+            who = str(
+                _mv_get(mv, "attacker", "") or _mv_get(mv, "label", "")
+                or "Movimento in arrivo"
+            )[:80]
+            moves.append(
+                {
+                    "category": cat,
+                    "direction": "inbound",
+                    "from_x": cx,
+                    "from_y": cy,
+                    "to_x": sx,
+                    "to_y": sy,
+                    "counterpart": who,
+                    "label": who,
+                    "arrives_at": arr,
+                    "details": {
+                        "troops_summary": str(
+                            _mv_get(mv, "troop_count",
+                                    _mv_get(mv, "count") or "") or ""
+                        )
+                    },
+                }
+            )
+        for mv in outg or []:
+            mtype = str(_mv_get(mv, "movement_type",
+                                _mv_get(mv, "type") or "unknown"))
+            cat = _RADAR_CAT_OUT.get(mtype, CAT_OUTGOING_ATTACK)
+            arr = float(_mv_get(mv, "arrival_ts", 0.0) or 0.0)
+            if arr <= 0:
+                arr = now + float(
+                    _mv_get(mv, "seconds_remaining",
+                            _mv_get(mv, "seconds") or 0) or 0
+                )
+            if arr <= now:
+                continue
+            cx = _mv_get(mv, "counterpart_x", _mv_get(mv, "cx"))
+            cy = _mv_get(mv, "counterpart_y", _mv_get(mv, "cy"))
+            who = str(
+                _mv_get(mv, "attacker", "") or _mv_get(mv, "label", "")
+                or "Movimento in partenza"
+            )[:80]
+            moves.append(
+                {
+                    "category": cat,
+                    "direction": "outbound",
+                    "from_x": sx,
+                    "from_y": sy,
+                    "to_x": cx,
+                    "to_y": cy,
+                    "counterpart": who,
+                    "label": who,
+                    "arrives_at": arr,
+                    "details": {
+                        "troops_summary": str(
+                            _mv_get(mv, "troop_count",
+                                    _mv_get(mv, "count") or "") or ""
+                        )
+                    },
+                }
+            )
+        rs.sync_categories(vkey, moves, _RADAR_SYNC_CATS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("%s Sync radar movimenti fallita: %s", prefix, exc)
+
+
 async def monitor_all_villages(
     browser: TravianBrowser,
     observer: GameObserver,
@@ -2169,28 +2311,46 @@ async def monitor_all_villages(
                 )
 
             # 3.52 Movimenti truppe (telemetria radar): in arrivo e in
-            #     partenza dalla Piazza d'Armi. Con la difesa attiva la
-            #     pagina e' gia' stata caricata da get_incoming_attacks:
-            #     nessuna navigazione extra in quel caso.
+            #     partenza dalla Piazza d'Armi + box '#movements' dorf1
+            #     (mercanti e villaggi senza rally). Con la difesa
+            #     attiva la pagina rally e' gia' stata caricata da
+            #     get_incoming_attacks: nessuna navigazione extra.
             rally_mv = find_rally_point(state.interior_fields())
-            if rally_mv is not None:
-                try:
-                    inc, outg = await observer.get_troop_movements(
-                        rally_mv.slot_id, village.village_id
+            try:
+                inc, outg = await observer.get_troop_movements(
+                    rally_mv.slot_id if rally_mv is not None else 0,
+                    village.village_id,
+                )
+                state.incoming_moves = inc
+                state.outgoing_moves = outg
+                hostile = [a for a in inc if a.is_threat]
+                if hostile:
+                    state.incoming_attacks = max(
+                        state.incoming_attacks, len(hostile)
                     )
-                    state.incoming_moves = inc
-                    state.outgoing_moves = outg
-                    hostile = [a for a in inc if a.is_threat]
-                    if hostile:
-                        state.incoming_attacks = max(
-                            state.incoming_attacks, len(hostile)
-                        )
-                except Exception as mv_exc:
-                    logger.debug(
-                        "%s Lettura movimenti truppe fallita "
-                        "(non bloccante): %s",
-                        vprefix, mv_exc,
+                # Sync live nel RadarStore: attacchi/raid/rinforzi e
+                # mercanti osservati (incluse le spedizioni manuali)
+                # compaiono sui vettori anche senza azione del bot.
+                _parse_ok = (
+                    getattr(observer, "_movements_rally_ok", False)
+                    or getattr(observer, "_movements_dorf1_ok", False)
+                )
+                if _parse_ok:
+                    _sync_radar_movements(
+                        settings,
+                        vname,
+                        village.x,
+                        village.y,
+                        inc,
+                        outg,
+                        prefix=vprefix,
                     )
+            except Exception as mv_exc:
+                logger.debug(
+                    "%s Lettura movimenti truppe fallita "
+                    "(non bloccante): %s",
+                    vprefix, mv_exc,
+                )
 
             # 3.55 Smart Reinforce Coordinator: il villaggio corrente,
             #     se non minacciato, valuta il registro attacchi e manda
@@ -4514,6 +4674,10 @@ async def run_single_account_loop(
                         _ns_left / 60.0,
                     )
                 _ns_waited = 0.0
+                # Scansione radar passiva: un GET dorf1 ogni 10-15 min
+                # mantiene i vettori aggiornati senza azioni di gioco.
+                _ns_radar_next = random.uniform(600.0, 900.0)
+                _ns_radar_last = 0.0
                 while _ns_waited < _ns_left:
                     # I flag operativi restano attivi anche durante il sonno.
                     if stop_file.exists() or pause_file.exists():
@@ -4532,6 +4696,60 @@ async def run_single_account_loop(
                     _step = min(60.0, _ns_left - _ns_waited)
                     await asyncio.sleep(_step)
                     _ns_waited += _step
+                    # Radar passivo: solo lettura DOM, nessuna azione.
+                    if (
+                        _ns_waited - _ns_radar_last >= _ns_radar_next
+                        and observer is not None
+                        and browser.is_alive()
+                    ):
+                        _ns_radar_last = _ns_waited
+                        _ns_radar_next = random.uniform(600.0, 900.0)
+                        try:
+                            await browser.goto(selectors.PATH_DORF1)
+                            _inc_r, _out_r = (
+                                await observer.get_troop_movements(0)
+                            )
+                            _rvname = (
+                                await observer.extract_village_name()
+                            )
+                            _rx = _ry = None
+                            try:
+                                for _rv in (
+                                    await observer.get_all_villages()
+                                ):
+                                    if str(_rv.name or "") == str(
+                                        _rvname or ""
+                                    ):
+                                        _rx, _ry = _rv.x, _rv.y
+                                        break
+                            except Exception:  # noqa: BLE001
+                                pass
+                            if _rx is None:
+                                _rcfg = settings.village_config_for(
+                                    str(_rvname or "")
+                                )
+                                if _rcfg is not None:
+                                    _rx, _ry = _rcfg.x, _rcfg.y
+                            _sync_radar_movements(
+                                settings,
+                                str(_rvname or ""),
+                                _rx,
+                                _ry,
+                                _inc_r,
+                                _out_r,
+                                prefix=prefix,
+                            )
+                            logger.debug(
+                                "%s Scansione radar notturna: %d in "
+                                "arrivo, %d in partenza.",
+                                prefix, len(_inc_r), len(_out_r),
+                            )
+                        except Exception as _ns_exc:  # noqa: BLE001
+                            logger.debug(
+                                "%s Scansione radar notturna fallita "
+                                "(non bloccante): %s",
+                                prefix, _ns_exc,
+                            )
 
             except ConcurrentSessionError as cs_exc:
                 # Login manuale altrove (o sessione invalidata): il bot si

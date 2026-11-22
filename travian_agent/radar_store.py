@@ -41,12 +41,14 @@ CAT_HERO_ADVENTURE = "hero_adventure"
 CAT_OUTGOING_RAID = "outgoing_raid"
 CAT_OUTGOING_ATTACK = "outgoing_attack"
 CAT_INCOMING_ATTACK = "incoming_attack"
+CAT_REINFORCEMENT = "reinforcement"
 VALID_CATEGORIES = frozenset({
     CAT_MERCHANT,
     CAT_HERO_ADVENTURE,
     CAT_OUTGOING_RAID,
     CAT_OUTGOING_ATTACK,
     CAT_INCOMING_ATTACK,
+    CAT_REINFORCEMENT,
 })
 
 VALID_DIRECTIONS = frozenset({"outbound", "inbound", "return"})
@@ -56,6 +58,11 @@ VALID_DIRECTIONS = frozenset({"outbound", "inbound", "return"})
 # l'altro): l'id e' costruito su un bucket di 60s per deduplicare i
 # sync passivi senza perdere l'aggiornamento dell'ETA.
 _ETA_BUCKET_SECONDS = 60.0
+
+# Tolleranza dedup fuzzy: un movimento osservato dal sync passivo e'
+# lo stesso di uno registrato dall'azione bot se condividono categoria,
+# direzione e arrives_at entro questa finestra.
+_DEDUP_ETA_TOLERANCE = 15.0
 
 
 def make_move_id(
@@ -279,6 +286,26 @@ class RadarStore:
                 norm = normalize_movement(vkey, mv)
                 if norm is None:
                     continue
+                # Dedup fuzzy vs movimenti registrati dalle azioni bot:
+                # stesso vettore (categoria+direzione+ETA ~uguale) ma id
+                # diverso per controparte label differente -> riuso
+                # l'id esistente invece di creare un duplicato.
+                if norm["id"] not in bucket:
+                    arr = float(norm.get("arrives_at") or 0.0)
+                    for mid, prev_mv in bucket.items():
+                        if (
+                            prev_mv.get("category") == norm["category"]
+                            and prev_mv.get("direction")
+                            == norm["direction"]
+                            and abs(
+                                float(prev_mv.get("arrives_at") or 0.0)
+                                - arr
+                            )
+                            <= _DEDUP_ETA_TOLERANCE
+                            and mid not in seen
+                        ):
+                            norm["id"] = mid
+                            break
                 prev = bucket.get(norm["id"])
                 if prev and not norm.get("started_at"):
                     norm["started_at"] = prev.get("started_at") or 0.0
