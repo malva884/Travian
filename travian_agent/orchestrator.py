@@ -1813,6 +1813,35 @@ def _mv_get(mv, key: str, default=None):
     return getattr(mv, key, default)
 
 
+def _resolve_counterpart_coords(settings: Settings, who: str):
+    """(x, y) della controparte se e' un villaggio noto dell'account.
+
+    Il box '#movements' di dorf1 non espone link mappa: il nome del
+    villaggio controparte nel label (es. 'Pizzo') viene risolto via
+    ``settings.village_config_for`` / scansione dei nomi configurati.
+    Ritorna ``(None, None)`` per controparti esterne.
+    """
+    text = str(who or "").strip()
+    if not text:
+        return None, None
+    low = text.lower()
+    try:
+        villages = getattr(settings, "villages", None) or {}
+        # Match esatto nome -> config (chiave o campo name).
+        for key, cfg in villages.items():
+            names = {str(getattr(cfg, "name", "") or ""), str(key)}
+            for nm in names:
+                nm = nm.strip().lower()
+                if nm and nm in low:
+                    cx = getattr(cfg, "x", None)
+                    cy = getattr(cfg, "y", None)
+                    if cx is not None and cy is not None:
+                        return cx, cy
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
 def _sync_radar_movements(
     settings: Settings,
     vname: str,
@@ -1855,6 +1884,10 @@ def _sync_radar_movements(
                 _mv_get(mv, "attacker", "") or _mv_get(mv, "label", "")
                 or "Movimento in arrivo"
             )[:80]
+            _approx = False
+            if cx is None or cy is None:
+                cx, cy = _resolve_counterpart_coords(settings, who)
+                _approx = cx is None or cy is None
             moves.append(
                 {
                     "category": cat,
@@ -1870,7 +1903,8 @@ def _sync_radar_movements(
                         "troops_summary": str(
                             _mv_get(mv, "troop_count",
                                     _mv_get(mv, "count") or "") or ""
-                        )
+                        ),
+                        "approx_coords": _approx,
                     },
                 }
             )
@@ -1892,6 +1926,10 @@ def _sync_radar_movements(
                 _mv_get(mv, "attacker", "") or _mv_get(mv, "label", "")
                 or "Movimento in partenza"
             )[:80]
+            _approx = False
+            if cx is None or cy is None:
+                cx, cy = _resolve_counterpart_coords(settings, who)
+                _approx = cx is None or cy is None
             moves.append(
                 {
                     "category": cat,
@@ -1907,7 +1945,8 @@ def _sync_radar_movements(
                         "troops_summary": str(
                             _mv_get(mv, "troop_count",
                                     _mv_get(mv, "count") or "") or ""
-                        )
+                        ),
+                        "approx_coords": _approx,
                     },
                 }
             )

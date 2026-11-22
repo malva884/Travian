@@ -1949,7 +1949,9 @@ class TravianParser:
              if isinstance(r, dict)],
         )
 
-    async def read_market_movements(self) -> list[dict]:
+    async def read_market_movements(
+        self, market_slot: int = 0, village_id: int = 0
+    ) -> list[dict]:
         """Righe 'Mercanti in viaggio' della pagina Mercato corrente.
 
         Il tab 'Invia risorse' (build.php?id=<slot>&t=5 / market) mostra
@@ -1957,12 +1959,14 @@ class TravianParser:
         mercanti in arrivo (inbound), con villaggio controparte (x|y),
         risorse trasportate e countdown .timer. Ritorna dict grezzi:
         ``{direction, secs, cx, cy, resources, counterpart, label}``.
+
+        Se la pagina non contiene la sezione mercanti (es. DOM aggiornato
+        dopo il submit senza ricaricare la tabella) naviga a
+        ``build.php?id=<slot>&t=5`` e rilegge le righe.
         """
         if not self.page:
             return []
-        try:
-            raw = await self.page.evaluate(
-                """
+        _JS_MARKET_ROWS = """
                 () => {
                     const stripInv = (s) => (s || '').replace(
                         /[‎‏‪-‮ ­﻿−]/g, ''
@@ -1979,12 +1983,16 @@ class TravianParser:
                             tbl.innerText || ''
                         ).slice(0, 300).toLowerCase();
                         let dir = '';
-                        if (/in arriv|ankomm|incoming|en route to you|
-                             verso di te/i.test(head)) dir = 'inbound';
-                        else if (/in viagg|unterwegs|on the way|
-                                  outgoing|partenz/i.test(head)) {
-                            dir = 'outbound';
-                        }
+                        const reIn = new RegExp(
+                            'in arriv|ankomm|incoming|en route to you|' +
+                            'verso di te', 'i'
+                        );
+                        const reOut = new RegExp(
+                            'in viagg|unterwegs|on the way|outgoing|' +
+                            'partenz', 'i'
+                        );
+                        if (reIn.test(head)) dir = 'inbound';
+                        else if (reOut.test(head)) dir = 'outbound';
                         tbl.querySelectorAll('tr').forEach(row => {
                             const rowText = stripInv(
                                 row.innerText || ''
@@ -2079,11 +2087,59 @@ class TravianParser:
                     return out;
                 }
                 """
-            )
+
+        async def _read_rows() -> list[dict]:
+            raw = await self.page.evaluate(_JS_MARKET_ROWS)
             return [r for r in (raw or []) if isinstance(r, dict)]
+
+        try:
+            rows = await _read_rows()
         except Exception as exc:  # noqa: BLE001
             logger.debug("Parse 'Mercanti in viaggio' fallito: %s", exc)
             return []
+        if rows:
+            return rows
+        # Fallback: sezione mercanti assente sul DOM corrente (post-submit
+        # o tab sbagliato) -> naviga al tab t=5 e rilegge.
+        slot = int(market_slot or 0)
+        if not slot:
+            m_id = re.search(r"[?&]id=(\d+)", self.page.url or "")
+            if m_id:
+                slot = int(m_id.group(1))
+        if not slot:
+            try:
+                slot = int(
+                    await self.page.evaluate(
+                        """() => {
+                            const a = document.querySelector(
+                                'a[href*="gid=17"], a[href*="t=5"]'
+                            );
+                            const m = a
+                                ? (a.getAttribute('href') || '')
+                                    .match(/id=(\\d+)/)
+                                : null;
+                            return m ? parseInt(m[1], 10) : 0;
+                        }"""
+                    )
+                    or 0
+                )
+            except Exception:  # noqa: BLE001
+                slot = 0
+        if not slot:
+            return rows
+        url = f"{selectors.PATH_BUILD}?id={slot}&t=5"
+        if village_id:
+            url += f"&newdid={village_id}"
+        try:
+            await self._goto(
+                _abs_game_url(self.page.url or "", url), timeout=20000
+            )
+            rows = await _read_rows()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Fallback 'Mercanti in viaggio' (t=5) fallito: %s", exc
+            )
+        return rows
 
     async def get_troop_movements(
         self, rally_slot: int = 0, village_id: int = 0
@@ -2139,7 +2195,20 @@ class TravianParser:
         if village_id:
             url += f"&newdid={village_id}"
         try:
-            if f"id={rally_slot}" not in (self.page.url or ""):
+            _url_now = self.page.url or ""
+            # Righe dorf1 prive di coordinate: la panoramica rally
+            # espone i link mappa (x|y) e i nomi dei target — la visita
+            # e' forzata anche se l'URL punta gia' all'edificio ma su un
+            # altro tab (es. tt=1 'Invia truppe' dopo un'azione bot).
+            _coordless = any(
+                r.get("cx") is None or r.get("cy") is None
+                for r in (dorf1_in or []) + (dorf1_out or [])
+            )
+            _need_nav = (
+                f"id={rally_slot}" not in _url_now
+                or (_coordless and "tt=" in _url_now)
+            )
+            if _need_nav:
                 await self._goto(
                     _abs_game_url(self.page.url or "", url),
                     timeout=20000,

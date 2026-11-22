@@ -122,6 +122,10 @@ def normalize_movement(
         or data.get("label")
         or ""
     )[:80]
+    fx = _int_or_none(data.get("from_x"))
+    fy = _int_or_none(data.get("from_y"))
+    tx = _int_or_none(data.get("to_x"))
+    ty = _int_or_none(data.get("to_y"))
     move = {
         "id": str(
             data.get("id")
@@ -129,10 +133,14 @@ def normalize_movement(
         ),
         "category": category,
         "direction": direction,
-        "from_x": _int_or_none(data.get("from_x")),
-        "from_y": _int_or_none(data.get("from_y")),
-        "to_x": _int_or_none(data.get("to_x")),
-        "to_y": _int_or_none(data.get("to_y")),
+        "from_x": fx,
+        "from_y": fy,
+        "to_x": tx,
+        "to_y": ty,
+        # False = il renderer proietta il vettore dal bordo radar;
+        # i movimenti senza coordinate restano comunque validi e
+        # conteggiati nei badge (spec sync live dorf1/mercato).
+        "has_coords": all(v is not None for v in (fx, fy, tx, ty)),
         "label": str(data.get("label") or counterpart)[:90],
         "counterpart": counterpart,
         "started_at": float(
@@ -146,6 +154,9 @@ def normalize_movement(
             "troops_summary": str(
                 (data.get("details") or {}).get("troops_summary") or ""
             )[:80],
+            "approx_coords": bool(
+                (data.get("details") or {}).get("approx_coords")
+            ),
         },
     }
     return move

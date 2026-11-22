@@ -3528,6 +3528,8 @@ class ActionExecutor:
         ty,
         target_label: str,
         resources: dict | None = None,
+        market_slot: int = 0,
+        village_id: int = 0,
     ) -> None:
         """Vettore Mercanti outbound + segmento di ritorno sul radar.
 
@@ -3681,7 +3683,10 @@ class ActionExecutor:
         try:
             from .sensors import TravianParser
 
-            rows = await TravianParser(page).read_market_movements()
+            rows = await TravianParser(page).read_market_movements(
+                market_slot=int(market_slot or 0),
+                village_id=int(village_id or 0),
+            )
             if rows:
                 now2 = time.time()
                 synced: list[dict] = []
