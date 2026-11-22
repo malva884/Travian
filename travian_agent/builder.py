@@ -39,6 +39,7 @@ from .building_prereqs import (
     GID_GRAIN_MILL,
     GID_IRON_MINE,
     GID_WOODCUTTER,
+    missing_prereqs,
     GID_LABELS,
     GID_MAIN_BUILDING,
     GID_TOWN_HALL,
@@ -312,7 +313,13 @@ def upgradeable_fields(
 def storage_needed(
     state: GameState, threshold: float = _STORAGE_WARN_RATIO
 ) -> list[int]:
-    """Gid degli storage da potenziare perche' quasi pieni."""
+    """Gid degli storage da potenziare perche' quasi pieni.
+
+    Uno storage gia' in coda di costruzione non e' piu' 'needed': il
+    blocco "Storage al limite" resta silente finche' il lavoro in corso
+    non e' completato, lasciando il passo alla Coda Prioritaria invece
+    di proporre un secondo upgrade gemello.
+    """
     res = state.resources
     needed: list[int] = []
     if res.warehouse_capacity > 0 and (
@@ -321,6 +328,17 @@ def storage_needed(
         needed.append(GID_WAREHOUSE)
     if res.granary_capacity > 0 and res.crop >= res.granary_capacity * threshold:
         needed.append(GID_GRANARY)
+    if needed:
+        # Upgrade in corso riconosciuto per gid esplicito dell'item,
+        # altrimenti dallo slot della coda risalendo al gid del field.
+        queued_gids = {q.gid for q in state.build_queue if q.gid > 0}
+        slot_gid = {f.slot_id: f.gid for f in state.fields}
+        queued_gids.update(
+            slot_gid.get(q.slot_id, 0)
+            for q in state.build_queue
+            if q.slot_id > 0
+        )
+        needed = [g for g in needed if g not in queued_gids]
     return needed
 
 
@@ -785,6 +803,61 @@ def _pick_group_gid(state: GameState, gids: tuple[int, ...]) -> int:
     return gids[0]
 
 
+def _prereq_intent(
+    state: GameState, gid: int, slot_id: int
+) -> Field | None:
+    """Candidato prerequisito per uno step della Coda Prioritaria.
+
+    Quando la nuova costruzione `gid` e' bloccata dai requisiti (es.
+    Palazzo senza Ambasciata liv. 1) lo step non viene scartato: il
+    primo requisito interno mancante diventa il candidato — upgrade
+    dell'edificio esistente se e' solo sotto livello, altrimenti nuova
+    costruzione sull'area `slot_id` riservata allo step quando anche i
+    SUOI prerequisiti reggono. I requisiti a campo risorsa non sono
+    auto-risolvibili su un'area dorf2 e restano bloccanti.
+    """
+    cap_ok, missing = missing_prereqs(state.fields, gid, is_capital(state))
+    if not cap_ok or not missing:
+        return None
+    queued = queued_slot_ids(state)
+    interiors = state.interior_fields()
+    existing = {f.gid for f in interiors}
+    for req_gid, req_level in missing:
+        if req_gid in FIELD_GID_TYPES:
+            continue  # campo risorsa: niente auto-costruzione in dorf2
+        built = next((f for f in interiors if f.gid == req_gid), None)
+        if built is not None:
+            # Esiste ma e' sotto il livello richiesto: upgrade del
+            # prerequisito al posto della nuova costruzione.
+            if (
+                built.level < req_level
+                and built.slot_id not in queued
+                and built.level < field_max_level(state, built)
+            ):
+                return built
+            continue
+        # Assente: costruibile sull'area dello step solo se anche i
+        # suoi prerequisiti reggono (catena risolta un livello alla
+        # volta, es. Palazzo -> Ambasciata -> Centro Villaggio).
+        ok, _why = prereqs_met(state.fields, req_gid, is_capital(state))
+        if not ok:
+            continue
+        if any(
+            req_gid in group
+            and any(o != req_gid and o in existing for o in group)
+            for group in _MUTUALLY_EXCLUSIVE_GIDS
+        ):
+            continue
+        return Field(
+            slot_id=slot_id,
+            name=GID_LABELS.get(req_gid, f"slot {slot_id}"),
+            level=0,
+            resource_type=None,
+            gid=req_gid,
+        )
+    return None
+
+
 def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
     """Pool candidati della Coda Prioritaria PRIMA del filtro slot-coda.
 
@@ -848,6 +921,13 @@ def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
             if cur_lvl == 0:
                 ok, why = prereqs_met(state.fields, gid, is_capital(state))
                 if not ok:
+                    # Prerequisiti mancanti (spec): lo step non viene
+                    # scartato — si propone il primo requisito interno
+                    # costruibile (es. Palazzo -> Ambasciata liv. 1).
+                    prereq_field = _prereq_intent(state, gid, slot_id)
+                    if prereq_field is not None:
+                        out.append(prereq_field)
+                        continue
                     logger.debug(
                         "[%s] Nuovo edificio gid %d bloccato: %s",
                         state.village_name,
@@ -1050,6 +1130,10 @@ def focus_skip_reasons(
             gid = it.gid if it.gid > 0 else _pick_group_gid(state, gids)
             ok, why = prereqs_met(state.fields, gid, is_capital(state))
             if not ok:
+                # Step applicabile via prerequisito automatico: nessun
+                # motivo di blocco da segnalare.
+                if _prereq_intent(state, gid, slot_id) is not None:
+                    break
                 reasons.append(f"'{label}' nuova costruzione bloccata: {why}")
                 continue
             break

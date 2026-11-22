@@ -223,6 +223,36 @@ def _field_level(fields: list[Field], res_type: ResourceType) -> int:
     )
 
 
+def missing_prereqs(
+    fields: list[Field],
+    gid: int,
+    is_capital: bool = False,
+) -> tuple[bool, list[tuple[int, int]]]:
+    """Prerequisiti mancanti per costruire `gid` su un'area vuota.
+
+    Ritorna (capital_ok, [(gid_richiesto, livello_minimo), ...]):
+    ``capital_ok`` False quando l'edificio e' riservato alla capitale e
+    il villaggio non lo e' — un blocco che la coda non puo' risolvere
+    da sola. La lista vuota significa requisiti tutti soddisfatti.
+    """
+    reqs, capital_only = _PREREQS.get(gid, ([], False))
+    if capital_only and not is_capital:
+        return False, []
+    missing: list[tuple[int, int]] = []
+    for req_gid, req_level in reqs:
+        if req_gid in FIELD_GID_TYPES:
+            have = _field_level(fields, FIELD_GID_TYPES[req_gid])
+        else:
+            have = max(
+                (f.level for f in fields
+                 if not f.is_resource_field and f.gid == req_gid),
+                default=0,
+            )
+        if have < req_level:
+            missing.append((req_gid, req_level))
+    return True, missing
+
+
 def prereqs_met(
     fields: list[Field],
     gid: int,
@@ -234,21 +264,12 @@ def prereqs_met(
     chiamante non dovrebbe invocare questa funzione: l'esistenza stessa
     garantisce i prerequisiti.
     """
-    reqs, capital_only = _PREREQS.get(gid, ([], False))
-    if capital_only and not is_capital:
+    cap_ok, missing = missing_prereqs(fields, gid, is_capital)
+    if not cap_ok:
         return False, "costruibile solo in capitale"
-    missing: list[str] = []
-    for req_gid, req_level in reqs:
-        if req_gid in FIELD_GID_TYPES:
-            have = _field_level(fields, FIELD_GID_TYPES[req_gid])
-        else:
-            have = max(
-                (f.level for f in fields
-                 if not f.is_resource_field and f.gid == req_gid),
-                default=0,
-            )
-        if have < req_level:
-            missing.append(f"gid {req_gid} liv.{req_level}")
     if missing:
-        return False, "manca " + ", ".join(missing)
+        return False, "manca " + ", ".join(
+            f"gid {req_gid} liv.{req_level}"
+            for req_gid, req_level in missing
+        )
     return True, ""
