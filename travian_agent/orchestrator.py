@@ -3055,6 +3055,32 @@ async def monitor_all_villages(
                     ac_state = await observer.read_academy_state(
                         academy.slot_id, village.village_id
                     )
+                    # Rettifiche slot->gid: il sensore ha verificato che
+                    # la pagina aperta fosse davvero gid 22; se la mappa
+                    # era errata (es. data-aid ambiguo su UI moderne) le
+                    # correzioni vengono applicate subito cosi' i planner
+                    # downstream vedono i gid reali.
+                    _corr = (ac_state or {}).get("slot_corrections") or {}
+                    _resolved = int((ac_state or {}).get("resolved_slot") or 0)
+                    if _corr:
+                        for _f in state.fields:
+                            _g = _corr.get(_f.slot_id)
+                            if _g is not None and _f.gid != int(_g):
+                                _f.gid = int(_g)
+                        _imap = interior_map.get(
+                            village.name or str(village.village_id)
+                        ) or []
+                        for _f in _imap:
+                            _g = _corr.get(_f.slot_id)
+                            if _g is not None and _f.gid != int(_g):
+                                _f.gid = int(_g)
+                    if _resolved and _resolved != academy.slot_id:
+                        academy = Field(
+                            slot_id=_resolved,
+                            name=academy.name,
+                            level=academy.level,
+                            gid=GID_ACADEMY,
+                        )
                     if not ac_state:
                         _record_decision(
                             settings,

@@ -13,7 +13,7 @@ from urllib.parse import urljoin
 from playwright.async_api import Page
 
 from . import selectors
-from .building_prereqs import FIELD_GID_TYPES
+from .building_prereqs import FIELD_GID_TYPES, GID_ACADEMY
 from .server_profile import calibrate_routing, profile_for_url
 from .telemetry_capture import capture_anomaly
 from .models import (
@@ -1334,32 +1334,73 @@ class TravianParser:
             interior_data = await page.evaluate("""
                 () => {
                     const buildings = {};
-                    const nodes = document.querySelectorAll(
-                        '#village_map .buildingSlot, #villageMap .buildingSlot, ' +
-                        '.buildingSlot, a[href*="build.php?id="], area[href*="build.php?id="], [data-aid]'
+                    // Scope alla mappa del villaggio: [data-aid] fuori
+                    // dalla mappa (menu costruzione, tooltip) puo'
+                    // veicolare il building-aid, non lo slot.
+                    const mapScope = document.querySelector(
+                        '#village_map, #villageMap, .villageMap, ' +
+                        'map[name*="village" i], [id*="villagemap" i]'
+                    ) || document;
+                    const nodes = mapScope.querySelectorAll(
+                        '.buildingSlot, a[href*="build.php"], ' +
+                        'a[href*="dorf2.php"], a[href*="/building"], ' +
+                        'area[href], [data-aid], [data-gid], ' +
+                        '[data-slot], [data-did]'
                     );
+                    const attr = (e, k) =>
+                        (e && e.getAttribute) ? e.getAttribute(k) : null;
                     nodes.forEach(el => {
                         const cls = el.getAttribute('class') || '';
                         const inner = el.querySelector('a') || el;
+                        const href =
+                            (inner.getAttribute &&
+                             inner.getAttribute('href')) ||
+                            attr(el, 'href') || '';
 
-                        // slot id: href build.php?id=N > classe 'aN' > data-aid
+                        // ---- slot_id ----------------------------------
+                        // Fonti ordinate: href ?id=N > data-slot/data-did
+                        // > classe aN (posizione sulla mappa) > data-aid
+                        // (usato come slot solo in assenza di fonti
+                        // affidabili — su UI moderne puo' essere il
+                        // building-aid, cioe' il gid).
+                        const idMatch = href.match(/[?&]id=(\\d+)/);
+                        const dSlot =
+                            attr(el, 'data-slot') ||
+                            attr(el, 'data-slotid') ||
+                            attr(el, 'data-did') ||
+                            attr(inner, 'data-slot') ||
+                            attr(inner, 'data-did');
+                        const aCls = cls.match(/\\ba(\\d+)\\b/);
+                        const aid = attr(el, 'data-aid') ||
+                                    attr(inner, 'data-aid');
                         let slotId = null;
-                        const href = (inner.getAttribute && inner.getAttribute('href')) ||
-                                     el.getAttribute('href') || '';
-                        const idMatch = href.match(/build\\.php[^#\\s]*?\\bid=(\\d+)/) || href.match(/[?&]id=(\\d+)/);
-                        const clsMatch = cls.match(/\\ba(\\d+)\\b/);
-                        const aid = el.getAttribute('data-aid') || inner.getAttribute?.('data-aid');
                         if (idMatch) slotId = parseInt(idMatch[1], 10);
-                        else if (clsMatch) slotId = parseInt(clsMatch[1], 10);
-                        else if (aid && /^\\d+$/.test(aid)) slotId = parseInt(aid, 10);
-
+                        else if (dSlot && /^\\d+$/.test(dSlot))
+                            slotId = parseInt(dSlot, 10);
+                        else if (aCls) slotId = parseInt(aCls[1], 10);
+                        else if (aid && /^\\d+$/.test(aid))
+                            slotId = parseInt(aid, 10);
                         // Solo edifici interni del dorf2
-                        if (slotId === null || slotId < 19 || slotId > 40) return;
+                        if (slotId === null || slotId < 19 || slotId > 40)
+                            return;
 
-                        // gid: classe 'gN' del markup Travian (g10 magazzino, g11 granaio, g0 vuoto)
+                        // ---- gid --------------------------------------
+                        // Fonti ordinate: data-gid > data-aid diverso
+                        // dallo slotId (building-aid UI moderne) >
+                        // classe gN/gidN del markup classico.
+                        const dGid = attr(el, 'data-gid') ||
+                                     attr(inner, 'data-gid');
+                        const gCls = cls.match(/\\bg(\\d+)\\b/) ||
+                                     cls.match(/\\bgid(\\d+)\\b/);
                         let gid = -1;
-                        const gidMatch = cls.match(/\\bg(\\d+)\\b/);
-                        if (gidMatch) gid = parseInt(gidMatch[1], 10);
+                        if (dGid && /^\\d+$/.test(dGid))
+                            gid = parseInt(dGid, 10);
+                        else if (
+                            aid && /^\\d+$/.test(aid) &&
+                            parseInt(aid, 10) !== slotId
+                        )
+                            gid = parseInt(aid, 10);
+                        else if (gCls) gid = parseInt(gCls[1], 10);
 
                         // nome e livello: title/alt/innerText > sotto-elementi dedicati
                         const title = (inner.getAttribute && inner.getAttribute('title')) ||
@@ -1372,10 +1413,19 @@ class TravianParser:
                         const lvlMatch = (levelSrc || '').match(/(\\d+)/g);
                         if (lvlMatch) level = parseInt(lvlMatch[lvlMatch.length - 1], 10);
 
-                        // Se lo stesso slot compare due volte, tieni la versione piu' ricca
+                        // Merge per-campo: una versione piu' povera non
+                        // puo' sovrascrivere gid/nome/livello gia' letti.
                         const prev = buildings[slotId];
-                        if (!prev || (!prev.name && name) || (prev.level === null && level !== null)) {
-                            buildings[slotId] = { slot_id: slotId, gid: gid, name: name, level: level };
+                        if (!prev) {
+                            buildings[slotId] = {
+                                slot_id: slotId, gid: gid,
+                                name: name, level: level
+                            };
+                        } else {
+                            if (prev.gid < 0 && gid >= 0) prev.gid = gid;
+                            if (!prev.name && name) prev.name = name;
+                            if (prev.level === null && level !== null)
+                                prev.level = level;
                         }
                     });
                     return buildings;
@@ -2552,6 +2602,98 @@ class TravianParser:
         }
     """
 
+    async def _goto_building_slot(
+        self, slot_id: int, village_id: int = 0
+    ) -> bool:
+        """Naviga a ``?id=<slot>`` senza redirect inutili.
+
+        Appende ``&newdid`` solo quando il villaggio attivo differisce da
+        ``village_id`` (evita il round-trip di cambio contesto). Ritorna
+        False se la navigazione fallisce o se l'URL finale non e' una
+        pagina edificio.
+        """
+        if not self.page or not slot_id:
+            return False
+        url = self._building_url_path(slot_id)
+        if village_id and self._current_newdid() != int(village_id):
+            url += f"&newdid={village_id}"
+        try:
+            await self._goto(_abs_game_url(self.page.url or "", url))
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            from .actions import _is_building_url  # no cicli
+
+            if not _is_building_url(self.page.url or ""):
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _detect_building_gid(self) -> int | None:
+        """gid reale della pagina edificio aperta (``div#build.gidN``).
+
+        Fonte di verita' sul tipo di edificio effettivamente caricato:
+        serve a intercettare mapping slot->gid errati della mappa
+        villaggio (es. UI moderne con data-aid ambiguo). ``None`` se la
+        classe gid non e' leggibile.
+        """
+        if not self.page:
+            return None
+        try:
+            gid = await self.page.evaluate("""
+                () => {
+                    const b = document.querySelector(
+                        '#build, .buildingDetails, .build'
+                    );
+                    const pick = (el) => {
+                        if (!el) return null;
+                        const cls = el.getAttribute('class') || '';
+                        const m = cls.match(/\\bgid?(\\d{1,2})\\b/);
+                        return m ? parseInt(m[1], 10) : null;
+                    };
+                    let g = pick(b);
+                    if (g === null) {
+                        g = pick(document.querySelector(
+                            '#content [class*="gid"], #build [class*="gid"]'
+                        ));
+                    }
+                    return g;
+                }
+            """)
+            return int(gid) if gid is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _locate_gid_slot(
+        self,
+        target_gid: int,
+        village_id: int,
+        slot_corrections: dict[int, int],
+    ) -> int | None:
+        """Rilegge la mappa dorf2 e cerca lo slot con ``gid=target_gid``.
+
+        Effetto collaterale: ``slot_corrections`` viene popolato con i
+        gid reali rilevati (rettifiche da applicare a ``state.fields``).
+        Ritorna lo slot_id del target o ``None``.
+        """
+        try:
+            interiors = await self.read_interior_fields()
+        except Exception:  # noqa: BLE001
+            return None
+        if not interiors:
+            return None
+        found: int | None = None
+        for f in interiors:
+            gid = int(getattr(f, "gid", -1) or -1)
+            sid = int(getattr(f, "slot_id", 0) or 0)
+            if sid < 19 or sid > 40 or gid < 0:
+                continue
+            slot_corrections.setdefault(sid, gid)
+            if gid == target_gid and found is None:
+                found = sid
+        return found
+
     async def read_academy_state(
         self, academy_slot: int, village_id: int = 0
     ) -> dict:
@@ -2569,39 +2711,87 @@ class TravianParser:
           risorse insufficienti/prerequisiti mancanti;
         - ``researching``: chiavi tN in corso di ricerca.
 
-        Ritorna {} se la pagina non espone dati riconoscibili.
+        Ritorna {} se la pagina non espone dati riconoscibili. Quando il
+        gid rilevato diverge da 22 (mappa villaggio errata) la chiave
+        ``slot_corrections`` riporta le rettifiche slot->gid da applicare
+        a ``state.fields`` e ``resolved_slot`` lo slot reale dell'Accademia.
         """
         if not self.page or not academy_slot:
             return {}
-        # Nessun redirect: se il villaggio attivo e' gia' village_id il
-        # parametro newdid non serve (evita il round-trip server-side);
-        # se diverso il newdid forza il cambio contesto.
-        cur_did = self._current_newdid()
-        url = self._building_url_path(academy_slot)
-        if village_id and cur_did != int(village_id):
-            url += f"&newdid={village_id}"
-        try:
-            await self._goto(_abs_game_url(self.page.url or "", url))
-        except Exception as exc:  # noqa: BLE001
+        if not await self._goto_building_slot(academy_slot, village_id):
             logger.debug(
-                "read_academy_state: navigazione slot %s fallita: %s",
-                academy_slot, exc,
+                "read_academy_state: navigazione slot %s fallita o "
+                "URL non edificio (%s)",
+                academy_slot, (self.page.url or "")[:120],
             )
             return {}
-        # Guard: l'URL finale deve restare una pagina edificio — un
-        # redirect fuori contesto (dorf1/index) renderebbe la lettura
-        # inattendibile.
-        try:
-            from .actions import _is_building_url  # no cicli
 
-            if not _is_building_url(self.page.url or ""):
-                logger.debug(
-                    "read_academy_state: URL finale non edificio: %s",
-                    (self.page.url or "")[:120],
+        # Coerenza gid: la pagina aperta deve essere davvero l'Accademia
+        # (gid 22). Su UI moderne la mappa puo' aver associato slot->gid
+        # sbagliati (data-aid ambiguo): si corregge la mappa e si cerca
+        # lo slot reale.
+        resolved_slot = academy_slot
+        slot_corrections: dict[int, int] = {}
+        detected = await self._detect_building_gid()
+        if detected is not None and detected != GID_ACADEMY:
+            logger.info(
+                "read_academy_state: slot %s non e' Accademia "
+                "(gid=%s rilevato, atteso 22) — correzione mappa",
+                academy_slot, detected,
+            )
+            slot_corrections[academy_slot] = detected
+            try:
+                await capture_anomaly(
+                    self.page,
+                    "ACADEMY_WRONG_GID",
+                    slot_id=academy_slot,
+                    expected_gid=GID_ACADEMY,
+                    detected_gid=detected,
+                    village_id=village_id,
                 )
-                return {}
-        except Exception:  # noqa: BLE001
-            pass
+            except Exception:  # noqa: BLE001
+                pass
+            # Recovery 1: rilettura dorf2 (JS gia' corretto per
+            # data-aid/data-gid) per localizzare lo slot con gid 22.
+            new_slot = await self._locate_gid_slot(
+                GID_ACADEMY, village_id, slot_corrections
+            )
+            if new_slot is None:
+                # Recovery 2: scansione selettiva degli slot 19-40 fino a
+                # trovare div#build.gid22. Solo slot non marcati vuoti
+                # dalla mappa corretta — i g0 sono aree libere.
+                empty = {
+                    sid for sid, g in slot_corrections.items() if g == 0
+                }
+                for sid in range(19, 41):
+                    if sid in empty:
+                        continue
+                    if not await self._goto_building_slot(sid, village_id):
+                        continue
+                    g = await self._detect_building_gid()
+                    if g is not None and g != GID_ACADEMY:
+                        slot_corrections.setdefault(sid, g)
+                    if g == GID_ACADEMY:
+                        new_slot = sid
+                        break
+            if new_slot is None:
+                logger.debug(
+                    "read_academy_state: nessun slot gid22 trovato "
+                    "(correzioni: %s)",
+                    slot_corrections,
+                )
+                return {"slot_corrections": slot_corrections}
+            resolved_slot = new_slot
+            # Naviga allo slot reale e verifica il gid ancora una volta
+            # (il locate gia' l'ha aperto nello scan; nel path dorf2
+            # serve la navigazione).
+            if not await self._goto_building_slot(
+                resolved_slot, village_id
+            ):
+                return {"slot_corrections": slot_corrections}
+            final_gid = await self._detect_building_gid()
+            if final_gid is not None and final_gid != GID_ACADEMY:
+                return {"slot_corrections": slot_corrections}
         try:
             raw = await self.page.evaluate(self._JS_ACADEMY_SNAPSHOT)
         except Exception as exc:  # noqa: BLE001
@@ -2628,6 +2818,17 @@ class TravianParser:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # La rettifica della mappa non si perde col fallimento del
+            # parse: l'orchestratore la applica a state.fields.
+            if slot_corrections:
+                return {"slot_corrections": dict(slot_corrections)}
+        else:
+            # Metadati di recovery per il chiamante: lo slot reale
+            # risolto e le rettifiche slot->gid da applicare a
+            # state.fields (mappa villaggio).
+            state["resolved_slot"] = resolved_slot
+            if slot_corrections:
+                state["slot_corrections"] = dict(slot_corrections)
         return state
 
     async def read_trainable_units(
