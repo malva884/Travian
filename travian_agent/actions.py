@@ -2087,6 +2087,17 @@ class ActionExecutor:
         # La pagina corrente mostra gia' la conferma/tabella 'Mercanti in
         # viaggio' — la lettura ETA non costa navigazioni extra.
         try:
+            if sx is None or sy is None:
+                # Coordinate mittente mancanti: risolvi dal profilo del
+                # villaggio attivo (nome letto a pagina o newdid).
+                try:
+                    _sv = self.settings.village_config_for(
+                        str(sender_name or village_id)
+                    )
+                    if _sv and _sv.x is not None and _sv.y is not None:
+                        sx, sy = _sv.x, _sv.y
+                except Exception:  # noqa: BLE001
+                    pass
             await self._register_merchant_moves(
                 page,
                 village_key=str(
@@ -2098,6 +2109,8 @@ class ActionExecutor:
                 ty=int(ty) if ty is not None else None,
                 target_label=str(target or ""),
                 resources=resources_dict,
+                market_slot=int(market_slot or 0),
+                village_id=int(village_id or 0),
             )
         except Exception as _rad_exc:
             logger.debug(
@@ -3591,8 +3604,10 @@ class ActionExecutor:
                     )
             except Exception:  # noqa: BLE001
                 eta_secs = 0.0
-        if eta_secs <= 0:
-            return
+        # Nessun return anticipato: con ETA ignota si salta solo la
+        # registrazione del vettore appena inviato, ma il sync della
+        # tabella 'Mercanti in viaggio' sotto viene eseguito comunque
+        # (copre anche gli invii manuali dell'utente).
         now = time.time()
         arrives = now + eta_secs
         label = str(target_label or "")
@@ -3603,79 +3618,89 @@ class ActionExecutor:
             for k, v in (resources or {}).items()
             if isinstance(v, (int, float)) and int(v) > 0
         }
-        rs.register(
-            village_key,
-            {
-                "category": CAT_MERCHANT,
-                "direction": "outbound",
-                "from_x": sx,
-                "from_y": sy,
-                "to_x": tx,
-                "to_y": ty,
-                "counterpart": label,
-                "label": label,
-                "started_at": now,
-                "arrives_at": arrives,
-                "details": {"resources": res_details},
-            },
-        )
-        # Segmento di ritorno dei mercanti: parte quando arrivano e
-        # impiega la stessa durata dell'andata.
-        rs.register(
-            village_key,
-            {
-                "category": CAT_MERCHANT,
-                "direction": "return",
-                "from_x": tx,
-                "from_y": ty,
-                "to_x": sx,
-                "to_y": sy,
-                "counterpart": label,
-                "label": f"Ritorno mercanti {label}".strip(),
-                "started_at": arrives,
-                "arrives_at": arrives + eta_secs,
-                "details": {"resources": {}},
-            },
-        )
-        # Vettore speculare inbound: se la destinazione e' un villaggio
-        # proprio dell'account, il radar lo visualizza anche quando
-        # l'utente seleziona il villaggio ricevente.
-        try:
-            for _key, _vcfg in (
-                getattr(self.settings, "villages", {}) or {}
-            ).items():
-                if (
-                    tx is not None
-                    and ty is not None
-                    and getattr(_vcfg, "x", None) == int(tx)
-                    and getattr(_vcfg, "y", None) == int(ty)
-                ):
-                    dest_key = (
-                        str(getattr(_vcfg, "name", "") or "") or str(_key)
-                    )
-                    if dest_key == village_key:
+        _n_reg = 0
+        if eta_secs > 0:
+            rs.register(
+                village_key,
+                {
+                    "category": CAT_MERCHANT,
+                    "direction": "outbound",
+                    "from_x": sx,
+                    "from_y": sy,
+                    "to_x": tx,
+                    "to_y": ty,
+                    "counterpart": label,
+                    "label": label,
+                    "started_at": now,
+                    "arrives_at": arrives,
+                    "details": {"resources": res_details},
+                },
+            )
+            # Segmento di ritorno dei mercanti: parte quando arrivano e
+            # impiega la stessa durata dell'andata.
+            rs.register(
+                village_key,
+                {
+                    "category": CAT_MERCHANT,
+                    "direction": "return",
+                    "from_x": tx,
+                    "from_y": ty,
+                    "to_x": sx,
+                    "to_y": sy,
+                    "counterpart": label,
+                    "label": f"Ritorno mercanti {label}".strip(),
+                    "started_at": arrives,
+                    "arrives_at": arrives + eta_secs,
+                    "details": {"resources": {}},
+                },
+            )
+            _n_reg = 2
+            # Vettore speculare inbound: se la destinazione e' un
+            # villaggio proprio dell'account, il radar lo visualizza
+            # anche quando l'utente seleziona il villaggio ricevente.
+            try:
+                for _key, _vcfg in (
+                    getattr(self.settings, "villages", {}) or {}
+                ).items():
+                    if (
+                        tx is not None
+                        and ty is not None
+                        and getattr(_vcfg, "x", None) == int(tx)
+                        and getattr(_vcfg, "y", None) == int(ty)
+                    ):
+                        dest_key = (
+                            str(getattr(_vcfg, "name", "") or "")
+                            or str(_key)
+                        )
+                        if dest_key == village_key:
+                            break
+                        rs.register(
+                            dest_key,
+                            {
+                                "category": CAT_MERCHANT,
+                                "direction": "inbound",
+                                "from_x": sx,
+                                "from_y": sy,
+                                "to_x": tx,
+                                "to_y": ty,
+                                "counterpart": village_key,
+                                "label": (
+                                    f"Mercanti da {village_key} {label}"
+                                ).strip(),
+                                "started_at": now,
+                                "arrives_at": arrives,
+                                "details": {"resources": res_details},
+                            },
+                        )
+                        _n_reg += 1
                         break
-                    rs.register(
-                        dest_key,
-                        {
-                            "category": CAT_MERCHANT,
-                            "direction": "inbound",
-                            "from_x": sx,
-                            "from_y": sy,
-                            "to_x": tx,
-                            "to_y": ty,
-                            "counterpart": village_key,
-                            "label": (
-                                f"Mercanti da {village_key} {label}"
-                            ).strip(),
-                            "started_at": now,
-                            "arrives_at": arrives,
-                            "details": {"resources": res_details},
-                        },
-                    )
-                    break
-        except Exception:  # noqa: BLE001
-            pass
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info(
+            "Radar: villaggio '%s' — invio mercanti verso '%s', "
+            "ETA %.0fs, %d vettori registrati",
+            village_key, label or "?", eta_secs, _n_reg,
+        )
         # Sync live della tabella 'Mercanti in viaggio': la pagina del
         # Mercato elenca TUTTE le spedizioni attive, comprese quelle
         # avviate manualmente dal giocatore. Per i mercanti in partenza
@@ -3760,8 +3785,13 @@ class ActionExecutor:
                         synced,
                         frozenset({CAT_MERCHANT}),
                     )
+                logger.info(
+                    "Radar: villaggio '%s' — %d righe 'Mercanti in "
+                    "viaggio' lette, %d vettori sincronizzati",
+                    village_key, len(rows), len(synced),
+                )
         except Exception as _mkt_exc:  # noqa: BLE001
-            logger.debug(
+            logger.warning(
                 "Sync radar tabella mercanti fallita: %s", _mkt_exc
             )
 

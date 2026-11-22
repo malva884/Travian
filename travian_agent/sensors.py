@@ -1942,12 +1942,33 @@ class TravianParser:
             self._movements_dorf1_ok = False
             return [], []
         raw = raw or {}
-        return (
-            [r for r in (raw.get("incoming") or [])
-             if isinstance(r, dict)],
-            [r for r in (raw.get("outgoing") or [])
-             if isinstance(r, dict)],
-        )
+        inc = [r for r in (raw.get("incoming") or [])
+               if isinstance(r, dict)]
+        outg = [r for r in (raw.get("outgoing") or [])
+                if isinstance(r, dict)]
+        if not inc and not outg:
+            # Diagnostica selettori: il box movimenti e' presente ma il
+            # parser non ha estratto righe — dump snippet DOM per
+            # allineare i selettori al markup reale del server.
+            try:
+                _snip = await self.page.evaluate(
+                    """() => {
+                        const el = document.querySelector(
+                            '#movements, .movements, ' +
+                            '[class*="movement"]'
+                        );
+                        return el ? (el.outerHTML || '').slice(0, 800)
+                                  : '';
+                    }"""
+                )
+                if _snip:
+                    logger.warning(
+                        "Radar: box movimenti dorf1 presente ma 0 righe "
+                        "parse — snippet DOM: %s", _snip,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        return inc, outg
 
     async def read_market_movements(
         self, market_slot: int = 0, village_id: int = 0
@@ -2099,6 +2120,32 @@ class TravianParser:
             return []
         if rows:
             return rows
+        # Diagnostica: il testo pagina menziona mercanti in viaggio ma
+        # il parser non ha estratto righe — selettori da allineare.
+        try:
+            _snip = await self.page.evaluate(
+                """() => {
+                    const txt = (document.body.innerText || '')
+                        .toLowerCase();
+                    if (!txt.includes('mercanti in') &&
+                        !txt.includes('merchants on') &&
+                        !txt.includes('händler unterwegs')) {
+                        return '';
+                    }
+                    const scope = document.querySelector(
+                        '#content, .content, main'
+                    ) || document.body;
+                    return (scope.innerHTML || '').slice(0, 800);
+                }"""
+            )
+            if _snip:
+                logger.warning(
+                    "Radar: pagina mercato menziona 'Mercanti in "
+                    "viaggio' ma 0 righe parse — snippet DOM: %s",
+                    _snip,
+                )
+        except Exception:  # noqa: BLE001
+            pass
         # Fallback: sezione mercanti assente sul DOM corrente (post-submit
         # o tab sbagliato) -> naviga al tab t=5 e rilegge.
         slot = int(market_slot or 0)

@@ -1950,9 +1950,17 @@ def _sync_radar_movements(
                     },
                 }
             )
-        rs.sync_categories(vkey, moves, _RADAR_SYNC_CATS)
+        _n = rs.sync_categories(vkey, moves, _RADAR_SYNC_CATS)
+        logger.info(
+            "%s Radar: villaggio '%s' — %d in/%d out letti, %d vettori "
+            "attivi nello store",
+            prefix, vkey, len(inc or []), len(outg or []),
+            _n if isinstance(_n, int) else len(moves),
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("%s Sync radar movimenti fallita: %s", prefix, exc)
+        logger.warning(
+            "%s Sync radar movimenti fallita: %s", prefix, exc
+        )
 
 
 async def monitor_all_villages(
