@@ -491,6 +491,9 @@ class TravianParser:
         # Anti-detection: navigazione via click DOM quando possibile
         # (impostata dall'orchestrator da settings.dom_navigation).
         self.dom_nav: bool = True
+        # Slot Piazza d'Armi risolto dal redirect build.php?gid=16 ->
+        # ?id=N (per village_id): riusato nei cicli successivi.
+        self._rally_slot_cache: dict[int, int] = {}
 
     async def _goto(self, url: str, **kwargs) -> None:
         """Naviga verso ``url`` preferendo i click DOM al GET diretto.
@@ -1977,7 +1980,7 @@ class TravianParser:
     """
 
     async def read_dorf1_movements(
-        self,
+        self, village_id: int = 0,
     ) -> tuple[list[dict], list[dict]]:
         """Righe grezze del box '#movements' della pagina corrente.
 
@@ -1988,6 +1991,27 @@ class TravianParser:
         """
         if not self.page:
             return [], []
+        # Su pagine non-villaggio il box '#movements' non esiste:
+        # ritorno rapido a dorf1.php cosi' i movimenti vengono letti
+        # ad ogni ciclo radar anche dopo azioni su tasks/reports/
+        # messages/statistiken/hero.
+        _url0 = self.page.url or ""
+        if re.search(
+            r"(?:tasks|reports?|messages?|statistiken|statistics|"
+            r"hero|spieler|allianz|karte)\.php",
+            _url0,
+        ):
+            try:
+                _durl = selectors.PATH_DORF1
+                if village_id:
+                    _durl += f"?newdid={int(village_id)}"
+                await self._goto(
+                    _abs_game_url(_url0, _durl),
+                    timeout=20000,
+                    wait_until="domcontentloaded",
+                )
+            except Exception:  # noqa: BLE001
+                pass
         try:
             raw = await self.page.evaluate(self._JS_DORF1_MOVEMENTS)
             self._movements_dorf1_ok = True
@@ -2289,7 +2313,13 @@ class TravianParser:
         # lo leggiamo prima della navigazione al Punto di Raduno cosi'
         # la telemetria resta completa anche senza Piazza d'Armi e
         # copre i mercanti (che il rally overview non elenca).
-        dorf1_in, dorf1_out = await self.read_dorf1_movements()
+        dorf1_in, dorf1_out = await self.read_dorf1_movements(
+            village_id
+        )
+        if not rally_slot:
+            rally_slot = self._rally_slot_cache.get(
+                int(village_id or 0), 0
+            )
         if not rally_slot:
             # Auto-resolve slot Piazza d'Armi dal DOM: link gid=16 o
             # area/link dorf2 con titolo 'Punto di Raduno'/'Rally'.
@@ -2364,16 +2394,10 @@ class TravianParser:
             r.get("cx") is None or r.get("cy") is None
             for r in (dorf1_in or []) + (dorf1_out or [])
         )
-        _use_gid_url = False
-        if not rally_slot:
-            if not _coordless:
-                # Nessuno slot risolto e nessun vantaggio atteso dal
-                # rally overview -> solo righe dorf1.
-                return _build_only(dorf1_in), _build_only(dorf1_out)
-            # Righe senza coordinate e slot ignoto: ultimo tentativo
-            # via build.php?gid=16&tt=1 (routing per gid, espone le
-            # tabelle con link mappa (x|y) e nomi target).
-            _use_gid_url = True
+        # Slot ignoto (non in state.buildings, non nel DOM — es. pagina
+        # corrente tasks.php): naviga comunque a build.php?gid=16&tt=1;
+        # il redirect del server espone lo slot reale via ?id=N.
+        _use_gid_url = not rally_slot
         if _use_gid_url:
             url = f"{selectors.PATH_BUILD}?gid=16&tt=1"
         else:
@@ -2398,6 +2422,16 @@ class TravianParser:
                     _abs_game_url(self.page.url or "", url),
                     timeout=20000,
                 )
+            if _use_gid_url:
+                # Slot reale dal redirect gid=16 -> build.php?id=N:
+                # riusato nei cicli successivi (cache per newdid).
+                _m_rs = re.search(
+                    r"[?&]id=(\d+)", self.page.url or ""
+                )
+                if _m_rs:
+                    self._rally_slot_cache[
+                        int(village_id or 0)
+                    ] = int(_m_rs.group(1))
             raw = await self.page.evaluate(
                 """
                 () => {
@@ -2529,7 +2563,7 @@ class TravianParser:
         except Exception as exc:
             logger.debug("Parse movimenti Piazza d'Armi fallito: %s", exc)
             self._movements_rally_ok = False
-            return [], []
+            return _build_only(dorf1_in), _build_only(dorf1_out)
 
         now = time.time()
 
