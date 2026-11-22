@@ -1998,7 +1998,7 @@ class TravianParser:
         _url0 = self.page.url or ""
         if re.search(
             r"(?:tasks|reports?|messages?|statistiken|statistics|"
-            r"hero|spieler|allianz|karte)\.php",
+            r"hero|spieler|allianz|karte)(?:\.php|$|\?)",
             _url0,
         ):
             try:
@@ -2390,10 +2390,6 @@ class TravianParser:
                 )
             return moves
 
-        _coordless = any(
-            r.get("cx") is None or r.get("cy") is None
-            for r in (dorf1_in or []) + (dorf1_out or [])
-        )
         # Slot ignoto (non in state.buildings, non nel DOM — es. pagina
         # corrente tasks.php): naviga comunque a build.php?gid=16&tt=1;
         # il redirect del server espone lo slot reale via ?id=N.
@@ -2401,7 +2397,10 @@ class TravianParser:
         if _use_gid_url:
             url = f"{selectors.PATH_BUILD}?gid=16&tt=1"
         else:
-            url = f"{selectors.PATH_BUILD}?id={rally_slot}"
+            # T4.6: senza &tt=1 il server apre l'ultimo tab usato
+            # (spesso tt=2 'Invia truppe'), dove NON esiste alcuna
+            # table.troop_details — la panoramica e' sempre tt=1.
+            url = f"{selectors.PATH_BUILD}?id={rally_slot}&tt=1"
         if village_id:
             url += f"&newdid={village_id}"
         try:
@@ -2409,13 +2408,13 @@ class TravianParser:
             # Righe dorf1 prive di coordinate: la panoramica rally
             # espone i link mappa (x|y) e i nomi dei target — la visita
             # e' forzata anche se l'URL punta gia' all'edificio ma su un
-            # altro tab (es. tt=1 'Invia truppe' dopo un'azione bot).
+            # altro tab (es. tt=2 'Invia truppe' dopo un'azione bot).
             if _use_gid_url:
                 _need_nav = "gid=16" not in _url_now
             else:
                 _need_nav = (
                     f"id={rally_slot}" not in _url_now
-                    or (_coordless and "tt=" in _url_now)
+                    or "tt=1" not in _url_now
                 )
             if _need_nav:
                 await self._goto(
