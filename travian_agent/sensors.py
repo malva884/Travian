@@ -30,6 +30,18 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+# Mark bidirezionali invisibili con cui T4.6 avvolge coordinate e
+# nomi (es. "(75|-12)" nel thead dei troop_details): LRM/RLM,
+# embedding LRE..PDF e isolates LRI..PDI. Rimossi prima di ogni
+# regex su testo/coordinate.
+_BIDI_RE = re.compile("[‎‏‪-‮⁦-⁩]")
+
+
+def _strip_bidi(s: str) -> str:
+    """Rimuove i mark bidi invisibili di Travian dal testo."""
+    return _BIDI_RE.sub("", str(s or ""))
+
+
 # Dump diagnostici dei parser (testo della pagina quando una lettura
 # non produce dati): stessa convenzione di settings.debug_dir.
 _DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
@@ -2378,8 +2390,8 @@ class TravianParser:
                         seconds_remaining=secs,
                         troop_count=safe_int(item.get("count") or 0),
                         arrival_ts=_now_only + secs,
-                        attacker=str(item.get("attacker") or ""),
-                        label=str(item.get("label") or ""),
+                        attacker=_strip_bidi(item.get("attacker")),
+                        label=_strip_bidi(item.get("label")),
                         counterpart_x=(
                             safe_int(cx) if cx is not None else None
                         ),
@@ -2439,6 +2451,15 @@ class TravianParser:
                     // (75|-12)') + link mappa/giocatore; tbody.units =
                     // icone + conteggi truppe; tbody.infos = .timer.
                     const parseTable = (table) => {
+                        // Mark bidi invisibili di T4.6 (LRM/RLM,
+                        // embedding, isolates): rimossi prima del
+                        // parse di testo/controparte/(x|y).
+                        const BIDI = new RegExp(
+                            '[\\u200e\\u200f\\u202a-\\u202e' +
+                            '\\u2066-\\u2069]', 'g'
+                        );
+                        const cleanTxt = (s) =>
+                            String(s || '').replace(BIDI, '').trim();
                         const tokens = (
                             table.className || ''
                         ).toLowerCase().split(/\\s+/);
@@ -2539,12 +2560,12 @@ class TravianParser:
                         // Intestazione: 'Attacco contro Oasi occupata
                         // (75|-12)' / 'Ritorno da ...'.
                         const headEl = table.querySelector('thead');
-                        const headTxt = (
+                        const headTxt = cleanTxt(
                             headEl ? (
                                 headEl.innerText ||
                                 headEl.textContent || ''
                             ) : (table.innerText || '')
-                        ).trim();
+                        );
 
                         // Controparte: link villaggio/giocatore/mappa
                         // nel thead; fallback sul testo dell'intestaz.
@@ -2555,17 +2576,18 @@ class TravianParser:
                             'thead a[href*="profile"], a[href*="karte"]'
                         );
                         if (pLink) {
-                            other = (pLink.innerText || '').trim();
+                            other = cleanTxt(pLink.innerText ||
+                                pLink.textContent || '');
                         }
                         if (!other) {
                             const om = headTxt.match(
                                 /contro\\s+(.+?)\\s*\\(|da\\s+(.+?)\\s*\\(|to\\s+(.+?)\\s*\\(|from\\s+(.+?)\\s*\\(/
                             );
                             if (om) {
-                                other = (
+                                other = cleanTxt(
                                     om[1] || om[2] || om[3] || om[4] ||
                                     ''
-                                ).trim();
+                                );
                             }
                         }
 
@@ -2598,36 +2620,26 @@ class TravianParser:
                         if (isNaN(cx)) cx = null;
                         if (isNaN(cy)) cy = null;
 
-                        // Truppe: tbody.units — l'ultima riga contiene
-                        // i conteggi (prima cella = icona; '?' nemico).
+                        // Truppe: SOLO l'ultima riga di tbody.units —
+                        // textContent diretto della cella (niente
+                        // innerText/nodi nascosti/ID unita'), prima
+                        // cella icona saltata (idx 0); '?' = ignoto.
                         let count = 0;
                         let summary = '';
-                        const unitsTb = table.querySelector(
-                            'tbody.units, .units'
-                        );
-                        if (unitsTb) {
-                            const uRows = unitsTb.querySelectorAll('tr');
-                            const lastRow = uRows[uRows.length - 1];
-                            const parts = [];
-                            if (lastRow) {
-                                lastRow.querySelectorAll('td').forEach(
-                                    (td, i) => {
-                                        const t = (
-                                            td.innerText || ''
-                                        ).trim();
-                                        if (i === 0 && !/^\\d+$/.test(t)) {
-                                            return;
-                                        }
-                                        if (/^\\d+$/.test(t) &&
-                                            t.length < 7) {
-                                            count += parseInt(t, 10);
-                                            parts.push(t);
-                                        } else if (t === '?') {
-                                            parts.push('?');
-                                        }
-                                    }
-                                );
+                        const parts = [];
+                        table.querySelectorAll(
+                            'tbody.units tr:last-child td'
+                        ).forEach((cell, idx) => {
+                            if (idx === 0) return;
+                            const t = cleanTxt(cell.textContent || '');
+                            if (/^\\d+$/.test(t) && t.length < 7) {
+                                count += parseInt(t, 10);
+                                parts.push(t);
+                            } else if (t === '?') {
+                                parts.push('?');
                             }
+                        });
+                        if (parts.length) {
                             summary = parts.join(' ');
                         }
                         if (!summary) {
@@ -2635,9 +2647,10 @@ class TravianParser:
                             // numeriche dell'intera table.
                             table.querySelectorAll('td, span').forEach(
                                 el => {
-                                    const t = (
-                                        el.innerText || ''
-                                    ).trim();
+                                    const t = cleanTxt(
+                                        el.innerText ||
+                                        el.textContent || ''
+                                    );
                                     if (/^\\d+$/.test(t) &&
                                         t.length < 7) {
                                         count += parseInt(t, 10);
@@ -2652,7 +2665,7 @@ class TravianParser:
                             'tbody.infos .timer, .timer, span.timer'
                         );
                         const ttxt = timerEl
-                            ? (timerEl.textContent || '')
+                            ? cleanTxt(timerEl.textContent || '')
                             : '';
                         const m = ttxt.match(
                             /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
@@ -2673,7 +2686,8 @@ class TravianParser:
                             count: count,
                             attacker: other,
                             label: (headTxt ||
-                                table.innerText || '').slice(0, 160),
+                                cleanTxt(table.innerText) || ''
+                            ).slice(0, 160),
                             summary: summary,
                             cx: cx,
                             cy: cy,
@@ -2755,8 +2769,8 @@ class TravianParser:
                         seconds_remaining=secs,
                         troop_count=safe_int(item.get("count") or 0),
                         arrival_ts=now + secs,
-                        attacker=str(item.get("attacker") or ""),
-                        label=str(item.get("label") or ""),
+                        attacker=_strip_bidi(item.get("attacker")),
+                        label=_strip_bidi(item.get("label")),
                         counterpart_x=(
                             safe_int(cx) if cx is not None else None
                         ),

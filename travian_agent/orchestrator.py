@@ -93,6 +93,7 @@ from .radar_store import (
     CAT_OUTGOING_ATTACK,
     CAT_OUTGOING_RAID,
     CAT_REINFORCEMENT,
+    CAT_TROOP_RETURN,
     radar_store,
 )
 from .replenishment import (
@@ -1784,6 +1785,7 @@ _RADAR_CAT_IN = {
     "unknown": CAT_INCOMING_ATTACK,
     "reinforce": CAT_REINFORCEMENT,
     "merchant": CAT_MERCHANT,
+    "return": CAT_TROOP_RETURN,
 }
 _RADAR_CAT_OUT = {
     "attack": CAT_OUTGOING_ATTACK,
@@ -1792,6 +1794,7 @@ _RADAR_CAT_OUT = {
     "unknown": CAT_OUTGOING_ATTACK,
     "reinforce": CAT_REINFORCEMENT,
     "merchant": CAT_MERCHANT,
+    "return": CAT_TROOP_RETURN,
 }
 # Categorie la cui assenza nella pagina corrente e' verita' (il rally
 # overview e il box #movements elencano TUTTI i movimenti truppe).
@@ -1803,6 +1806,7 @@ _RADAR_SYNC_CATS = frozenset({
     CAT_OUTGOING_ATTACK,
     CAT_OUTGOING_RAID,
     CAT_REINFORCEMENT,
+    CAT_TROOP_RETURN,
 })
 
 
@@ -1851,6 +1855,7 @@ def _sync_radar_movements(
     outg: list,
     *,
     prefix: str = "",
+    reconcile: bool = True,
 ) -> None:
     """Sincronizza i movimenti osservati nel RadarStore dell'account.
 
@@ -1858,6 +1863,10 @@ def _sync_radar_movements(
     box #movements fusi dal sensore) oppure dict grezzi. Il dedup dei
     vettori registrati dalle azioni bot avviene nello store (stessa
     categoria+direzione+arrives_at entro 15s).
+
+    ``reconcile=False`` (scansione rally non riuscita, solo box dorf1):
+    i vettori militari vengono aggiunti/aggiornati ma NON rimossi —
+    il box '#movements' non dichiara la completezza delle categorie.
     """
     vkey = str(vname or "")
     if not vkey:
@@ -1869,6 +1878,7 @@ def _sync_radar_movements(
         for mv in inc or []:
             mtype = str(_mv_get(mv, "movement_type",
                                 _mv_get(mv, "type") or "unknown"))
+            _is_return = mtype == "return"
             cat = _RADAR_CAT_IN.get(mtype, CAT_INCOMING_ATTACK)
             arr = float(_mv_get(mv, "arrival_ts", 0.0) or 0.0)
             if arr <= 0:
@@ -1891,7 +1901,7 @@ def _sync_radar_movements(
             moves.append(
                 {
                     "category": cat,
-                    "direction": "inbound",
+                    "direction": "return" if _is_return else "inbound",
                     "from_x": cx,
                     "from_y": cy,
                     "to_x": sx,
@@ -1911,6 +1921,7 @@ def _sync_radar_movements(
         for mv in outg or []:
             mtype = str(_mv_get(mv, "movement_type",
                                 _mv_get(mv, "type") or "unknown"))
+            _is_return = mtype == "return"
             cat = _RADAR_CAT_OUT.get(mtype, CAT_OUTGOING_ATTACK)
             arr = float(_mv_get(mv, "arrival_ts", 0.0) or 0.0)
             if arr <= 0:
@@ -1933,11 +1944,14 @@ def _sync_radar_movements(
             moves.append(
                 {
                     "category": cat,
-                    "direction": "outbound",
-                    "from_x": sx,
-                    "from_y": sy,
-                    "to_x": cx,
-                    "to_y": cy,
+                    # Rientro osservato nella sezione 'out' del rally
+                    # (truppe proprie che tornano da un altro villaggio):
+                    # vettore di ritorno controparte -> villaggio.
+                    "direction": "return" if _is_return else "outbound",
+                    "from_x": cx if _is_return else sx,
+                    "from_y": cy if _is_return else sy,
+                    "to_x": sx if _is_return else cx,
+                    "to_y": sy if _is_return else cy,
                     "counterpart": who,
                     "label": who,
                     "arrives_at": arr,
@@ -1950,7 +1964,9 @@ def _sync_radar_movements(
                     },
                 }
             )
-        _n = rs.sync_categories(vkey, moves, _RADAR_SYNC_CATS)
+        _n = rs.sync_categories(
+            vkey, moves, _RADAR_SYNC_CATS if reconcile else frozenset()
+        )
         logger.info(
             "%s Radar: villaggio '%s' — %d in/%d out letti, %d vettori "
             "attivi nello store",
@@ -2382,6 +2398,13 @@ async def monitor_all_villages(
                     getattr(observer, "_movements_rally_ok", False)
                     or getattr(observer, "_movements_dorf1_ok", False)
                 )
+                # Riconciliazione live (rimozione vettori fantasma):
+                # solo quando la scansione del Punto di Raduno ha
+                # esito positivo — il rally overview elenca TUTTI i
+                # movimenti militari, quelli assenti sono conclusi.
+                _rally_ok = bool(
+                    getattr(observer, "_movements_rally_ok", False)
+                )
                 if _parse_ok:
                     _sync_radar_movements(
                         settings,
@@ -2391,6 +2414,7 @@ async def monitor_all_villages(
                         inc,
                         outg,
                         prefix=vprefix,
+                        reconcile=_rally_ok,
                     )
             except Exception as mv_exc:
                 logger.debug(

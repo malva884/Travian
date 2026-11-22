@@ -42,6 +42,7 @@ CAT_OUTGOING_RAID = "outgoing_raid"
 CAT_OUTGOING_ATTACK = "outgoing_attack"
 CAT_INCOMING_ATTACK = "incoming_attack"
 CAT_REINFORCEMENT = "reinforcement"
+CAT_TROOP_RETURN = "troop_return"
 VALID_CATEGORIES = frozenset({
     CAT_MERCHANT,
     CAT_HERO_ADVENTURE,
@@ -49,6 +50,7 @@ VALID_CATEGORIES = frozenset({
     CAT_OUTGOING_ATTACK,
     CAT_INCOMING_ATTACK,
     CAT_REINFORCEMENT,
+    CAT_TROOP_RETURN,
 })
 
 VALID_DIRECTIONS = frozenset({"outbound", "inbound", "return"})
@@ -63,6 +65,12 @@ _ETA_BUCKET_SECONDS = 60.0
 # lo stesso di uno registrato dall'azione bot se condividono categoria,
 # direzione e arrives_at entro questa finestra.
 _DEDUP_ETA_TOLERANCE = 15.0
+
+# Tolleranza riconciliazione live: un vettore militare salvato e'
+# considerato ancora presente se la scansione rally corrente contiene
+# un movimento stessa categoria/direzione con ETA entro 25s (il
+# countdown rilevato puo' derivare di qualche secondo tra i cicli).
+_LIVE_MATCH_TOLERANCE = 25.0
 
 
 def make_move_id(
@@ -111,12 +119,15 @@ def normalize_movement(
         return None
     direction = str(data.get("direction") or "")
     if direction not in VALID_DIRECTIONS:
-        direction = (
-            "outbound"
-            if category in (CAT_MERCHANT, CAT_OUTGOING_RAID,
-                            CAT_OUTGOING_ATTACK, CAT_HERO_ADVENTURE)
-            else "inbound"
-        )
+        if category == CAT_TROOP_RETURN:
+            direction = "return"
+        else:
+            direction = (
+                "outbound"
+                if category in (CAT_MERCHANT, CAT_OUTGOING_RAID,
+                                CAT_OUTGOING_ATTACK, CAT_HERO_ADVENTURE)
+                else "inbound"
+            )
     counterpart = str(
         data.get("counterpart")
         or data.get("label")
@@ -293,6 +304,7 @@ class RadarStore:
             self._load()
             bucket = self._data.setdefault(vkey, {})
             seen: set[str] = set()
+            live_norms: list[dict] = []
             for mv in movements or []:
                 norm = normalize_movement(vkey, mv)
                 if norm is None:
@@ -322,11 +334,32 @@ class RadarStore:
                     norm["started_at"] = prev.get("started_at") or 0.0
                 bucket[norm["id"]] = norm
                 seen.add(norm["id"])
+                live_norms.append(norm)
                 count += 1
+            # Riconciliazione live: un vettore militare resta anche se
+            # l'id non e' stato riusato (label controparte variata o
+            # ETA oltre la finestra dedup) purche' la scansione abbia
+            # un movimento stessa categoria/direzione con ETA ±25s.
+            def _still_live(mv: dict) -> bool:
+                arr = float(mv.get("arrives_at") or 0.0)
+                for ln in live_norms:
+                    if (
+                        ln.get("category") == mv.get("category")
+                        and ln.get("direction") == mv.get("direction")
+                        and abs(
+                            float(ln.get("arrives_at") or 0.0) - arr
+                        )
+                        <= _LIVE_MATCH_TOLERANCE
+                    ):
+                        return True
+                return False
+
             stale = [
                 mid
                 for mid, mv in bucket.items()
-                if mv.get("category") in categories and mid not in seen
+                if mv.get("category") in categories
+                and mid not in seen
+                and not _still_live(mv)
             ]
             for mid in stale:
                 del bucket[mid]
