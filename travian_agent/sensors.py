@@ -38,8 +38,13 @@ _BIDI_RE = re.compile("[‎‏‪-‮⁦-⁩]")
 
 
 def _strip_bidi(s: str) -> str:
-    """Rimuove i mark bidi invisibili di Travian dal testo."""
-    return _BIDI_RE.sub("", str(s or ""))
+    """Rimuove i mark bidi invisibili di Travian dal testo.
+
+    Normalizza anche il segno meno tipografico U+2212 '−' in '-'
+    ASCII: nei testi T4.6 compare nelle coordinate '(x|−y)' e
+    romperebbe le regex '-?\\d+' e i nomi delle controparti.
+    """
+    return _BIDI_RE.sub("", str(s or "").replace("−", "-"))
 
 
 # Dump diagnostici dei parser (testo della pagina quando una lettura
@@ -1030,7 +1035,7 @@ class TravianParser:
                     if not name:
                         name = (await entry.inner_text()).strip()
 
-                    cleaned_name = re.sub(r"\(\s*[-+]?\d+\s*[|/]\s*[-+]?\d+\s*\)", "", name).strip()
+                    cleaned_name = re.sub(r"\(\s*[-+]?\d+\s*[|/]\s*[-+]?\d+\s*\)", "", _strip_bidi(name)).strip()
                     if vid and vid not in seen_ids:
                         seen_ids.add(vid)
                         villages.append(
@@ -1073,6 +1078,9 @@ class TravianParser:
                             if (el) {
                                 let text = (el.innerText || el.textContent || '').trim();
                                 text = text.replace(/[\\u202d\\u202c\\r\\n]/g, ' ');
+                                // Meno tipografico U+2212 -> '-' prima
+                                // dello strip delle coordinate (x|y).
+                                text = text.replace(/[\\u2212]/g, '-');
                                 text = text.replace(/\\(\\s*[-+]?\\d+\\s*[|/]\\s*[-+]?\\d+\\s*\\)/g, ' ');
                                 text = text.replace(/\\s+/g, ' ').trim();
                                 if (text && text.length > 0 && text !== 'Villaggio') return text;
@@ -1808,9 +1816,11 @@ class TravianParser:
             // tipo+direzione e countdown .timer. Le coordinate target
             // non sono quasi mai esposte qui: si leggono solo se la
             // riga contiene un link karte o il pattern (x|y).
+            // Il segno meno U+2212 non e un mark: viene
+            // normalizzato a - dopo lo strip (ordine neutro).
             const stripInv = (s) => (s || '').replace(
-                /[‎‏‪-‮ ­﻿−]/g, ''
-            );
+                /[\\u200e\\u200f\\u202a-\\u202e\\u202f\\u00ad\\ufeff]/g, ''
+            ).replace(/[\\u2212]/g, '-');
             let box = document.querySelector(
                 '#movements, .troopMovements, ' +
                 '[id*="troopMovement" i], #sidebarBoxMovements, ' +
@@ -2107,9 +2117,11 @@ class TravianParser:
             return []
         _JS_MARKET_ROWS = """
                 () => {
+                    // Il segno meno U+2212 non e un mark: viene
+                    // normalizzato a - dopo lo strip (ordine neutro).
                     const stripInv = (s) => (s || '').replace(
-                        /[‎‏‪-‮ ­﻿−]/g, ''
-                    );
+                        /[\\u200e\\u200f\\u202a-\\u202e\\u202f\\u00ad\\ufeff]/g, ''
+                    ).replace(/[\\u2212]/g, '-');
                     const out = [];
                     const scope = document.querySelector(
                         '#content, .content, main'
@@ -2458,8 +2470,13 @@ class TravianParser:
                             '[\\u200e\\u200f\\u202a-\\u202e' +
                             '\\u2066-\\u2069]', 'g'
                         );
-                        const cleanTxt = (s) =>
-                            String(s || '').replace(BIDI, '').trim();
+                        const cleanTxt = (s) => String(s || '')
+                            // Meno tipografico U+2212 '−' -> '-' ASCII
+                            // prima delle regex (x|y) e della pulizia
+                            // controparte: '(x|−y)' deve matchare.
+                            .replace(/[\\u2212]/g, '-')
+                            .replace(BIDI, '')
+                            .trim();
                         const tokens = (
                             table.className || ''
                         ).toLowerCase().split(/\\s+/);
@@ -2699,6 +2716,17 @@ class TravianParser:
                         'table.troop_details'
                     ).forEach(table => {
                         const r = parseTable(table);
+                        // Sotto-elementi footer 'Arrivo in ...' /
+                        // 'Arrival ...' senza truppe NON sono
+                        // movimenti: senza il filtro un raid in uscita
+                        // genererebbe un falso incoming gemello.
+                        const cpart = String(
+                            r.attacker || r.label || ''
+                        ).trim().toLowerCase();
+                        if (!r.summary &&
+                            /^(arrivo|arrival)\b/.test(cpart)) {
+                            return;
+                        }
                         // Salta tabelle senza countdown (es. 'truppe nel
                         // villaggio' nella stessa panoramica).
                         if (r.seconds <= 0) return;
