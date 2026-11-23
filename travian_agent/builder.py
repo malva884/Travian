@@ -81,7 +81,7 @@ _STORAGE_WARN_RATIO = 0.90
 PLAN_DEPTH = 4
 
 # Anti-Raid (Depositi Segreti multipli): capacita' protetta per
-# livello del Nascondiglio (gid 23), tabella T4.x — raddoppiata per
+# livello del Deposito Segreto (gid 23), tabella T4.x — raddoppiata per
 # i Galli; gli attaccanti teutoni forano il 20% del deposito ->
 # fattore prudenziale 0.8 sulla capacita' effettiva.
 _CRANNY_CAP_BY_LEVEL = (0, 100, 130, 170, 220, 280, 360, 460, 600, 770, 1000)
@@ -104,8 +104,17 @@ BOOTSTRAP_FIELD_LEVEL = 5     # tutti i campi risorsa >= 5 (spec biforcazione)
 _ROLE_INTERIORS: dict[str, tuple[int, ...]] = {
     "hammer": (GID_BARRACKS, GID_STABLE, GID_WORKSHOP),
     "defensive": (GID_BARRACKS, GID_RESIDENCE) + WALL_GIDS,
-    "croplog": (GID_GRANARY, GID_WAREHOUSE, GID_GRAIN_MILL, GID_BAKERY),
-    "feeder": (GID_MARKETPLACE, GID_WAREHOUSE, GID_GRANARY),
+    # Sicurezza passiva (cranny) e presidio militare (caserma) sono
+    # parte del bilanciamento: il villaggio non resta scoperto ai raid
+    # notturni mentre sviluppa campi/strutture.
+    "croplog": (
+        GID_GRANARY, GID_WAREHOUSE, GID_GRAIN_MILL, GID_BAKERY,
+        GID_CRANNY, GID_EMBASSY, GID_PALACE, GID_BARRACKS,
+    ) + WALL_GIDS,
+    "feeder": (
+        GID_MARKETPLACE, GID_WAREHOUSE, GID_GRANARY, GID_CRANNY,
+        GID_BARRACKS,
+    ) + WALL_GIDS,
     "chiefing": (GID_ACADEMY, GID_RESIDENCE, GID_TOWN_HALL),
     "early_cropper_founder": (
         GID_RESIDENCE, GID_EMBASSY, GID_MARKETPLACE, GID_ACADEMY,
@@ -545,7 +554,7 @@ def building_category(gid: int) -> int:
     2 = Militari
     3 = Risorse
     """
-    if gid in (13, 14, 16, 19, 20, 21, 22, 29, 30, 31, 32, 33, 35, 36, 41):
+    if gid in (13, 14, 16, 19, 20, 21, 22, 29, 30, 31, 32, 33, 36, 41):
         return 2  # Militari
     if gid in (5, 6, 7, 8, 9, 42):
         return 3  # Risorse

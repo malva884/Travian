@@ -35,18 +35,21 @@ ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
     "early_cropper_founder": [
         # Nuovo ordine (spec): Magazzino/Granaio anticipati per assorbire
         # il flusso dei feeder senza overflow; Residenza al livello 10
-        # entro i primi 5 step per sbloccare subito i 3 coloni.
+        # entro i primi 6 step per sbloccare subito i 3 coloni.
         ("main_building", 5),     # prerequisito Residenza
+        ("cranny", 10),           # anti-raid preventivo (raid notturni)
         ("rally_point", 1),       # presidio minimo
         ("warehouse", 10),        # buffer feeder — anti-overflow
         ("granary", 10),
-        ("residence", 10),        # step 5 — slot addestramento 3 coloni
+        ("residence", 10),        # step 6 — slot addestramento 3 coloni
         ("city_wall", 5),
+        ("barracks", 3),          # sblocca Accademia + presidio fanteria
         ("marketplace", 5),       # ricezione risorse dai feeder
         ("woodcutter", 5),
         ("clay_pit", 5),
         ("iron_mine", 5),
         ("cropland", 5),
+        ("embassy", 1),           # punti cultura (prereq. Palazzo)
         ("academy", 10),          # prerequisito Municipio
     ],
     # Villaggio offensivo: infrastrutture militari al massimo, storage
@@ -54,6 +57,12 @@ ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
     # Piazza del Torneo richiede Punto di Raduno 15 -> il target del
     # rally point e' 15 (non 10) per non bloccare lo step.
     "hammer": [
+        # Fase 1: apertura rapida + difesa passiva preventiva anti-raid
+        # (Deposito Segreto prima della rampa militare lunga).
+        ("main_building", 5),
+        ("rally_point", 1),
+        ("cranny", 10),
+        ("city_wall", 5),         # presidio difensivo preventivo
         ("main_building", 20),
         ("rally_point", 15),
         ("barracks", 20),
@@ -73,8 +82,10 @@ ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
     # Presidio difensivo: mura al massimo (priorita' assoluta), poi la
     # catena militare difensiva; storage ed economia di supporto.
     "defensive": [
+        ("main_building", 5),     # Fase 1: apertura + anti-raid
+        ("rally_point", 1),       # sblocca Caserma/Mura
+        ("cranny", 10),
         ("main_building", 15),
-        ("rally_point", 1),       # sblocca Caserma
         ("city_wall", 20),
         ("barracks", 20),
         ("academy", 5),           # sblocca Scuderia (con Fucina 3)
@@ -90,6 +101,16 @@ ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
     # Rifornitore economico: campi e mercato al top per spedire il
     # surplus all'impero; difesa e caserma minime di presidio.
     "feeder": [
+        # Fase 1: difesa passiva preventiva prima dello sviluppo
+        # economico (villaggio non piu' scoperto di notte).
+        ("main_building", 5),
+        ("cranny", 10),
+        ("rally_point", 1),       # sblocca Caserma/Mura
+        ("city_wall", 8),
+        ("barracks", 3),          # presidio minimo difensivo
+        ("warehouse", 10),
+        ("granary", 10),
+        ("marketplace", 12),
         ("woodcutter", 12),
         ("clay_pit", 12),
         ("iron_mine", 12),
@@ -98,18 +119,37 @@ ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
         ("warehouse", 18),
         ("granary", 18),
         ("marketplace", 20),
-        ("rally_point", 1),       # sblocca Caserma
-        ("city_wall", 10),
-        ("barracks", 5),
+        # Moltiplicatori di produzione dopo Mercato 20 e campi al 12
+        # (spec): i prerequisiti campo-10 sono gia' soddisfatti.
+        ("sawmill", 5),
+        ("brickyard", 5),
+        ("iron_foundry", 5),
+        ("grain_mill", 5),
+        ("bakery", 5),
+        # Ufficio Commerciale (gid 28): richiede anche Scuderia 10 —
+        # i prerequisiti sono segnalati dalla preview di fattibilita'.
+        ("trade_office", 10),
+        ("city_wall", 12),
     ],
     # Capitale cerealicola (9c/15c): grano e moltiplicatori al massimo,
     # grandi depositi, mura difensive.
     "croplog": [
+        # Fase 1 (spec capitale): difesa passiva + prerequisiti
+        # Palazzo/Ambasciata prima dello sviluppo cerealicolo.
+        ("main_building", 5),     # prerequisito Palazzo
+        ("cranny", 10),
+        ("rally_point", 1),
+        ("city_wall", 10),
+        ("embassy", 1),           # prerequisito Palazzo
+        ("palace", 1),            # dichiarazione capitale
+        ("barracks", 5),          # presidio + sblocca Accademia
+        ("academy", 5),
+        ("granary", 12),
+        ("warehouse", 10),
         ("cropland", 15),
-        ("main_building", 20),
-        ("granary", 20),
         ("grain_mill", 5),
         ("bakery", 5),
+        ("granary", 20),
         ("warehouse", 20),
         ("city_wall", 15),
         ("woodcutter", 10),
@@ -120,8 +160,12 @@ ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
     # per la ricerca e l'addestramento dei nobili, Municipio per le
     # feste grandi (punti cultura).
     "chiefing": [
+        # Fase 1: anti-raid + mura preventive in apertura.
+        ("main_building", 5),
+        ("rally_point", 1),       # sblocca Caserma/Mura
+        ("cranny", 10),
+        ("city_wall", 8),
         ("main_building", 15),
-        ("rally_point", 1),       # sblocca Caserma
         ("barracks", 3),          # sblocca Accademia
         ("academy", 20),
         ("residence_palace", 20), # Residenza, o Palazzo in capitale
@@ -182,25 +226,40 @@ _TROOP_PRESET_SLOT_KEYS: dict[str, str | None] = {
     "defensive_infantry_target": "infantry_def",
     "offensive_cavalry_target": "cavalry_off",
     "defensive_cavalry_target": "cavalry_def",
+    "scout_target": "scout",
     "settlers_target": None,
 }
 
-# Preset Smart Troop Replenishment per ruolo (schema JSON della spec).
-# Solo il founder ha target numerici espliciti dalla spec.
+# Preset Smart Troop Replenishment per ruolo (schema JSON della spec):
+# presidio minimo anti-raid + scout anti-spiata sui villaggi economici,
+# guarnigione pesante solo sui ruoli militari.
 TROOP_REPLENISHMENT_PRESETS: dict[str, dict[str, int]] = {
     "early_cropper_founder": {
-        "base_infantry_target": 80,
+        "base_infantry_target": 50,
+        "defensive_infantry_target": 30,
         "settlers_target": 3,
+    },
+    "croplog": {
+        "defensive_infantry_target": 40,
+        "scout_target": 10,
+    },
+    "feeder": {
+        "defensive_infantry_target": 30,
+        "scout_target": 5,
+    },
+    "defensive": {
+        "defensive_infantry_target": 150,
+        "defensive_cavalry_target": 50,
     },
 }
 
 # Slot truppe sbloccati come allowed/priority units per ruolo.
 ALLOWED_UNIT_SLOTS: dict[str, list[str]] = {
-    "early_cropper_founder": ["infantry_base"],
+    "early_cropper_founder": ["infantry_base", "infantry_def", "scout"],
     "hammer": ["infantry_off", "cavalry_off", "ram", "catapult"],
     "defensive": ["infantry_def", "cavalry_def"],
-    "feeder": ["infantry_base"],
-    "croplog": [],
+    "feeder": ["infantry_def", "infantry_base", "scout"],
+    "croplog": ["infantry_def", "infantry_base", "scout"],
     "chiefing": ["chief", "settler"],
 }
 
