@@ -1313,7 +1313,14 @@ class ActionExecutor:
             return ActionResult(
                 True,
                 f"{action_name} avviata sullo slot {slot_id}",
-                data={"slot_id": int(slot_id), "gid": gid},
+                data={
+                    "slot_id": int(slot_id),
+                    "gid": gid,
+                    # Il circuit-breaker STUCK (record_upgrade_exec) conta
+                    # solo esecuzioni confermate in coda: skip per coda
+                    # piena / click non confermato non lo alimentano.
+                    "queue_confirmed": True,
+                },
             )
 
         # Resource-ETA Sleep: riporta il costo del BLOCCANTE (C1) per

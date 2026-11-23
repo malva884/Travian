@@ -51,6 +51,7 @@ from .config import Settings
 from .presets import resolve_role
 from .models import (
     GID_BARRACKS,
+    GID_EMPTY,
     GID_GRANARY,
     GID_MARKETPLACE,
     GID_PALACE,
@@ -462,15 +463,33 @@ def _interior_intents(state: GameState, gids: tuple[int, ...]) -> list[Field]:
 
 
 def empty_slots(state: GameState) -> list[Field]:
-    """Aree vuote del dorf2 (gid 0) non occupate da lavori in coda."""
+    """Aree vuote del dorf2 (gid 0) non occupate da lavori in coda.
+
+    In coda vengono aggiunti anche gli slot 19-38 assenti dalla lettura
+    (non scansionati): non hanno gid assegnato leggibile e vanno
+    trattati come possibili aree libere DOPO quelle verificate — se
+    risultano occupati l'esecutore li scarta con INVALID_SLOT_OCCUPIED.
+    """
     queued = queued_slot_ids(state)
-    return sorted(
+    interiors = state.interior_fields()
+    out = sorted(
         (
-            f for f in state.interior_fields()
+            f for f in interiors
             if f.is_empty_site and f.slot_id not in queued
         ),
         key=lambda f: f.slot_id,
     )
+    known = {f.slot_id for f in interiors}
+    # Solo con scansione almeno parziale: se non e' stato letto NESSUN
+    # interno non sappiamo distinguere slot liberi da occupati (lettura
+    # dorf2 mancante del tutto) e non si propone a tentativi.
+    if not known:
+        return out
+    for s in BUILD_SLOTS_DORF2:
+        if s in known or s in queued:
+            continue
+        out.append(Field(slot_id=s, name="", level=0, gid=GID_EMPTY))
+    return out
 
 
 def new_building_intents(
@@ -874,14 +893,27 @@ def resolve_target_slot(
         return item_obj.slot_id, 0, "OK"
 
     # auto slot: primo slot in BUILD_SLOTS_DORF2 vuoto e non in reserved/queued
+    by_slot = {f.slot_id: f for f in interiors}
     for s in BUILD_SLOTS_DORF2:
         if s in reserved or s in queued:
             continue
-        f = next((x for x in interiors if x.slot_id == s), None)
+        f = by_slot.get(s)
         if f is None or not f.is_empty_site:
             continue
         reserved.add(s)
         return s, 0, "OK"
+
+    # Fallback: slot dorf2 assenti da una lettura PARZIALE (non
+    # scansionati). Non hanno gid assegnato leggibile -> possibili aree
+    # libere; se in realta' sono occupati, l'esecutore li scarta con
+    # INVALID_SLOT_OCCUPIED e lo step passa al candidato successivo.
+    # Con zero interni letti (dorf2 non visitato) non si indovina.
+    if by_slot:
+        for s in BUILD_SLOTS_DORF2:
+            if s in reserved or s in queued or s in by_slot:
+                continue
+            reserved.add(s)
+            return s, 0, "OK"
 
     return None, 0, "NO_FREE_SLOTS"
 
@@ -1162,23 +1194,34 @@ def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
 
 
 # Circuit-breaker "falso EXECUTED": traccia il livello dello slot al
-# momento di ogni ActionResult.success su UPGRADE_FIELD. Se per 2
-# esecuzioni consecutive il livello risulta identico allo snapshot
-# successivo (e lo slot non e' in coda), lo step viene marcato
-# "stuck" e saltato invece di ritentarlo all'infinito. Stato di
-# runtime, azzerato a riavvio; un cambio livello reale (build
-# completata o intervento manuale) azzera la storia dello slot.
-_FOCUS_EXEC_HISTORY: dict[tuple[str, int], list[int]] = {}
+# momento di ogni ActionResult.success su UPGRADE_FIELD *confermato in
+# coda*. Se per 2 esecuzioni consecutive il livello risulta identico
+# allo snapshot successivo (e lo slot non e' in coda), lo step viene
+# marcato "stuck" e saltato invece di ritentarlo all'infinito. Stato
+# di runtime: un cambio livello reale (build completata o intervento
+# manuale) azzera la storia dello slot, e ogni EXECUTED scade dopo
+# _FOCUS_STUCK_TTL_S — una coda piena o un raid possono ritardare il
+# progresso osservato senza che lo step sia davvero irrecuperabile.
+_FOCUS_EXEC_HISTORY: dict[tuple[str, int], list[tuple[int, float]]] = {}
 _FOCUS_STUCK_MIN_ATTEMPTS = 2
+# TTL dello stato STUCK: passati ~20 minuti gli EXECUTED registrati
+# non contano piu' e lo slot torna candidabile da solo.
+_FOCUS_STUCK_TTL_S = 1200.0
 
 
 def record_upgrade_exec(village_id: int | str, slot_id: int, level: int) -> None:
-    """Registra un EXECUTED su ``slot_id`` con il livello noto all'epoca."""
+    """Registra un EXECUTED su ``slot_id`` con il livello noto all'epoca.
+
+    Da chiamare SOLO quando l'esecuzione e' stata confermata in coda
+    (``result.data['queue_confirmed']``): uno skip per coda piena
+    (UPGRADE_BLOCKED) o un click non confermato non devono alimentare
+    il circuit-breaker STUCK.
+    """
     if not slot_id or slot_id <= 0:
         return
     key = (str(village_id or "0"), int(slot_id))
     hist = _FOCUS_EXEC_HISTORY.setdefault(key, [])
-    hist.append(int(level))
+    hist.append((int(level), time.monotonic()))
     del hist[:-8]
     # Un EXECUTED riuscito resetta anche la storia dei fallimenti
     # strutturali: lo slot torna candidabile.
@@ -1202,16 +1245,29 @@ def focus_stuck_slots(state: GameState) -> set[int]:
     vkeys = {
         str(v) for v in (state.village_id, state.village_name) if v
     }
+    now = time.monotonic()
     stuck: set[int] = set()
     for (vid, slot), hist in list(_FOCUS_EXEC_HISTORY.items()):
-        if vid not in vkeys or len(hist) < _FOCUS_STUCK_MIN_ATTEMPTS:
+        if vid not in vkeys:
+            continue
+        # Scadenza TTL: gli EXECUTED piu' vecchi di ~20 minuti non
+        # tengono piu' lo slot bloccato — il blocco si auto-rilascia
+        # senza riavvio del container.
+        fresh = [e for e in hist if now - e[1] <= _FOCUS_STUCK_TTL_S]
+        if len(fresh) < len(hist):
+            if fresh:
+                _FOCUS_EXEC_HISTORY[(vid, slot)] = hist = fresh
+            else:
+                del _FOCUS_EXEC_HISTORY[(vid, slot)]
+                continue
+        if len(hist) < _FOCUS_STUCK_MIN_ATTEMPTS:
             continue
         if slot not in levels:
             # Slot assente dallo snapshot (lettura parziale): il
             # livello non e' osservabile -> niente marcatura STUCK.
             continue
         cur = levels[slot]
-        last = hist[-1]
+        last = hist[-1][0]
         if cur != last:
             # Livello cambiato dopo l'ultimo EXECUTED: progresso
             # reale o build manuale -> resetta il contatore.
@@ -1219,9 +1275,9 @@ def focus_stuck_slots(state: GameState) -> set[int]:
             continue
         if slot in queued:
             continue
-        if hist[-_FOCUS_STUCK_MIN_ATTEMPTS:].count(last) >= (
-            _FOCUS_STUCK_MIN_ATTEMPTS
-        ):
+        if [e[0] for e in hist[-_FOCUS_STUCK_MIN_ATTEMPTS:]].count(
+            last
+        ) >= _FOCUS_STUCK_MIN_ATTEMPTS:
             stuck.add(slot)
     stuck |= set(focus_fail_blocked(state))
     return stuck

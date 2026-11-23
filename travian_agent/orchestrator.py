@@ -2835,10 +2835,14 @@ async def monitor_all_villages(
                             break
                         except (TypeError, ValueError):
                             continue
-                if _done_slot > 0:
+                if _done_slot > 0 and (result.data or {}).get(
+                    "queue_confirmed"
+                ):
                     # Circuit-breaker Coda Prioritaria: registra il livello
-                    # dello slot REALMENTE eseguito; se lo step non
-                    # progredisce dopo 2 EXECUTED viene marcato STUCK.
+                    # dello slot REALMENTE eseguito E confermato in coda;
+                    # se lo step non progredisce dopo 2 EXECUTED viene
+                    # marcato STUCK. Skip per coda piena (UPGRADE_BLOCKED)
+                    # o click non confermato non alimentano il contatore.
                     try:
                         _lvl = next(
                             (
