@@ -819,6 +819,10 @@
                 <input id="queue-add-target" type="number" min="1" max="20" value="5" title="Livello target" class="w-14 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200">
                 <button onclick="addQueueStep()" class="px-3 py-1.5 rounded-lg bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 text-xs font-bold whitespace-nowrap">+ Coda</button>
               </div>
+              <label class="flex items-center gap-1.5 text-[9px] text-slate-500 font-mono cursor-pointer select-none" title="Il catalogo e' filtrato sullo stato reale del villaggio attivo (prerequisiti, tribu', capitale, edifici unici gia' costruiti). Attiva per ispezionare comunque l'intero catalogo.">
+                <input id="queue-show-all" type="checkbox" onchange="populateBrainSelects()" class="w-3 h-3 accent-cyan-400">
+                Mostra tutti (incl. non disponibili)
+              </label>
             </div>
             <div class="space-y-2">
               <div class="flex items-center justify-between font-mono text-[11px]">
@@ -1943,14 +1947,14 @@
 
     const GID_LABELS = {
       1: 'Taglialegna', 2: "Pozzo d'Argilla", 3: 'Miniera di Ferro', 4: 'Campo di Grano',
-      5: 'Segheria', 6: 'Fornace', 7: 'Fonderia', 8: 'Mulino', 9: 'Forno',
+      5: 'Segheria', 6: 'Fabbrica di mattoni', 7: 'Fonderia', 8: 'Mulino', 9: 'Panificio',
       10: 'Magazzino', 11: 'Granaio', 13: 'Fucina', 14: 'Piazza del Torneo',
-      15: 'Palazzo Pubblico', 16: 'Punto di Raduno', 17: 'Mercato', 18: 'Ambasciata',
+      15: 'Edificio Principale', 16: 'Punto di Raduno', 17: 'Mercato', 18: 'Ambasciata',
       19: 'Caserma', 20: 'Scuderia', 21: 'Officina', 22: 'Accademia',
       23: 'Deposito Segreto', 24: 'Municipio', 25: 'Residenza', 26: 'Palazzo',
-      27: 'Tesoreria', 28: 'Ufficio Commerciale', 29: 'Grande Caserma', 30: 'Grande Scuderia',
-      31: 'Muro di difesa', 32: 'Terrapieno', 33: 'Staccionata', 34: 'Laboratorio dello Scultore',
-      35: 'Birreria', 36: 'Trappolaio', 37: "Magione dell'Eroe",
+      27: 'Camera del Tesoro', 28: 'Ufficio Commerciale', 29: 'Grande Caserma', 30: 'Grande Scuderia',
+      31: 'Muro di difesa', 32: 'Terrapieno', 33: 'Palizzata', 34: 'Laboratorio dello Scultore',
+      35: 'Birrificio', 36: 'Esperto di trappole', 37: "Dimora dell'Eroe",
       38: 'Grande Magazzino', 39: 'Grande Granaio', 40: 'Meraviglia',
       41: 'Abbeveratoio', 42: 'Acquedotto'
     };
@@ -1973,6 +1977,184 @@
       residence_palace: [25, 26]
     };
 
+    // ------------------------------------------------------------------
+    // Filtro Dinamico Edifici (spec): validazione catalogo "+ Coda" e
+    // preset sullo stato reale del villaggio attivo (slots, building_queue,
+    // is_capital, tribu'). Mirror delle regole di building_prereqs.py.
+    // ------------------------------------------------------------------
+    // Prerequisiti T4.x: gid -> [[gid_richiesto, livello_min], ...].
+    // gid 1-4 = campo risorsa dorf1 (si valuta il livello massimo).
+    const BUILDING_PREREQS = {
+      5: [[1, 10]], 6: [[2, 10]], 7: [[3, 10]], 8: [[4, 5]],
+      9: [[4, 10], [8, 5]],
+      13: [[15, 3]], 14: [[16, 15]],
+      17: [[15, 3], [11, 1], [10, 1]], 18: [[15, 1]],
+      19: [[15, 3], [16, 1]], 20: [[22, 5], [13, 3]],
+      21: [[22, 10], [15, 5]], 22: [[15, 3], [19, 3]],
+      24: [[22, 10], [15, 10]], 25: [[15, 5]], 26: [[15, 5], [18, 1]],
+      27: [[15, 10]], 28: [[17, 20], [20, 10]],
+      29: [[19, 20]], 30: [[20, 20]], 34: [[15, 5], [26, 3]],
+      35: [[11, 20], [16, 10]], 36: [[16, 1]], 37: [[15, 3], [16, 1]],
+      41: [[20, 20], [16, 10]], 42: [[15, 5]]
+    };
+    // Edifici riservati: solo capitale (Tagliapietre + Grandi Caserma/
+    // Scuderia) e solo villaggio Meraviglia.
+    const CAPITAL_ONLY_GIDS = new Set([29, 30, 34]);
+    const WONDER_ONLY_GIDS = new Set([38, 39, 40]);
+    // Tribu' proprietaria dei gid razziali (mura incluse).
+    const TRIBE_GID_OWNER = {
+      31: 'romans', 41: 'romans',
+      32: 'teutons', 35: 'teutons',
+      33: 'gauls', 36: 'gauls'
+    };
+    const TRIBE_WALL_GID = { romans: 31, teutons: 32, gauls: 33 };
+    // Multi-istanza (mirror MULTI_INSTANCE_GIDS builder.py + tetti T4.x):
+    // nuova costruzione su altro slot consentita solo se almeno
+    // un'istanza esistente ha raggiunto il livello massimo.
+    const MULTI_MAX_LEVEL = { 10: 20, 11: 20, 23: 10, 36: 20, 38: 20, 39: 20 };
+    const FIELD_MAX_NORMAL = 10, FIELD_MAX_CAPITAL = 21;
+    const _FIELD_GIDS = new Set([1, 2, 3, 4]);
+
+    // Stato filtro del villaggio attivo: livelli per gid (edifici dorf2
+    // e campi dorf1), gid in coda di costruzione, tribu' e capitale.
+    function _villageFilterState() {
+      const v = activeVillage() || {};
+      const slots = Array.isArray(v.slots) ? v.slots : [];
+      const levels = {};
+      const fieldLevels = { 1: [], 2: [], 3: [], 4: [] };
+      slots.forEach(s => {
+        const g = Number(s.gid || 0), lv = Number(s.level || 0);
+        if (g <= 0) return;
+        if (_FIELD_GIDS.has(g) && Number(s.slot) < 19) fieldLevels[g].push(lv);
+        else levels[g] = Math.max(levels[g] || 0, lv);
+      });
+      const queueGids = new Set();
+      (v.building_queue || []).forEach(q => {
+        let g = Number(q.gid || 0);
+        if (!g && q.slot_id) {
+          const s = slots.find(x => Number(x.slot) === Number(q.slot_id));
+          g = s ? Number(s.gid || 0) : 0;
+        }
+        if (g > 0) queueGids.add(g);
+      });
+      // Tribu' del villaggio: firma dagli edifici/mura razziali rilevati;
+      // fallback sulla tribu' dell'account (come _detectTribe).
+      let tribe;
+      if (levels[31] > 0 || levels[41] > 0) tribe = 'romans';
+      else if (levels[32] > 0 || levels[35] > 0) tribe = 'teutons';
+      else if (levels[33] > 0 || levels[36] > 0) tribe = 'gauls';
+      else tribe = _detectTribe();
+      return {
+        levels, fieldLevels, queueGids,
+        isCapital: !!v.is_capital, tribe,
+        scanned: slots.length > 0
+      };
+    }
+
+    function _missingPrereqs(g, vs) {
+      return (BUILDING_PREREQS[g] || [])
+        .filter(([rg, rl]) => {
+          const have = _FIELD_GIDS.has(rg)
+            ? Math.max(0, ...(vs.fieldLevels[rg] || []))
+            : (vs.levels[rg] || 0);
+          return have < rl;
+        })
+        .map(([rg, rl]) => `${GID_LABELS[rg] || 'GID ' + rg} lv.${rl}`);
+    }
+
+    function _checkGidForVillage(g, vs, mode, target) {
+      // Villaggio non ancora scansionato: filtro permissivo.
+      if (!vs.scanned) return { valid: true, reason: '' };
+      const lvl = Number(vs.levels[g] || 0);
+      const built = lvl > 0 || vs.queueGids.has(g);
+
+      // Campi risorsa (dorf1): tetto 10, 21 in capitale.
+      if (_FIELD_GIDS.has(g)) {
+        const fMax = vs.isCapital ? FIELD_MAX_CAPITAL : FIELD_MAX_NORMAL;
+        const lvls = vs.fieldLevels[g] || [];
+        if (lvls.length && lvls.every(l => l >= fMax)) {
+          return { valid: false, reason: `campi al massimo (${fMax})` };
+        }
+        if (mode === 'queue' && target > fMax) {
+          return { valid: false, reason: `target lv.${target} oltre il massimo ${fMax} (${vs.isCapital ? 'capitale' : 'non capitale'})` };
+        }
+        return { valid: true, reason: '' };
+      }
+
+      // Regola 1 — esclusione mutua Residenza (25) / Reggia-Palazzo (26).
+      if (g === 25 && ((vs.levels[26] || 0) > 0 || vs.queueGids.has(26))) {
+        return { valid: false, reason: 'conflitto: Palazzo presente/in coda' };
+      }
+      if (g === 26 && ((vs.levels[25] || 0) > 0 || vs.queueGids.has(25))) {
+        return { valid: false, reason: 'conflitto: Residenza presente/in coda' };
+      }
+
+      // Regola 4 — tribu' / capitale / Meraviglia (solo se non costruito).
+      const owner = TRIBE_GID_OWNER[g];
+      if (owner && owner !== vs.tribe && !built) {
+        return { valid: false, reason: `edificio riservato ai ${owner}` };
+      }
+      if (CAPITAL_ONLY_GIDS.has(g) && !vs.isCapital && !built) {
+        return { valid: false, reason: 'costruibile solo in capitale' };
+      }
+      if (WONDER_ONLY_GIDS.has(g) && !built) {
+        return { valid: false, reason: 'solo villaggio Meraviglia' };
+      }
+
+      // Regola 3 — edificio gia' presente (o in coda di costruzione).
+      if (built) {
+        if (mode === 'queue') return { valid: true, reason: '' }; // upgrade
+        const instMax = MULTI_MAX_LEVEL[g];
+        if (instMax) {
+          return lvl >= instMax
+            ? { valid: true, reason: '' }
+            : { valid: false, reason: `istanza presente lv.${lvl} (< max ${instMax})` };
+        }
+        return { valid: false, reason: 'edificio unico gia\' presente' };
+      }
+
+      // 'queue': i prerequisiti mancanti sono auto-risolti dal planner
+      // backend (costruzione del prerequisito) — non bloccano lo step.
+      if (mode === 'queue') return { valid: true, reason: '' };
+
+      // Regola 2 — prerequisiti tecnologici (modalita' 'build').
+      const missing = _missingPrereqs(g, vs);
+      if (missing.length) {
+        return { valid: false, reason: `manca ${missing.join(', ')}` };
+      }
+      return { valid: true, reason: '' };
+    }
+
+    // Cuore del filtro (spec §2-3): valida una chiave catalogo / gid /
+    // voce di coda sul villaggio attivo.
+    //   buildingId: chiave FOCUS_KEY_GIDS (es. 'barracks') o gid numerico
+    //   opts.mode 'build' = nuova costruzione (dropdown "+ Coda")
+    //             'queue' = voce di coda/preset (upgrade consentito:
+    //             restano solo i blocchi duri — Residenza vs Palazzo,
+    //             tribu', solo-capitale, Meraviglia)
+    //   opts.target = livello obiettivo dello step (0 = nessuno)
+    // Ritorna { valid, reason }.
+    function isBuildingValidForVillage(buildingId, vState, opts) {
+      const o = opts || {};
+      const mode = o.mode || 'build';
+      const target = Number(o.target) || 0;
+      const vs = vState || _villageFilterState();
+      let gids = [];
+      if (typeof buildingId === 'number' || /^\d+$/.test(String(buildingId))) {
+        gids = [Number(buildingId)];
+      } else {
+        const raw = FOCUS_KEY_GIDS[String(buildingId || '').toLowerCase()];
+        gids = Array.isArray(raw) ? raw.map(Number) : (raw ? [Number(raw)] : []);
+      }
+      if (!gids.length) return { valid: true, reason: '' };
+      // Il gruppo mura [31,32,33] si riduce al gid della tribu' rilevata.
+      if (gids.length > 1 && gids.every(g => g >= 31 && g <= 33)) {
+        gids = [TRIBE_WALL_GID[vs.tribe] || 31];
+      }
+      const checks = gids.map(g => _checkGidForVillage(g, vs, mode, target));
+      return checks.find(c => c.valid) || checks[0] || { valid: true, reason: '' };
+    }
+
     // Catalogo "+ Coda": ogni step del piano usa le stesse chiavi del
     // backend (building_queue_plan -> FOCUS_KEY_GIDS). I campi risorsa
     // si applicano a TUTTI i campi del tipo (dorf1), come nei preset.
@@ -1982,11 +2164,11 @@
       { key: 'iron_mine', label: 'Miniera di Ferro (Tutti i campi)', group: 'Campi Risorsa' },
       { key: 'cropland', label: 'Campo di Grano (Tutti i campi)', group: 'Campi Risorsa' },
       { key: 'sawmill', label: 'Segheria', group: 'Moltiplicatori' },
-      { key: 'brickyard', label: 'Fornace', group: 'Moltiplicatori' },
+      { key: 'brickyard', label: 'Fabbrica di mattoni', group: 'Moltiplicatori' },
       { key: 'iron_foundry', label: 'Fonderia', group: 'Moltiplicatori' },
       { key: 'grain_mill', label: 'Mulino', group: 'Moltiplicatori' },
-      { key: 'bakery', label: 'Forno', group: 'Moltiplicatori' },
-      { key: 'main_building', label: 'Centro del Villaggio', group: 'Infrastrutture' },
+      { key: 'bakery', label: 'Panificio', group: 'Moltiplicatori' },
+      { key: 'main_building', label: 'Edificio Principale', group: 'Infrastrutture' },
       { key: 'warehouse', label: 'Magazzino', group: 'Infrastrutture' },
       { key: 'granary', label: 'Granaio', group: 'Infrastrutture' },
       { key: 'cranny', label: 'Deposito Segreto', group: 'Infrastrutture' },
@@ -1994,11 +2176,11 @@
       { key: 'marketplace', label: 'Mercato', group: 'Infrastrutture' },
       { key: 'trade_office', label: 'Ufficio Commerciale', group: 'Infrastrutture' },
       { key: 'town_hall', label: 'Municipio', group: 'Infrastrutture' },
-      { key: 'treasury', label: 'Tesoreria', group: 'Infrastrutture' },
+      { key: 'treasury', label: 'Camera del Tesoro', group: 'Infrastrutture' },
       { key: 'residence', label: 'Residenza', group: 'Infrastrutture' },
       { key: 'palace', label: 'Palazzo', group: 'Infrastrutture' },
       { key: 'residence_palace', label: 'Residenza/Palazzo (auto)', group: 'Infrastrutture' },
-      { key: 'hero_mansion', label: "Magione dell'Eroe", group: 'Infrastrutture' },
+      { key: 'hero_mansion', label: "Dimora dell'Eroe", group: 'Infrastrutture' },
       { key: 'stonemason_lodge', label: 'Laboratorio dello Scultore', group: 'Infrastrutture' },
       { key: 'great_warehouse', label: 'Grande Magazzino', group: 'Infrastrutture' },
       { key: 'great_granary', label: 'Grande Granaio', group: 'Infrastrutture' },
@@ -2011,9 +2193,9 @@
       { key: 'tournament_square', label: 'Piazza del Torneo', group: 'Militari' },
       { key: 'great_barracks', label: 'Grande Caserma', group: 'Militari' },
       { key: 'great_stable', label: 'Grande Scuderia', group: 'Militari' },
-      { key: 'trapper', label: 'Trappolaio', group: 'Militari' },
+      { key: 'trapper', label: 'Esperto di trappole', group: 'Militari' },
       { key: 'city_wall', label: 'Muro di difesa (auto-tribù)', group: 'Militari' },
-      { key: 'brewery', label: 'Birreria (Teutoni)', group: 'Speciali' },
+      { key: 'brewery', label: 'Birrificio (Teutoni)', group: 'Speciali' },
       { key: 'horse_drinking_trough', label: 'Abbeveratoio (Romani)', group: 'Speciali' }
     ];
 
@@ -2364,6 +2546,7 @@
       // riflettere villages[vid] e non lo snapshot del villaggio attivo
       // al momento dell'ultimo poll.
       _hydrateActiveVillageSlots();
+      populateBrainSelects();
       renderVillageTabs();
       renderVillageCard();
       applyVillageConfigToForm();
@@ -2736,16 +2919,27 @@
         return;
       }
       let nextAssigned = false;
+      // Pulizia coda (spec §4): le voci non piu' valide per lo stato
+      // attuale del villaggio (es. Residenza con Palazzo presente)
+      // ricevono un badge di warning invece del marker "Prossimo".
+      const _qvs = _villageFilterState();
       appState.priorityQueue.forEach((step, idx) => {
         const name = _stepLabel(step);
         const gids = _stepGids(step);
         const curLvl = _stepCurrentLevel(step);
         const completed = step.target > 0 && curLvl >= step.target;
+        const validity = completed
+          ? { valid: true }
+          : isBuildingValidForVillage(
+              step.key || Number(step.gid), _qvs,
+              { mode: 'queue', target: step.target });
         const frozen = _villageFreezeActive() && !completed
           && !gids.some(g => FREEZE_WHITELIST_GIDS.includes(g));
         let badge = '';
         if (completed) {
           badge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">✓ Completato</span>`;
+        } else if (!validity.valid) {
+          badge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-red-500/15 text-red-300 border border-red-500/40" title="${esc(validity.reason)}">⚠ Non valido</span>`;
         } else if (frozen) {
           badge = `<span class="px-1.5 py-0.5 rounded text-[9px] bg-amber-500/15 text-amber-300 border border-amber-500/30">⏸ Freeze</span>`;
         } else if (!nextAssigned) {
@@ -2930,13 +3124,29 @@
 
     function addQueueStep() {
       const key = document.getElementById('queue-add-key').value;
+      if (!key) { notify('Nessun edificio selezionabile per questo villaggio', 'amber'); return; }
       const target = Math.max(1, Math.min(20,
         Number(document.getElementById('queue-add-target').value) || 1));
+      // Validazione spec: i blocchi duri (Reggia vs Residenza, tribu',
+      // solo-capitale) rifiutano lo step; gli altri casi (es. edificio
+      // unico gia' presente = upgrade) passano con avviso.
+      const vs = _villageFilterState();
+      const chkQ = isBuildingValidForVillage(key, vs, { mode: 'queue', target });
+      if (!chkQ.valid) {
+        notify(`Step rifiutato: ${chkQ.reason}`, 'red');
+        addAuditEvent('builder', 'WARNING',
+          `Step '${key}' non accodato su ${appState.activeVillage}: ${chkQ.reason}`);
+        return;
+      }
+      const chkB = isBuildingValidForVillage(key, vs, { mode: 'build', target });
       const step = { key, target };
       appState.priorityQueue.push(step);
       renderPriorityQueue();
       saveMicroBrainConfig();
       notify(`Step aggiunto: ${_stepLabel(step)} → lv.${target}`, 'emerald');
+      if (!chkB.valid) {
+        notify(`Attenzione: ${chkB.reason} — lo step agirà come upgrade`, 'amber');
+      }
     }
 
     function removeQueueStep(idx) {
@@ -2959,7 +3169,20 @@
         saveMicroBrainConfig();
         return;
       }
-      appState.priorityQueue = preset.map(([key, target]) => ({ key, target }));
+      // Validazione preventiva (spec §3): ogni step del template passa
+      // per isBuildingValidForVillage in modo 'queue'. I conflitti duri
+      // (Residenza vs Palazzo, tribu', solo-capitale) vengono saltati
+      // con avviso non bloccante invece di avvelenare la coda.
+      const _pvs = _villageFilterState();
+      const _skipped = [];
+      appState.priorityQueue = preset
+        .filter(([key, target]) => {
+          const chk = isBuildingValidForVillage(
+            key, _pvs, { mode: 'queue', target });
+          if (!chk.valid) _skipped.push(`${key} (${chk.reason})`);
+          return chk.valid;
+        })
+        .map(([key, target]) => ({ key, target }));
       // Slot truppe del ruolo -> unita' consentite (tribu' da config)
       const slots = ALLOWED_UNIT_PRESETS[role] || [];
       const tribe = _detectTribe();
@@ -2984,9 +3207,14 @@
         smithy_auto_upgrade: SMITHY_PRESETS[role]
           || { enabled: false, target_level: 20, priority_units: [] },
       });
-      addAuditEvent('builder', 'EXECUTED',
-        `Preset ruolo '${role}' applicato: ${preset.length} step edilizi`);
-      notify(`Preset '${role}': ${preset.length} step + truppe/fucina`, 'cyan');
+      addAuditEvent('builder', _skipped.length ? 'WARNING' : 'EXECUTED',
+        `Preset ruolo '${role}' applicato: ${appState.priorityQueue.length} step edilizi` +
+        (_skipped.length ? ` — saltati: ${_skipped.join('; ')}` : ''));
+      notify(
+        `Preset '${role}': ${appState.priorityQueue.length} step` +
+        (_skipped.length ? ` (${_skipped.length} saltati: non validi)` : '') +
+        ' + truppe/fucina',
+        _skipped.length ? 'amber' : 'cyan');
     }
 
     // Cambio ruolo = auto-apply preset completo (edifici + truppe + fucina)
@@ -3047,24 +3275,47 @@
     }
 
     // Popola i select catalogo coda (optgroup) e truppe (optgroup per tribu').
+    // Il catalogo "+ Coda" e' ripopolato a ogni chiamata e filtrato sullo
+    // stato reale del villaggio attivo (spec Filtro Dinamico): di default
+    // solo le nuove costruzioni fattibili; la checkbox "Mostra tutti"
+    // svela l'intero catalogo marcando le voci non disponibili.
     function populateBrainSelects() {
       const qsel = document.getElementById('queue-add-key');
-      if (qsel && !qsel.options.length) {
+      if (qsel) {
+        const prev = qsel.value;
+        const showAll = !!(
+          document.getElementById('queue-show-all') || {}
+        ).checked;
+        const vs = _villageFilterState();
+        qsel.innerHTML = '';
         const groups = {};
         QUEUE_CATALOG.forEach(c => {
-          (groups[c.group] = groups[c.group] || []).push(c);
+          const chk = isBuildingValidForVillage(c.key, vs, { mode: 'build' });
+          if (!chk.valid && !showAll) return;
+          (groups[c.group] = groups[c.group] || []).push({ ...c, chk });
         });
+        let keptPrev = false;
         Object.entries(groups).forEach(([gname, items]) => {
           const og = document.createElement('optgroup');
           og.label = gname;
           items.forEach(c => {
             const o = document.createElement('option');
             o.value = c.key;
-            o.textContent = c.label;
+            o.textContent = c.chk.valid ? c.label : `${c.label} ⚠`;
+            if (!c.chk.valid) o.title = `Non disponibile: ${c.chk.reason}`;
+            if (c.key === prev) keptPrev = true;
             og.appendChild(o);
           });
-          qsel.appendChild(og);
+          if (og.children.length) qsel.appendChild(og);
         });
+        if (!qsel.options.length) {
+          const o = document.createElement('option');
+          o.value = '';
+          o.textContent = '(nessun edificio disponibile — attiva "Mostra tutti")';
+          qsel.appendChild(o);
+        } else if (keptPrev) {
+          qsel.value = prev;
+        }
       }
       const tsel = document.getElementById('brain-troop-add-select');
       if (tsel && !tsel.options.length) {
@@ -4814,8 +5065,11 @@
         appState.auditLogs = local.concat(remote).slice(0, 60);
       }
       // Slot map live (dorf1 campi + dorf2 edifici) dal payload telemetrico:
-      // alimenta la Mappa Slot Dorf2 e i livelli correnti della coda.
+      // alimenta la Mappa Slot Dorf2, i livelli correnti della coda e il
+      // filtro dinamico del catalogo "+ Coda" (nuove scansioni = nuovi
+      // edifici sbloccati dai prerequisiti appena completati).
       _hydrateActiveVillageSlots();
+      populateBrainSelects();
       setConnBadge(EMBEDDED ? 'embedded' : 'live');
       renderVillageTabs();
       renderVillageCard();
