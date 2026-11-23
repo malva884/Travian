@@ -106,6 +106,13 @@ class VillageConfig:
     # {"wood","clay","iron","crop"} float > 0 — il campo da uppare e'
     # scelto minimizzando (riempimento/peso); vuoto = risorsa piu' scarsa.
     resource_weights: dict = field(default_factory=dict)
+    # Reclaim & Chiefing: coordinate dell'insediamento da riconquistare
+    # con il treno reclaim (None = non impostato).
+    reclaim_village_x: int | None = None
+    reclaim_village_y: int | None = None
+    # Riserva risorse: quantita' minima per tipo da non spendere/spedire
+    # (0 = nessuna riserva, spec Impostazioni Avanzate Villaggio).
+    resource_keep: int = 0
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:
@@ -543,6 +550,15 @@ def _parse_account_item(item: dict) -> Settings:
                                         cfg.get("smithy_auto_upgrade") or {}
                                     ),
                                     max_crannies=int(cfg.get("max_crannies", 0) or 0),
+                                    reclaim_village_x=int(cfg["reclaim_village_x"])
+                                    if cfg.get("reclaim_village_x") is not None
+                                    else None,
+                                    reclaim_village_y=int(cfg["reclaim_village_y"])
+                                    if cfg.get("reclaim_village_y") is not None
+                                    else None,
+                                    resource_keep=int(
+                                        cfg.get("resource_keep", 0) or 0
+                                    ),
                                     resource_weights={
                                         str(k): float(v)
                                         for k, v in dict(
@@ -760,6 +776,9 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                     ),
                     "smithy_auto_upgrade": dict(cfg.smithy_auto_upgrade),
                     "max_crannies": int(cfg.max_crannies or 0),
+                    "reclaim_village_x": cfg.reclaim_village_x,
+                    "reclaim_village_y": cfg.reclaim_village_y,
+                    "resource_keep": int(cfg.resource_keep or 0),
                     "resource_weights": dict(cfg.resource_weights),
                 }
                 for key, cfg in acc.villages.items()

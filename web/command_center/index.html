@@ -935,12 +935,22 @@
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <div>
-                <label class="block text-[10px] uppercase text-slate-400 mb-1">Obiettivi truppe (unità: quantità, virgola)</label>
-                <input id="vset-troop-targets" type="text" placeholder="Legionario: 500, Pretoriano: 200" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200">
+                <label class="block text-[10px] uppercase text-slate-400 mb-1">Obiettivi truppe (quantità)</label>
+                <div id="vset-troop-targets-list" class="p-2 rounded-lg bg-slate-950/90 border border-slate-800 min-h-[34px] flex flex-wrap gap-1.5 font-mono text-[10px]"></div>
+                <div class="flex gap-1.5 mt-1">
+                  <select id="vset-troop-unit" class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200"></select>
+                  <input id="vset-troop-qty" type="number" min="1" placeholder="q.tà" class="w-16 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200">
+                  <button onclick="addTroopTarget()" class="px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-bold">+</button>
+                </div>
               </div>
               <div>
-                <label class="block text-[10px] uppercase text-slate-400 mb-1">Upgrade Fucina (unità: livello, virgola)</label>
-                <input id="vset-smithy" type="text" placeholder="Legionario: 5, Imperiano: 3" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200">
+                <label class="block text-[10px] uppercase text-slate-400 mb-1">Upgrade Fucina (livello target)</label>
+                <div id="vset-smithy-list" class="p-2 rounded-lg bg-slate-950/90 border border-slate-800 min-h-[34px] flex flex-wrap gap-1.5 font-mono text-[10px]"></div>
+                <div class="flex gap-1.5 mt-1">
+                  <select id="vset-smithy-unit" class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200"></select>
+                  <input id="vset-smithy-level" type="number" min="1" max="20" placeholder="liv." class="w-16 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200">
+                  <button onclick="addSmithyTarget()" class="px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-bold">+</button>
+                </div>
               </div>
             </div>
             <button onclick="saveVillageExtras()" class="w-full px-2 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/35 text-[11px] font-bold">Salva Impostazioni Avanzate Villaggio</button>
@@ -2373,6 +2383,8 @@
         { gid: 23, target: 6 }, { gid: 31, target: 5 }
       ],
       allowedTroops: ['Legionario'],
+      troopTargets: {},
+      smithyTargets: {},
       auditLogs: [
         { time: '12:14:02', village: 'Hipponion', module: 'builder', status: 'EXECUTED', msg: "Slot check OK (gid==0): avviato 'Mercato' (GID 17, liv. 1) su slot #28" },
         { time: '12:12:30', village: 'Hipponion', module: 'anti_raid', status: 'EXECUTED', msg: "Protezione Depositi Segreti (4.200) > target (3.743)" },
@@ -2571,9 +2583,14 @@
         // visibile invece di lasciare i valori dell'account precedente.
         appState.priorityQueue = [];
         appState.allowedTroops = [];
+        appState.troopTargets = {};
+        appState.smithyTargets = {};
         appState.manualFocus = { enabled: false, gid: 17, slot: 0 };
         renderPriorityQueue();
         renderBrainTroops();
+        populateVillageUnitSelects();
+        renderTroopTargetBadges();
+        renderSmithyBadges();
         renderDorf2Map();
         return;
       }
@@ -2617,19 +2634,46 @@
       const sc = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
       sc('vset-farm-enabled', cfg.farm_enabled);
       sc('vset-defense-enabled', cfg.defense_enabled);
-      sc('vset-bootstrap', cfg.bootstrap_mode);
-      sc('vset-reclaim', cfg.reclaim_enabled);
+      sc('vset-bootstrap', cfg.is_bootstrap);
+      sc('vset-reclaim', cfg.is_reclaim_source);
       sv('vset-farm-unit', cfg.farm_unit || '');
       sv('vset-farm-qty', cfg.farm_unit_qty);
       sv('vset-market-slot', cfg.market_slot);
-      sv('vset-cranny', cfg.cranny_target);
+      sv('vset-cranny', cfg.max_crannies);
       sv('vset-x', cfg.x);
       sv('vset-y', cfg.y);
       sv('vset-reclaim-x', cfg.reclaim_village_x);
       sv('vset-reclaim-y', cfg.reclaim_village_y);
       sv('vset-keep', cfg.resource_keep);
-      sv('vset-troop-targets', Object.entries(cfg.troop_targets || {}).map(([k, v]) => `${k}: ${v}`).join(', '));
-      sv('vset-smithy', Object.entries(cfg.smithy_targets || {}).map(([k, v]) => `${k}: ${v}`).join(', '));
+      // Obiettivi truppe -> badge (chiavi tN; le label legacy vengono
+      // risolte via TROOP_INFO in _unitKey).
+      appState.troopTargets = {};
+      Object.entries(cfg.troop_targets || {}).forEach(([k, v]) => {
+        const key = _unitKeyOrSlot(k);
+        const qty = Number(v);
+        if (key && qty > 0) appState.troopTargets[key] = qty;
+      });
+      // Fucina: smithy_auto_upgrade {enabled, target_level,
+      // priority_units, unit_levels} -> badge {tN: livello}.
+      appState.smithyTargets = {};
+      const sau = cfg.smithy_auto_upgrade || {};
+      const sauLevels = sau.unit_levels || {};
+      if (Object.keys(sauLevels).length) {
+        Object.entries(sauLevels).forEach(([k, v]) => {
+          const key = _unitKeyOrSlot(k);
+          const lvl = Number(v);
+          if (key && lvl > 0) appState.smithyTargets[key] = lvl;
+        });
+      } else {
+        const sauTarget = Number(sau.target_level) || 20;
+        (sau.priority_units || []).forEach(k => {
+          const key = _unitKeyOrSlot(k);
+          if (key) appState.smithyTargets[key] = sauTarget;
+        });
+      }
+      populateVillageUnitSelects();
+      renderTroopTargetBadges();
+      renderSmithyBadges();
       renderBrainTroops();
       renderPriorityQueue();
       renderDorf2Map();
@@ -3332,6 +3376,7 @@
           tsel.appendChild(og);
         });
       }
+      populateVillageUnitSelects();
     }
 
     function toggleBrainFocus(enabled) {
@@ -3365,13 +3410,90 @@
       saveMicroBrainConfig();
     }
 
-    function _parseUnitMap(text) {
-      const out = {};
-      (text || '').split(',').forEach(p => {
-        const m = p.trim().match(/^([^:]+):\s*(-?\d+)$/);
-        if (m) out[m[1].trim()] = Number(m[2]);
+    const _TRIBE_LABEL = { romans: 'Romani', teutons: 'Teutoni', gauls: 'Galli' };
+
+    // Unita' della tribu' del villaggio attivo (firma edifici razziali
+    // -> fallback tribu' account), per i selettori guidati del pannello
+    // Impostazioni Avanzate.
+    function _villageUnits() {
+      const tribe = _TRIBE_LABEL[(_villageFilterState() || {}).tribe] || 'Romani';
+      return TROOP_UNITS.filter(u => u.t === tribe);
+    }
+
+    function _unitKeyOrSlot(s) {
+      // 't5'/'u5' -> 't5'; label italiana -> chiave tN; slot astratto
+      // (infantry_off, ...) -> tN della tribu' del villaggio.
+      const k = String(s || '').trim();
+      const m = k.match(/^[ut](\d+)$/i);
+      if (m) return 't' + m[1];
+      if (TROOP_INFO[k]) return TROOP_INFO[k].k;
+      const map = TRIBE_UNIT_SLOTS[k];
+      const tribe = (_villageFilterState() || {}).tribe || 'romans';
+      return (map && map[tribe]) ? map[tribe] : '';
+    }
+
+    function populateVillageUnitSelects() {
+      const units = _villageUnits();
+      ['vset-troop-unit', 'vset-smithy-unit'].forEach(id => {
+        const sel = document.getElementById(id);
+        if (!sel) return;
+        const prev = sel.value;
+        sel.innerHTML = '';
+        units.forEach(u => {
+          const o = document.createElement('option');
+          o.value = u.k;
+          o.textContent = u.n;
+          sel.appendChild(o);
+        });
+        if (prev && units.some(u => u.k === prev)) sel.value = prev;
       });
-      return out;
+    }
+
+    function _renderUnitBadges(listId, map, removeFn, suffix) {
+      const list = document.getElementById(listId);
+      if (!list) return;
+      list.innerHTML = '';
+      const keys = Object.keys(map || {});
+      if (!keys.length) {
+        list.innerHTML = '<span class="text-slate-500 italic">Nessun obiettivo impostato</span>';
+        return;
+      }
+      keys.forEach(k => {
+        const label = TROOP_LABEL_OF[k] || k;
+        const chip = document.createElement('span');
+        chip.className = 'inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-cyan-500/15 text-cyan-300 border border-cyan-500/35';
+        chip.innerHTML = `<span>${esc(label)} ${suffix}${map[k]}</span><button onclick="${removeFn}('${k}')" class="font-bold hover:text-white">×</button>`;
+        list.appendChild(chip);
+      });
+    }
+
+    function renderTroopTargetBadges() {
+      _renderUnitBadges('vset-troop-targets-list', appState.troopTargets, 'removeTroopTarget', '×');
+    }
+    function renderSmithyBadges() {
+      _renderUnitBadges('vset-smithy-list', appState.smithyTargets, 'removeSmithyTarget', 'liv.');
+    }
+    function addTroopTarget() {
+      const k = document.getElementById('vset-troop-unit').value;
+      const q = Math.max(1, parseInt(document.getElementById('vset-troop-qty').value, 10) || 0);
+      if (!k || !q) return;
+      appState.troopTargets[k] = q;
+      renderTroopTargetBadges();
+    }
+    function removeTroopTarget(k) {
+      delete appState.troopTargets[k];
+      renderTroopTargetBadges();
+    }
+    function addSmithyTarget() {
+      const k = document.getElementById('vset-smithy-unit').value;
+      const l = Math.max(1, Math.min(20, parseInt(document.getElementById('vset-smithy-level').value, 10) || 0));
+      if (!k || !l) return;
+      appState.smithyTargets[k] = l;
+      renderSmithyBadges();
+    }
+    function removeSmithyTarget(k) {
+      delete appState.smithyTargets[k];
+      renderSmithyBadges();
     }
 
     function saveVillageExtras() {
@@ -3379,18 +3501,28 @@
         const el = document.getElementById(id);
         return el && el.value !== '' ? Number(el.value) : undefined;
       };
+      const smithyLevels = { ...(appState.smithyTargets || {}) };
+      const smithyUnits = Object.keys(smithyLevels);
       const extra = {
         farm_enabled: document.getElementById('vset-farm-enabled').checked,
         defense_enabled: document.getElementById('vset-defense-enabled').checked,
-        bootstrap_mode: document.getElementById('vset-bootstrap').checked,
-        reclaim_enabled: document.getElementById('vset-reclaim').checked,
+        is_bootstrap: document.getElementById('vset-bootstrap').checked,
+        is_reclaim_source: document.getElementById('vset-reclaim').checked,
         farm_unit: document.getElementById('vset-farm-unit').value.trim(),
-        troop_targets: _parseUnitMap(document.getElementById('vset-troop-targets').value),
-        smithy_targets: _parseUnitMap(document.getElementById('vset-smithy').value),
+        troop_targets: { ...(appState.troopTargets || {}) },
+        // Formato backend VillageConfig.smithy_auto_upgrade:
+        // {enabled, target_level, priority_units, unit_levels}.
+        smithy_auto_upgrade: {
+          enabled: smithyUnits.length > 0,
+          target_level: smithyUnits.length
+            ? Math.max(...Object.values(smithyLevels)) : 0,
+          priority_units: smithyUnits,
+          unit_levels: smithyLevels,
+        },
       };
       [['vset-farm-qty', 'farm_unit_qty'],
        ['vset-market-slot', 'market_slot'],
-       ['vset-cranny', 'cranny_target'],
+       ['vset-cranny', 'max_crannies'],
        ['vset-x', 'x'], ['vset-y', 'y'],
        ['vset-reclaim-x', 'reclaim_village_x'],
        ['vset-reclaim-y', 'reclaim_village_y'],
@@ -3407,7 +3539,12 @@
         extra,
       }).then(res => {
         if (res && res.status === 'saved') {
-          notify(`Impostazioni avanzate salvate: ${appState.activeVillage}`, 'emerald');
+          const w = (res.warnings || []).filter(Boolean);
+          notify(
+            `Impostazioni avanzate salvate: ${appState.activeVillage}`
+            + (w.length ? ` — avvisi: ${w.join('; ')}` : ''),
+            w.length ? 'amber' : 'emerald'
+          );
         }
       });
     }

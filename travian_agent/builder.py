@@ -203,6 +203,79 @@ def queued_slot_ids(state: GameState) -> set[int]:
     return {q.slot_id for q in state.build_queue if q.slot_id > 0}
 
 
+def queued_level_map(state_or_snapshot) -> dict[int, int]:
+    """slot_id -> livello massimo programmato dai lavori in coda.
+
+    ``BuildQueueItem.level`` e' il livello TARGET del lavoro (es.
+    "Ambasciata liv. 1" in costruzione -> 1); un item senza livello
+    letto vale comunque il livello successivo dello slot (ogni coda
+    alza di +1). Il livello effettivo di uno slot e' quindi
+    ``max(livello_attuale, livelli_in_coda)``: serve a non riaccodare
+    un upgrade gia' programmato quando la doppia coda (romani/Plus) o
+    un prerequisito automatico lascia il field al livello reale piu'
+    basso del target.
+    """
+    if isinstance(state_or_snapshot, GameState):
+        queue = state_or_snapshot.build_queue
+        real = {
+            f.slot_id: int(f.level or 0)
+            for f in state_or_snapshot.fields
+        }
+    else:
+        queue = state_or_snapshot.get("building_queue") or []
+        real = {}
+        for s in (
+            state_or_snapshot.get("slots")
+            or state_or_snapshot.get("fields")
+            or []
+        ):
+            try:
+                real[int(s.get("slot", 0))] = int(s.get("level", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+    out: dict[int, int] = {}
+    for q in queue:
+        if isinstance(q, dict):
+            slot = q.get("slot_id") or q.get("slot") or 0
+            lvl = q.get("target_level") or q.get("level") or 0
+        else:
+            slot = getattr(q, "slot_id", 0) or 0
+            lvl = getattr(q, "level", 0) or 0
+        try:
+            slot, lvl = int(slot), int(lvl)
+        except (TypeError, ValueError):
+            continue
+        if slot <= 0:
+            continue
+        if lvl <= 0:
+            lvl = real.get(slot, 0) + 1
+        out[slot] = max(out.get(slot, 0), lvl)
+    return out
+
+
+def queued_gid_map(state_or_snapshot) -> dict[int, int]:
+    """slot_id -> gid del lavoro in coda (0 = gid non letto)."""
+    if isinstance(state_or_snapshot, GameState):
+        queue = state_or_snapshot.build_queue
+    else:
+        queue = state_or_snapshot.get("building_queue") or []
+    out: dict[int, int] = {}
+    for q in queue:
+        if isinstance(q, dict):
+            slot = q.get("slot_id") or q.get("slot") or 0
+            gid = q.get("gid") or 0
+        else:
+            slot = getattr(q, "slot_id", 0) or 0
+            gid = getattr(q, "gid", 0) or 0
+        try:
+            slot, gid = int(slot), int(gid)
+        except (TypeError, ValueError):
+            continue
+        if slot > 0:
+            out[slot] = gid
+    return out
+
+
 def parallel_build_enabled(settings: Settings) -> bool:
     """Costruzione parallela dorf1+dorf2 attiva.
 
@@ -460,11 +533,13 @@ def construct_gids(state: GameState, fields: list[Field]) -> dict[int, int]:
     non esiste ancora o ha level 0.
     """
     real = {f.slot_id: f for f in state.interior_fields()}
+    queued = queued_slot_ids(state)
     return {
         f.slot_id: f.gid
         for f in fields
         if not f.is_resource_field
         and f.gid > 0
+        and f.slot_id not in queued
         and (
             f.level == 0
             or (real.get(f.slot_id) is not None and real[f.slot_id].is_empty_site)
@@ -609,6 +684,12 @@ def resolve_target_slot(
     # Campi risorsa dorf1 (slot 1-18)
     if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
         rtype = FIELD_GID_TYPES[gids[0]]
+        qmap = queued_level_map(state_or_snapshot)
+
+        def _res_level(f: Field) -> int:
+            """Livello effettivo: attuale + quanto gia' in coda."""
+            return max(int(f.level or 0), qmap.get(f.slot_id, 0))
+
         if isinstance(state_or_snapshot, GameState):
             res_fields = [
                 f for f in state_or_snapshot.resource_fields()
@@ -632,25 +713,26 @@ def resolve_target_slot(
         if item_obj.slot_id is not None and 1 <= item_obj.slot_id <= 18:
             f = next((x for x in res_fields if x.slot_id == item_obj.slot_id), None)
             if f is not None:
-                if item_obj.target_level > 0 and f.level >= item_obj.target_level:
-                    return f.slot_id, f.level, "TARGET_REACHED"
+                eff = _res_level(f)
+                if item_obj.target_level > 0 and eff >= item_obj.target_level:
+                    return f.slot_id, eff, "TARGET_REACHED"
                 if f.slot_id in reserved:
-                    return None, f.level, "INVALID_SLOT_OCCUPIED"
+                    return None, eff, "INVALID_SLOT_OCCUPIED"
                 reserved.add(f.slot_id)
-                return f.slot_id, f.level, "OK"
+                return f.slot_id, eff, "OK"
             return None, 0, "INVALID_SLOT_OCCUPIED"
 
         # Auto dorf1: campo piu' basso non al target e non riservato
         cands = [
             f for f in res_fields
             if f.slot_id not in reserved
-            and (item_obj.target_level <= 0 or f.level < item_obj.target_level)
+            and (item_obj.target_level <= 0 or _res_level(f) < item_obj.target_level)
         ]
         if not cands:
             return None, 0, "TARGET_REACHED"
-        best = min(cands, key=lambda x: (x.level, x.slot_id))
+        best = min(cands, key=lambda x: (_res_level(x), x.slot_id))
         reserved.add(best.slot_id)
-        return best.slot_id, best.level, "OK"
+        return best.slot_id, _res_level(best), "OK"
 
     # Edifici dorf2 (slot 19-40)
     if isinstance(state_or_snapshot, GameState):
@@ -674,10 +756,17 @@ def resolve_target_slot(
             if q.get("slot_id")
         }
 
+    qmap = queued_level_map(state_or_snapshot)
+    qgids = queued_gid_map(state_or_snapshot)
+
+    def _eff_level(f: Field) -> int:
+        """Livello effettivo: attuale + livelli gia' programmati in coda."""
+        return max(int(f.level or 0), qmap.get(f.slot_id, 0))
+
     # Slot fissi speciali: Punto di Raduno (39) e Mura (40)
     if any(g == GID_RALLY_POINT for g in gids):
         f39 = next((f for f in interiors if f.slot_id == 39), None)
-        cur_lvl = f39.level if f39 and f39.gid == GID_RALLY_POINT else 0
+        cur_lvl = _eff_level(f39) if f39 and f39.gid == GID_RALLY_POINT else 0
         if item_obj.target_level > 0 and cur_lvl >= item_obj.target_level:
             return 39, cur_lvl, "TARGET_REACHED"
         if 39 in reserved:
@@ -687,7 +776,7 @@ def resolve_target_slot(
 
     if any(g in WALL_GIDS for g in gids):
         f40 = next((f for f in interiors if f.slot_id == 40), None)
-        cur_lvl = f40.level if f40 and f40.gid in WALL_GIDS else 0
+        cur_lvl = _eff_level(f40) if f40 and f40.gid in WALL_GIDS else 0
         if item_obj.target_level > 0 and cur_lvl >= item_obj.target_level:
             return 40, cur_lvl, "TARGET_REACHED"
         if 40 in reserved:
@@ -697,18 +786,52 @@ def resolve_target_slot(
 
     # Edifici normali dorf2: BUILD_SLOTS_DORF2 [19..38]
     existing = [f for f in interiors if f.gid in gids and f.gid > 0]
+    # Edificio in costruzione su slot ancora letto vuoto (gid 0) o
+    # assente dagli internals: l'item in coda col gid del gruppo conta
+    # come istanza esistente — il suo livello effettivo arriva da qmap.
+    known = {f.slot_id for f in existing}
+    for q_slot, q_gid in qgids.items():
+        if q_gid not in gids or q_gid <= 0 or q_slot in known:
+            continue
+        host = next((x for x in interiors if x.slot_id == q_slot), None)
+        if host is not None and host.gid > 0 and host.gid not in gids:
+            continue
+        existing.append(
+            host
+            if host is not None
+            else Field(slot_id=q_slot, name="", level=0, gid=q_gid)
+        )
+        known.add(q_slot)
 
     # --- Caso 1: Edificio gia' esistente nel villaggio ---
     if item_obj.slot_id is not None and item_obj.slot_id > 0:
         target_f = next((f for f in interiors if f.slot_id == item_obj.slot_id), None)
         if target_f is not None and target_f.gid in gids:
-            if item_obj.target_level > 0 and target_f.level >= item_obj.target_level:
-                return item_obj.slot_id, target_f.level, "TARGET_REACHED"
+            eff = _eff_level(target_f)
+            if item_obj.target_level > 0 and eff >= item_obj.target_level:
+                return item_obj.slot_id, eff, "TARGET_REACHED"
             if item_obj.slot_id in reserved:
-                return None, target_f.level, "INVALID_SLOT_OCCUPIED"
+                return None, eff, "INVALID_SLOT_OCCUPIED"
             reserved.add(item_obj.slot_id)
-            return item_obj.slot_id, target_f.level, "OK"
+            return item_obj.slot_id, eff, "OK"
         elif target_f is not None and (target_f.gid <= 0 or target_f.is_empty_site):
+            if item_obj.slot_id in queued:
+                # Slot "vuoto" con lavoro in coda: se e' lo stesso
+                # edificio del gruppo conta come istanza esistente al
+                # livello programmato, altrimenti lo slot e' occupato.
+                q_gid = qgids.get(item_obj.slot_id, 0)
+                if q_gid in gids and q_gid > 0:
+                    eff = qmap.get(item_obj.slot_id, 0)
+                    if (
+                        item_obj.target_level > 0
+                        and eff >= item_obj.target_level
+                    ):
+                        return item_obj.slot_id, eff, "TARGET_REACHED"
+                    if item_obj.slot_id in reserved:
+                        return None, eff, "INVALID_SLOT_OCCUPIED"
+                    reserved.add(item_obj.slot_id)
+                    return item_obj.slot_id, eff, "OK"
+                return None, 0, "INVALID_SLOT_OCCUPIED"
             if item_obj.slot_id not in BUILD_SLOTS_DORF2 or item_obj.slot_id in reserved:
                 return None, 0, "INVALID_SLOT_OCCUPIED"
             reserved.add(item_obj.slot_id)
@@ -720,12 +843,12 @@ def resolve_target_slot(
     under_target = [
         f for f in existing
         if f.slot_id not in reserved
-        and (item_obj.target_level <= 0 or f.level < item_obj.target_level)
+        and (item_obj.target_level <= 0 or _eff_level(f) < item_obj.target_level)
     ]
     if under_target:
-        best = min(under_target, key=lambda x: (x.level, x.slot_id))
+        best = min(under_target, key=lambda x: (_eff_level(x), x.slot_id))
         reserved.add(best.slot_id)
-        return best.slot_id, best.level, "OK"
+        return best.slot_id, _eff_level(best), "OK"
 
     if existing:
         is_multi = (
@@ -733,12 +856,16 @@ def resolve_target_slot(
             or item_obj.allow_duplicate_building
         )
         if not is_multi:
-            top = max(existing, key=lambda x: x.level)
-            return top.slot_id, top.level, "TARGET_REACHED"
+            top = max(existing, key=lambda x: _eff_level(x))
+            return top.slot_id, _eff_level(top), "TARGET_REACHED"
 
     # --- Caso 2: Edificio non ancora costruito (level == 0) o nuova istanza multi-building ---
     if item_obj.slot_id is not None and item_obj.slot_id > 0:
-        if item_obj.slot_id not in BUILD_SLOTS_DORF2 or item_obj.slot_id in reserved:
+        if (
+            item_obj.slot_id not in BUILD_SLOTS_DORF2
+            or item_obj.slot_id in reserved
+            or item_obj.slot_id in queued
+        ):
             return None, 0, "INVALID_SLOT_OCCUPIED"
         target_f = next((f for f in interiors if f.slot_id == item_obj.slot_id), None)
         if target_f is None or not target_f.is_empty_site:
@@ -838,6 +965,8 @@ def _prereq_intent(
     if not cap_ok or not missing:
         return None
     queued = queued_slot_ids(state)
+    qmap = queued_level_map(state)
+    queued_gids = set(queued_gid_map(state).values())
     interiors = state.interior_fields()
     existing = {f.gid for f in interiors}
     for req_gid, req_level in missing:
@@ -846,13 +975,22 @@ def _prereq_intent(
         built = next((f for f in interiors if f.gid == req_gid), None)
         if built is not None:
             # Esiste ma e' sotto il livello richiesto: upgrade del
-            # prerequisito al posto della nuova costruzione.
+            # prerequisito al posto della nuova costruzione. Il livello
+            # effettivo include i lavori gia' in coda — un upgrade gia'
+            # programmato copre il requisito senza riaccodarlo (es.
+            # Ambasciata lv.0 + coda ->1 con target 1).
+            eff = max(built.level, qmap.get(built.slot_id, 0))
             if (
-                built.level < req_level
+                eff < req_level
                 and built.slot_id not in queued
                 and built.level < field_max_level(state, built)
             ):
                 return built
+            continue
+        # Assente ma gia' in costruzione (slot dorf2 letto ancora
+        # vuoto): il requisito e' coperto dalla coda — niente seconda
+        # costruzione dello stesso edificio.
+        if req_gid in queued_gids:
             continue
         # Assente: costruibile sull'area dello step solo se anche i
         # suoi prerequisiti reggono (catena risolta un livello alla
@@ -1136,11 +1274,16 @@ def focus_skip_reasons(
 
         if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
             rtype = FIELD_GID_TYPES[gids[0]]
+            qmap = queued_level_map(state)
             below = [
                 f
                 for f in state.resource_fields()
                 if f.resource_type is rtype
-                and (it.target_level <= 0 or f.level < it.target_level)
+                and (
+                    it.target_level <= 0
+                    or max(f.level, qmap.get(f.slot_id, 0))
+                    < it.target_level
+                )
             ]
             if not below:
                 continue
@@ -1152,7 +1295,14 @@ def focus_skip_reasons(
             continue
 
         if cur_lvl == 0:
-            gid = it.gid if it.gid > 0 else _pick_group_gid(state, gids)
+            role = settings.village_role_for(
+                state.village_name, state.village_id
+            )
+            gid = (
+                it.gid
+                if it.gid > 0
+                else _pick_group_gid(state, gids, role)
+            )
             ok, why = prereqs_met(state.fields, gid, is_capital(state))
             if not ok:
                 # Step applicabile via prerequisito automatico: nessun

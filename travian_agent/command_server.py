@@ -1927,6 +1927,7 @@ def _strategy_prompt(acc, text: str, snap: dict | None) -> str:
             "is_bootstrap", "is_reclaim_source", "defense_enabled",
             "market_slot", "smithy_auto_upgrade",
             "troop_replenishment_preset",
+            "reclaim_village_x", "reclaim_village_y", "resource_keep",
         ],
         "farming": sorted(cfg["farming"]),
         "scout_brain": sorted(cfg["scout_brain"]),
