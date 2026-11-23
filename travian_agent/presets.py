@@ -126,8 +126,11 @@ ROLE_PRESETS: dict[str, list[tuple[str, int]]] = {
         ("iron_foundry", 5),
         ("grain_mill", 5),
         ("bakery", 5),
-        # Ufficio Commerciale (gid 28): richiede anche Scuderia 10 —
-        # i prerequisiti sono segnalati dalla preview di fattibilita'.
+        # Catena sblocco Ufficio Commerciale: Fucina 3 -> Accademia 5
+        # -> Scuderia 10 (prerequisiti gia' coperti dagli step sopra).
+        ("smithy", 3),
+        ("academy", 5),
+        ("stable", 10),
         ("trade_office", 10),
         ("city_wall", 12),
     ],
