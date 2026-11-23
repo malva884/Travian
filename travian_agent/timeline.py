@@ -266,7 +266,14 @@ def _focus_stream(
         ):
             continue
 
-        gid = it.gid if it.gid > 0 else builder._pick_group_gid(state, gids)
+        role = settings.village_role_for(
+            state.village_name, state.village_id
+        )
+        gid = (
+            it.gid
+            if it.gid > 0
+            else builder._pick_group_gid(state, gids, role)
+        )
         sim_gid[slot_id] = gid
         target_limit = target if target > 0 else 20
 

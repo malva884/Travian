@@ -788,16 +788,21 @@ _TRIBE_WALL_GID: dict[str, int] = {
 }
 
 
-def _pick_group_gid(state: GameState, gids: tuple[int, ...]) -> int:
+def _pick_group_gid(
+    state: GameState, gids: tuple[int, ...], role: str = ""
+) -> int:
     """Sceglie il gid da costruire dentro un gruppo di alternative.
 
     - Mura: dipende dalla tribu' rilevata; se sconosciuta si usa il gid
       romano come default (caso piu' comune) — il contratto di
       costruzione fallira' comunque apertamente se la tribu' non lo
       consente, evitando però di provare tutti i gid a caso.
-    - Residenza/Palazzo: se esiste il Palazzo (capitale) lo step e' gia'
-      coperto dagli interni; qui si sceglie la Residenza per i
-      non-capitali.
+    - Residenza/Palazzo: quando NESSUNO dei due esiste ancora la scelta
+      segue il ruolo del villaggio — capitale rilevata o ruolo
+      ``croplog`` -> Palazzo (GID 26), qualsiasi altro ruolo ->
+      Residenza (GID 25). Se uno dei due e' gia' presente il chiamante
+      non arriva qui (lo step fa match sull'esistente) e la mutua
+      esclusione blocca la costruzione dell'altro.
     - Default: primo gid del gruppo i cui prerequisiti reggono.
     """
     if len(gids) == 1:
@@ -805,6 +810,10 @@ def _pick_group_gid(state: GameState, gids: tuple[int, ...]) -> int:
     if set(gids) == set(WALL_GIDS):
         tribe = _detect_tribe(state)
         return _TRIBE_WALL_GID.get(tribe, WALL_GIDS[0])
+    if set(gids) == {GID_RESIDENCE, GID_PALACE}:
+        if role == "croplog" or is_capital(state):
+            return GID_PALACE
+        return GID_RESIDENCE
     for gid in gids:
         ok, _why = prereqs_met(state.fields, gid, is_capital(state))
         if ok:
@@ -926,7 +935,14 @@ def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
                 ]
             out.extend(sorted(matches, key=lambda f: (f.level, f.slot_id)))
         else:
-            gid = it.gid if it.gid > 0 else _pick_group_gid(state, gids)
+            role = settings.village_role_for(
+                state.village_name, state.village_id
+            )
+            gid = (
+                it.gid
+                if it.gid > 0
+                else _pick_group_gid(state, gids, role)
+            )
             if cur_lvl == 0:
                 ok, why = prereqs_met(state.fields, gid, is_capital(state))
                 if not ok:
