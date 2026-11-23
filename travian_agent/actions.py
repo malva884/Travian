@@ -591,8 +591,14 @@ class ActionExecutor:
         blocker_cost: dict | None = None
         blocker_eta: float | None = None
         last_cost: dict = {}
+        # Primo fallimento strutturale incontrato (codice, slot, gid):
+        # propagato nel risultato finale se nessun candidato viene
+        # avviato — serve a record_upgrade_fail per marcare lo step
+        # della Coda Prioritaria come bloccato (spec anti-starvation).
+        first_structural: dict | None = None
 
-        for slot_id in candidates:
+        for cand_idx, slot_id in enumerate(candidates):
+            is_head = cand_idx == 0
             gid = construct.get(int(slot_id), 0)
 
             if gid > 0:
@@ -708,6 +714,21 @@ class ActionExecutor:
                             expected_gid=gid,
                             detected_gid=page_gid,
                         )
+                        _err = {
+                            "error": "INVALID_SLOT_OCCUPIED",
+                            "slot_id": int(slot_id),
+                            "gid": int(gid),
+                        }
+                        if is_head:
+                            # Testa prioritaria: niente spesa sui
+                            # candidati secondari — blocco esplicito.
+                            return ActionResult(
+                                False,
+                                f"candidato prioritario: slot {slot_id} "
+                                f"occupato da gid={page_gid}",
+                                data=_err,
+                            )
+                        first_structural = first_structural or _err
                         continue
                     try:
                         prereq_missing = await page.evaluate(
@@ -736,6 +757,19 @@ class ActionExecutor:
                         expected_gid=gid,
                         detected_gid=page_gid,
                     )
+                    _err = {
+                        "error": err,
+                        "slot_id": int(slot_id),
+                        "gid": int(gid),
+                    }
+                    if is_head:
+                        return ActionResult(
+                            False,
+                            f"candidato prioritario: contratto gid={gid} "
+                            f"non trovato su slot {slot_id} ({err})",
+                            data=_err,
+                        )
+                    first_structural = first_structural or _err
                     continue
 
                 button = None
@@ -749,6 +783,13 @@ class ActionExecutor:
                     f".buildingWrapper.gid{gid} button.green",
                     f".buildingWrapper.gid{gid} .contractLink button.green",
                     f"#contract_building{gid} button[type='button'].green",
+                    # Fallback generici: alcune skin della nuova UI non
+                    # usano la classe 'green' sul CTA primario, oppure
+                    # rendono cliccabile l'intera riga contractLink.
+                    f"#contract_building{gid} button",
+                    f".buildingWrapper.gid{gid} button",
+                    f"#contract_building{gid} a.contractLink",
+                    f".buildingWrapper.gid{gid} a.contractLink",
                 ]
                 for _idx, sel in enumerate(
                     self.profile.ordered_selectors(
@@ -805,6 +846,23 @@ class ActionExecutor:
                             slot_id=int(slot_id),
                             expected_gid=gid,
                         )
+                        _err = {
+                            "error": err,
+                            "slot_id": int(slot_id),
+                            "gid": int(gid),
+                        }
+                        if is_head:
+                            # Blocco strutturale sulla testa prioritaria:
+                            # niente spesa sui candidati secondari.
+                            return ActionResult(
+                                False,
+                                f"candidato prioritario: pulsante "
+                                f"costruzione gid={gid} non trovato su "
+                                f"slot {slot_id} (BTN_NOT_FOUND)",
+                                data=_err,
+                            )
+                        first_structural = first_structural or _err
+                        continue
                     if blocker_cost is None and cost:
                         _def = {
                             k: max(0, int(cost.get(k) or 0) - stock.get(k, 0))
@@ -1005,17 +1063,28 @@ class ActionExecutor:
                             }
                             // 2) Riga della coda costruzioni legata a slot/gid
                             const linkRe = new RegExp(
-                                'build\\\\.php[?&]id=' + sidStr + '(?![0-9])'
+                                '(build\\\\.php|\\\\/slot|\\\\/building)' +
+                                '[?&][^"\']*\\\\bid=' + sidStr + '(?![0-9])'
                             );
                             for (const row of document.querySelectorAll(
                                 '.buildingList li, #buildingContract .buildingRow, ' +
                                 '.buildingsOverview .buildingRow, ' +
                                 'table#building_contract tr, ' +
-                                '[class*="buildQueue" i] li, [class*="queueElement" i]'
+                                '#sidebarBoxBuildingQueue li, ' +
+                                '#sidebarBoxBuildingQueue [class*="entry" i], ' +
+                                '[class*="buildQueue" i] li, ' +
+                                '[class*="buildingQueue" i] li, ' +
+                                '[class*="queueElement" i]'
                             )) {
                                 const a = row.querySelector(
-                                    'a[href*="build.php?id="]'
-                                ) || row.closest('a[href*="build.php?id="]');
+                                    'a[href*="build.php?id="], ' +
+                                    'a[href*="/slot?"], ' +
+                                    'a[href*="/building?"]'
+                                ) || row.closest(
+                                    'a[href*="build.php?id="], ' +
+                                    'a[href*="/slot?"], ' +
+                                    'a[href*="/building?"]'
+                                );
                                 if (a && linkRe.test(a.getAttribute('href') || '')) {
                                     return 'queue-link';
                                 }
@@ -1029,6 +1098,17 @@ class ActionExecutor:
                                         return 'queue-gid';
                                     }
                                 }
+                            }
+                            // 3) La pagina dello slot marca il lavoro in
+                            // corso (nuova UI: il contratto mostra lo
+                            // stato 'under construction').
+                            if (document.querySelector(
+                                '#content [class*="underConstruction" i], ' +
+                                '#build [class*="underConstruction" i], ' +
+                                '#contract [class*="underConstruction" i], ' +
+                                '.buildingWrapper [class*="underConstruction" i]'
+                            )) {
+                                return 'contract-progress';
                             }
                             return null;
                         }
@@ -1073,6 +1153,22 @@ class ActionExecutor:
                         "confirm_kind": confirm_kind,
                     },
                 )
+                _err = {
+                    "error": "QUEUE_UNCONFIRMED",
+                    "slot_id": int(slot_id),
+                    "gid": int(gid),
+                }
+                if is_head:
+                    # Click senza effetto sulla testa prioritaria: stop
+                    # immediato — i candidati secondari non devono
+                    # bruciare le risorse riservate allo step di testa.
+                    return ActionResult(
+                        False,
+                        f"candidato prioritario: click senza effetto su "
+                        f"slot {slot_id} (QUEUE_UNCONFIRMED)",
+                        data=_err,
+                    )
+                first_structural = first_structural or _err
                 continue
 
             action_name = "costruzione iniziale" if gid > 0 else "upgrade"
@@ -1092,11 +1188,17 @@ class ActionExecutor:
 
         # Resource-ETA Sleep: riporta il costo del BLOCCANTE (C1) per
         # l'ETA corretta; se nessun bloccante, l'ultimo contratto letto.
+        # Se c'e' stato un fallimento strutturale su un candidato non
+        # prioritario, il codice errore viaggia nel data per
+        # record_upgrade_fail (marcatura step bloccato in dashboard).
         final_cost = blocker_cost or last_cost
+        _data: dict = dict(first_structural or {})
+        if final_cost:
+            _data["cost"] = final_cost
         return ActionResult(
             False,
             "nessun candidato migliorabile (risorse insufficienti o livello max)",
-            data={"cost": final_cost} if final_cost else {},
+            data=_data,
         )
 
     async def _claim_video_bonus(self, action: Action) -> ActionResult:

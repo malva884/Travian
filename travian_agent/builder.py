@@ -1014,6 +1014,33 @@ def _prereq_intent(
     return None
 
 
+def _mutual_conflict_reason(state: GameState, gid: int) -> str:
+    """Motivo di blocco per mutua esclusione ('' se costruibile).
+
+    Residenza (25) <-> Palazzo (26) e mura tribali: la presenza — anche
+    solo in coda di costruzione su slot ancora letto vuoto — di un altro
+    membro del gruppo rende irrealizzabile la nuova costruzione. Senza
+    questo guard lo step della Coda Prioritaria (es. 'palace' con
+    Residenza gia' edificata) produrrebbe un candidato che il gioco
+    rifiuta sempre: BTN_NOT_FOUND/QUEUE_UNCONFIRMED a ripetizione.
+    """
+    existing = {f.gid for f in state.interior_fields()}
+    existing |= {
+        g for g in queued_gid_map(state).values() if g > 0
+    }
+    for group in _MUTUALLY_EXCLUSIVE_GIDS:
+        if gid not in group:
+            continue
+        for other in group:
+            if other != gid and other in existing:
+                return (
+                    "mutua esclusione: "
+                    f"'{GID_LABELS.get(other, 'gid ' + str(other))}' "
+                    "gia' presente o in costruzione"
+                )
+    return ""
+
+
 def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
     """Pool candidati della Coda Prioritaria PRIMA del filtro slot-coda.
 
@@ -1082,6 +1109,15 @@ def focus_candidates(state: GameState, settings: Settings) -> list[Field]:
                 else _pick_group_gid(state, gids, role)
             )
             if cur_lvl == 0:
+                conflict = _mutual_conflict_reason(state, gid)
+                if conflict:
+                    logger.debug(
+                        "[%s] Nuovo edificio gid %d bloccato: %s",
+                        state.village_name,
+                        gid,
+                        conflict,
+                    )
+                    continue
                 ok, why = prereqs_met(state.fields, gid, is_capital(state))
                 if not ok:
                     # Prerequisiti mancanti (spec): lo step non viene
@@ -1144,6 +1180,9 @@ def record_upgrade_exec(village_id: int | str, slot_id: int, level: int) -> None
     hist = _FOCUS_EXEC_HISTORY.setdefault(key, [])
     hist.append(int(level))
     del hist[:-8]
+    # Un EXECUTED riuscito resetta anche la storia dei fallimenti
+    # strutturali: lo slot torna candidabile.
+    _FOCUS_FAIL_HISTORY.pop(key, None)
 
 
 def focus_stuck_slots(state: GameState) -> set[int]:
@@ -1153,6 +1192,8 @@ def focus_stuck_slots(state: GameState) -> set[int]:
     livello, il livello attuale non e' cresciuto rispetto a quello
     registrato e non compare nella coda costruzioni. Se il livello e'
     variato la storia viene azzerata (progresso reale o mano umana).
+    Include anche gli slot bloccati da fallimenti strutturali ripetuti
+    dell'esecutore (``focus_fail_blocked``).
     """
     queued = queued_slot_ids(state)
     levels = {f.slot_id: int(f.level) for f in state.fields}
@@ -1182,7 +1223,63 @@ def focus_stuck_slots(state: GameState) -> set[int]:
             _FOCUS_STUCK_MIN_ATTEMPTS
         ):
             stuck.add(slot)
+    stuck |= set(focus_fail_blocked(state))
     return stuck
+
+
+# Circuit-breaker per fallimenti STRUTTURALI dell'esecutore
+# (BTN_NOT_FOUND, QUEUE_UNCONFIRMED, INVALID_SLOT_OCCUPIED,
+# PREREQUISITES_MISSING): >=2 esiti identici consecutivi sullo stesso
+# slot marcano lo step come 'blocked' — la coda lo salta con motivo
+# esplicito invece di riprovare all'infinito bruciando risorse sui
+# candidati secondari. Codici transienti (INSUFFICIENT_RESOURCES,
+# errori di navigazione) non contano. Stato di runtime, azzerato a
+# riavvio; un EXECUTED riuscito su quello slot resetta la storia.
+_FOCUS_FAIL_HISTORY: dict[tuple[str, int], list[str]] = {}
+_FOCUS_FAIL_MIN_ATTEMPTS = 2
+STRUCTURAL_EXEC_ERRORS = frozenset(
+    {
+        "BTN_NOT_FOUND",
+        "QUEUE_UNCONFIRMED",
+        "INVALID_SLOT_OCCUPIED",
+        "PREREQUISITES_MISSING",
+    }
+)
+
+
+def record_upgrade_fail(
+    village_id: int | str, slot_id: int, error: str
+) -> None:
+    """Registra un fallimento strutturale dell'esecutore su ``slot_id``."""
+    if not slot_id or int(slot_id) <= 0:
+        return
+    code = str(error or "").strip().upper()
+    if code not in STRUCTURAL_EXEC_ERRORS:
+        return
+    key = (str(village_id or "0"), int(slot_id))
+    hist = _FOCUS_FAIL_HISTORY.setdefault(key, [])
+    if hist and hist[-1] != code:
+        # Codice diverso: la storia riparte (nuovo modo di fallire).
+        hist.clear()
+    hist.append(code)
+    del hist[:-8]
+
+
+def focus_fail_blocked(state: GameState) -> dict[int, str]:
+    """slot_id -> ultimo codice errore per slot con fallimenti ripetuti."""
+    vkeys = {
+        str(v) for v in (state.village_id, state.village_name) if v
+    }
+    levels = {f.slot_id: int(f.level) for f in state.fields}
+    queued = queued_slot_ids(state)
+    out: dict[int, str] = {}
+    for (vid, slot), hist in list(_FOCUS_FAIL_HISTORY.items()):
+        if vid not in vkeys or len(hist) < _FOCUS_FAIL_MIN_ATTEMPTS:
+            continue
+        if slot not in levels or slot in queued:
+            continue
+        out[slot] = hist[-1]
+    return out
 
 
 def focus_intents(state: GameState, settings: Settings) -> list[Field]:
@@ -1242,6 +1339,7 @@ def focus_skip_reasons(
     queued = queued_slot_ids(state)
     reserved_slots: set[int] = set()
     stuck = focus_stuck_slots(state)
+    fail_blocked = focus_fail_blocked(state)
     reasons: list[str] = []
     items = _focus_items(plan)
     for it in items:
@@ -1267,9 +1365,16 @@ def focus_skip_reasons(
         if status != "OK" or slot_id is None:
             continue
         if slot_id in stuck:
-            reasons.append(
-                f"'{label}' slot {slot_id} bloccato: EXECUTED ripetuto senza aumento livello (STUCK)"
-            )
+            _fc = fail_blocked.get(slot_id)
+            if _fc:
+                reasons.append(
+                    f"'{label}' slot {slot_id} bloccato: esecutore "
+                    f"{_fc} ripetuto senza effetto (BLOCKED)"
+                )
+            else:
+                reasons.append(
+                    f"'{label}' slot {slot_id} bloccato: EXECUTED ripetuto senza aumento livello (STUCK)"
+                )
             continue
 
         if len(gids) == 1 and gids[0] in FIELD_GID_TYPES:
@@ -1303,6 +1408,12 @@ def focus_skip_reasons(
                 if it.gid > 0
                 else _pick_group_gid(state, gids, role)
             )
+            conflict = _mutual_conflict_reason(state, gid)
+            if conflict:
+                reasons.append(
+                    f"'{label}' non costruibile: {conflict}"
+                )
+                continue
             ok, why = prereqs_met(state.fields, gid, is_capital(state))
             if not ok:
                 # Step applicabile via prerequisito automatico: nessun

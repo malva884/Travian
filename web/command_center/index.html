@@ -2021,6 +2021,12 @@
     const MULTI_MAX_LEVEL = { 10: 20, 11: 20, 23: 10, 36: 20, 38: 20, 39: 20 };
     const FIELD_MAX_NORMAL = 10, FIELD_MAX_CAPITAL = 21;
     const _FIELD_GIDS = new Set([1, 2, 3, 4]);
+    // Gid duplicabili (multi-istanza): mirror MULTI_INSTANCE_GIDS di
+    // builder.py + campi risorsa. Restano sempre selezionabili nel
+    // catalogo "+ Coda" (upgrade o nuova istanza), anche se gia' in
+    // Coda Prioritaria o costruiti; i non duplicabili vengono invece
+    // nascosti quando presenti in coda o nella mappa DORF2.
+    const DUPLICABLE_GIDS = new Set([1, 2, 3, 4, 10, 11, 23, 36, 38, 39]);
 
     // Stato filtro del villaggio attivo: livelli per gid (edifici dorf2
     // e campi dorf1), gid in coda di costruzione, tribu' e capitale.
@@ -2069,7 +2075,7 @@
         .map(([rg, rl]) => `${GID_LABELS[rg] || 'GID ' + rg} lv.${rl}`);
     }
 
-    function _checkGidForVillage(g, vs, mode, target) {
+    function _checkGidForVillage(g, vs, mode, target, o) {
       // Villaggio non ancora scansionato: filtro permissivo.
       if (!vs.scanned) return { valid: true, reason: '' };
       const lvl = Number(vs.levels[g] || 0);
@@ -2112,6 +2118,9 @@
       if (built) {
         if (mode === 'queue') return { valid: true, reason: '' }; // upgrade
         const instMax = MULTI_MAX_LEVEL[g];
+        // opts.upgrade (solo duplicabili): l'istanza esistente non
+        // nasconde la voce — lo step agisce come upgrade.
+        if (instMax && o && o.upgrade) return { valid: true, reason: '' };
         if (instMax) {
           return lvl >= instMax
             ? { valid: true, reason: '' }
@@ -2158,7 +2167,7 @@
       if (gids.length > 1 && gids.every(g => g >= 31 && g <= 33)) {
         gids = [TRIBE_WALL_GID[vs.tribe] || 31];
       }
-      const checks = gids.map(g => _checkGidForVillage(g, vs, mode, target));
+      const checks = gids.map(g => _checkGidForVillage(g, vs, mode, target, o));
       return checks.find(c => c.valid) || checks[0] || { valid: true, reason: '' };
     }
 
@@ -2672,6 +2681,7 @@
       renderSmithyBadges();
       renderBrainTroops();
       renderPriorityQueue();
+      populateBrainSelects();
       renderDorf2Map();
     }
 
@@ -3127,6 +3137,7 @@
       appState.priorityQueue.push(step);
       closeSlotModal();
       renderPriorityQueue();
+      populateBrainSelects();
       saveMicroBrainConfig();
       notify(`Step aggiunto: ${_stepLabel(step)} lv.${target} su Slot #${_activeModalSlot}`, 'emerald');
     }
@@ -3185,6 +3196,7 @@
       const step = { key, target };
       appState.priorityQueue.push(step);
       renderPriorityQueue();
+      populateBrainSelects();
       saveMicroBrainConfig();
       notify(`Step aggiunto: ${_stepLabel(step)} → lv.${target}`, 'emerald');
       if (!chkB.valid) {
@@ -3195,6 +3207,7 @@
     function removeQueueStep(idx) {
       const [step] = appState.priorityQueue.splice(idx, 1);
       renderPriorityQueue();
+      populateBrainSelects();
       saveMicroBrainConfig();
       if (step) notify(`Step rimosso: ${_stepLabel(step)}`, 'amber');
     }
@@ -3243,6 +3256,7 @@
       });
       renderBrainTroops();
       renderPriorityQueue();
+      populateBrainSelects();
       saveMicroBrainConfig({
         preset_applied: true,
         troop_replenishment_preset: rp,
@@ -3317,11 +3331,28 @@
       notify(`Filtro truppe: ${label}`, 'cyan');
     }
 
+    // Gid risolti di una chiave catalogo (stessa riduzione del gruppo
+    // mura di isBuildingValidForVillage): usata per il filtro dinamico
+    // sulla Coda Prioritaria e per la classificazione duplicabile.
+    function _keyToGids(key, vs) {
+      const raw = FOCUS_KEY_GIDS[key];
+      let gids = Array.isArray(raw) ? raw.map(Number) : (raw ? [Number(raw)] : []);
+      if (gids.length > 1 && gids.every(g => g >= 31 && g <= 33)) {
+        gids = [TRIBE_WALL_GID[vs.tribe] || 31];
+      }
+      return gids;
+    }
+
     // Popola i select catalogo coda (optgroup) e truppe (optgroup per tribu').
     // Il catalogo "+ Coda" e' ripopolato a ogni chiamata e filtrato sullo
     // stato reale del villaggio attivo (spec Filtro Dinamico): di default
     // solo le nuove costruzioni fattibili; la checkbox "Mostra tutti"
     // svela l'intero catalogo marcando le voci non disponibili.
+    // Inoltre gli edifici NON duplicabili gia' presenti nella Coda
+    // Prioritaria vengono nascosti (spec filtro coda); i duplicabili
+    // (Magazzino, Granaio, Deposito, Grandi depositi, Trapper) e i
+    // campi risorsa restano sempre selezionabili per upgrade/nuova
+    // istanza.
     function populateBrainSelects() {
       const qsel = document.getElementById('queue-add-key');
       if (qsel) {
@@ -3330,10 +3361,23 @@
           document.getElementById('queue-show-all') || {}
         ).checked;
         const vs = _villageFilterState();
+        // Gid gia' pianificati nella Coda Prioritaria del villaggio.
+        const queuedGids = new Set();
+        (appState.priorityQueue || []).forEach(st => {
+          _stepGids(st).forEach(g => queuedGids.add(g));
+        });
         qsel.innerHTML = '';
         const groups = {};
         QUEUE_CATALOG.forEach(c => {
-          const chk = isBuildingValidForVillage(c.key, vs, { mode: 'build' });
+          const gids = _keyToGids(c.key, vs);
+          const duplicable = gids.length > 0
+            && gids.every(g => DUPLICABLE_GIDS.has(g));
+          let chk = isBuildingValidForVillage(
+            c.key, vs, { mode: 'build', upgrade: duplicable });
+          if (chk.valid && !duplicable
+              && gids.some(g => queuedGids.has(g))) {
+            chk = { valid: false, reason: 'già in Coda Prioritaria' };
+          }
           if (!chk.valid && !showAll) return;
           (groups[c.group] = groups[c.group] || []).push({ ...c, chk });
         });

@@ -31,6 +31,7 @@ from .builder import (
     plan_upgrades,
     queue_slots_free,
     record_upgrade_exec,
+    record_upgrade_fail,
     save_build_plan,
 )
 from .building_prereqs import (
@@ -2738,6 +2739,32 @@ async def monitor_all_villages(
                 logger.warning(
                     "%s Azione non eseguita: %s", vprefix, result.message
                 )
+
+                # Circuit-breaker Coda Prioritaria (spec anti-starvation):
+                # fallimenti strutturali dell'esecutore (BTN_NOT_FOUND,
+                # QUEUE_UNCONFIRMED, INVALID_SLOT_OCCUPIED,
+                # PREREQUISITES_MISSING) conteggiati per slot — dopo >=2
+                # esiti identici lo step viene marcato BLOCKED e la coda
+                # lo salta con motivo esplicito in dashboard.
+                if action.type == ActionType.UPGRADE_FIELD:
+                    try:
+                        _fd = result.data or {}
+                        if _fd.get("error") and _fd.get("slot_id"):
+                            record_upgrade_fail(
+                                str(
+                                    village.village_id
+                                    or village.name
+                                    or "0"
+                                ),
+                                int(_fd["slot_id"]),
+                                str(_fd["error"]),
+                            )
+                    except Exception:
+                        logger.debug(
+                            "%s record_upgrade_fail ignorato",
+                            vprefix,
+                            exc_info=True,
+                        )
 
                 # Emergency Unpack (spec 3.2): spesa prioritaria fallita per
                 # risorse mancanti -> il baule dell'eroe copre il delta. La
