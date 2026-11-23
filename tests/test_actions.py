@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from travian_agent.actions import ActionExecutor, _is_building_url
+from travian_agent.actions import (
+    ActionExecutor,
+    _is_building_url,
+    _slot_url_check,
+)
 
 
 class TestIsBuildingUrl:
@@ -44,6 +48,41 @@ def _data(wood=0, clay=0, iron=0, crop=0, units=None) -> dict:
         "resources": {"wood": wood, "clay": clay, "iron": iron, "crop": crop},
         "units": units or [],
     }
+
+
+class TestSlotUrlCheck:
+    """Guard 'pagina dello slot N aperta' sui routing Travian.
+
+    Regressione BTN_NOT_FOUND ts30: dopo la navigazione a
+    /slot?id=27&category=1 il server puo' riscrivere l'URL a
+    /slot?id=27 (category ignorata) — il guard deve comunque
+    riconoscere la pagina dello slot.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://ts30.x3.europe.travian.com/slot?id=27",
+            "https://ts30.x3.europe.travian.com/slot?id=27&category=1",
+            "https://ts30.x3.europe.travian.com/building?id=27",
+            "https://ts1.x1.travian.com/build.php?id=27",
+            "https://ts30.x3.europe.travian.com/slot?id=27&newdid=12345",
+        ],
+    )
+    def test_slot_urls_accepted(self, url):
+        assert _slot_url_check(27).search(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://ts30.x3.europe.travian.com/slot?id=7",
+            "https://ts30.x3.europe.travian.com/slot?id=270",
+            "https://ts30.x3.europe.travian.com/village",
+            "",
+        ],
+    )
+    def test_other_slot_urls_rejected(self, url):
+        assert not _slot_url_check(27).search(url)
 
 
 class TestPickTrainingBatch:

@@ -506,14 +506,18 @@ class ActionExecutor:
                 """
                 () => {
                     const containers = document.querySelectorAll(
-                        '#buildingContract, .buildingList, ' +
-                        '.buildingsOverview, table#building_contract, ' +
-                        '[class*="buildQueue" i], [class*="construction" i]'
+                        '#buildingContract, #building_contract, ' +
+                        '.buildingList, .buildingsOverview, ' +
+                        '#sidebarBoxBuilding, #sidebarBoxBuildingQueue, ' +
+                        '[id*="buildQueue" i], [id*="buildingQueue" i], ' +
+                        '[class*="buildQueue" i], [class*="buildingQueue" i], ' +
+                        '[class*="construction" i]'
                     );
                     if (!containers.length) return null;
                     const rowSels = [
                         '.buildingRow', 'li', 'tr',
                         '[class*="queueElement" i]', '[class*="entry" i]',
+                        '[class*="queue" i] > div', '.slotRow',
                     ];
                     let best = 0;
                     for (const c of containers) {
@@ -649,15 +653,30 @@ class ActionExecutor:
 
                 if block_count == 0:
                     # Il blocco .buildingWrapper.gid{N} esiste solo nel tab
-                    # categoria giusto: prova quello mappato, poi gli altri
-                    # (fallback per cataloghi/skin diversi).
+                    # categoria giusto. Su alcuni server il parametro
+                    # category= nella URL viene ignorato/riscritto (la
+                    # pagina slot apre il tab di default, es. Risorse):
+                    # 1) click mirato sul tab della categoria mappata,
+                    #    poi delle altre (fallback cataloghi/skin);
+                    # 2) enumerazione generica dei tab della pagina slot
+                    #    per markup che non espone href 'category='.
+                    if "category=" not in (page.url or ""):
+                        logger.debug(
+                            "Slot %s: parametro category assente in %s, "
+                            "seleziono il tab via DOM",
+                            slot_id,
+                            page.url,
+                        )
                     for cat_try in [cat_id] + [
                         c for c in (1, 2, 3) if c != cat_id
                     ]:
                         tab_loc = page.locator(
                             f".contentNavi a[href*='category={cat_try}'], "
                             f".tabItem[data-tab-id='{cat_try}'], "
+                            f".tabItem[data-category='{cat_try}'], "
                             f".tabItem a[href*='category={cat_try}'], "
+                            f"[role='tab'][href*='category={cat_try}'], "
+                            f"button[onclick*='category={cat_try}'], "
                             f"a[href*='category={cat_try}']"
                         ).first
                         try:
@@ -670,6 +689,38 @@ class ActionExecutor:
                             continue
                         if block_count > 0:
                             break
+
+                    if block_count == 0:
+                        # Fallback generico: i tab di categoria nella
+                        # nuova UI possono essere JS-driven senza href
+                        # 'category=' (tabItem/[role=tab]/nav). Clicca
+                        # ogni elemento tab-like nel content e ricontrolla.
+                        tabs = page.locator(
+                            "#content .tabItem, #content nav a, "
+                            "#content .tabs a, #content [role='tab'], "
+                            ".contentNavi .tabItem, .contentNavi a"
+                        )
+                        try:
+                            n_tabs = min(await tabs.count(), 8)
+                        except Exception:
+                            n_tabs = 0
+                        for ti in range(n_tabs):
+                            t = tabs.nth(ti)
+                            try:
+                                if not await t.is_visible():
+                                    continue
+                                await human_click(page, t)
+                                await sleep_human(0.8, 1.5)
+                                block_count = await contract_block.count()
+                            except Exception:
+                                continue
+                            if block_count > 0:
+                                break
+                            # Un tab puo' essere un link di navigazione
+                            # fuori dalla pagina slot: torna indietro
+                            # prima di provare il successivo.
+                            if not slot_check.search(page.url or ""):
+                                await self.browser.goto(build_url)
 
                 if block_count == 0:
                     # Blocco del gid assente anche dopo il tab: la
@@ -1026,7 +1077,7 @@ class ActionExecutor:
                 try:
                     confirm_kind = await page.evaluate(
                         """
-                        ({ sid, gid }) => {
+                        ({ sid, gid, qbefore }) => {
                             const sidStr = String(sid);
                             const clsOf = (el) => {
                                 const c = el ? el.className : '';
@@ -1061,29 +1112,41 @@ class ActionExecutor:
                                     }
                                 }
                             }
-                            // 2) Riga della coda costruzioni legata a slot/gid
+                            // 2) Riga della coda costruzioni legata a slot/gid.
+                            //    dorf2 nuova UI: il box NON usa la classe
+                            //    'buildingQueue' — copre #building_contract
+                            //    (anche non-table), sidebarBoxBuilding e
+                            //    qualunque id/classe *queue*.
                             const linkRe = new RegExp(
-                                '(build\\\\.php|\\\\/slot|\\\\/building)' +
+                                '(build\\\\.php|slot|building)' +
                                 '[?&][^"\']*\\\\bid=' + sidStr + '(?![0-9])'
                             );
                             for (const row of document.querySelectorAll(
                                 '.buildingList li, #buildingContract .buildingRow, ' +
+                                '#buildingContract li, ' +
                                 '.buildingsOverview .buildingRow, ' +
                                 'table#building_contract tr, ' +
+                                '#building_contract tr, ' +
+                                '#building_contract li, ' +
+                                '#building_contract .buildingRow, ' +
+                                '#sidebarBoxBuilding li, ' +
+                                '#sidebarBoxBuilding .buildingRow, ' +
                                 '#sidebarBoxBuildingQueue li, ' +
                                 '#sidebarBoxBuildingQueue [class*="entry" i], ' +
+                                '[id*="buildQueue" i] li, ' +
+                                '[id*="buildingQueue" i] li, ' +
                                 '[class*="buildQueue" i] li, ' +
                                 '[class*="buildingQueue" i] li, ' +
                                 '[class*="queueElement" i]'
                             )) {
                                 const a = row.querySelector(
                                     'a[href*="build.php?id="], ' +
-                                    'a[href*="/slot?"], ' +
-                                    'a[href*="/building?"]'
+                                    'a[href*="slot?"], ' +
+                                    'a[href*="building?"]'
                                 ) || row.closest(
                                     'a[href*="build.php?id="], ' +
-                                    'a[href*="/slot?"], ' +
-                                    'a[href*="/building?"]'
+                                    'a[href*="slot?"], ' +
+                                    'a[href*="building?"]'
                                 );
                                 if (a && linkRe.test(a.getAttribute('href') || '')) {
                                     return 'queue-link';
@@ -1110,10 +1173,34 @@ class ActionExecutor:
                             )) {
                                 return 'contract-progress';
                             }
+                            // 4) Timer in un box coda: conferma solo se
+                            //    prima del click non era rilevabile alcuna
+                            //    coda (evita falsi positivi su code
+                            //    preesistenti di altri edifici).
+                            if (qbefore === null || qbefore === 0) {
+                                const qbox = document.querySelector(
+                                    '#sidebarBoxBuilding, ' +
+                                    '#sidebarBoxBuildingQueue, ' +
+                                    '[id*="buildQueue" i], ' +
+                                    '[id*="buildingQueue" i], ' +
+                                    '[class*="buildQueue" i], ' +
+                                    '[class*="buildingQueue" i], ' +
+                                    '.buildingList, #building_contract'
+                                );
+                                if (qbox && qbox.querySelector(
+                                    '.timer, .dur, .clocks, [class*="timer" i]'
+                                )) {
+                                    return 'queue-timer';
+                                }
+                            }
                             return null;
                         }
                         """,
-                        {"sid": int(slot_id), "gid": int(gid)},
+                        {
+                            "sid": int(slot_id),
+                            "gid": int(gid),
+                            "qbefore": queue_before,
+                        },
                     )
                 except Exception:
                     confirm_kind = None

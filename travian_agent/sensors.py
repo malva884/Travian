@@ -710,8 +710,23 @@ class TravianParser:
             queue: list = await self.page.evaluate("""
                 () => {
                     const items = [];
-                    // Cerca il contenitore della coda di costruzione (.buildingList, #buildingContract, etc.)
-                    const queueElements = document.querySelectorAll('.buildingList li, #buildingContract .buildingRow, .buildingsOverview .buildingRow, table#building_contract tr');
+                    // Cerca il contenitore della coda di costruzione:
+                    // dorf2 nuova UI NON usa 'buildingQueue' — copre
+                    // .buildingList, #building_contract (anche non-table),
+                    // sidebarBoxBuilding e qualunque id/classe *queue*.
+                    const queueElements = document.querySelectorAll(
+                        '.buildingList li, #buildingContract .buildingRow, ' +
+                        '#buildingContract li, ' +
+                        '.buildingsOverview .buildingRow, ' +
+                        'table#building_contract tr, #building_contract tr, ' +
+                        '#building_contract li, #building_contract .buildingRow, ' +
+                        '#sidebarBoxBuilding li, #sidebarBoxBuilding .buildingRow, ' +
+                        '#sidebarBoxBuildingQueue li, ' +
+                        '#sidebarBoxBuildingQueue [class*="entry" i], ' +
+                        '[id*="buildQueue" i] li, [id*="buildingQueue" i] li, ' +
+                        '[class*="buildQueue" i] li, [class*="buildingQueue" i] li, ' +
+                        '[class*="queueElement" i]'
+                    );
 
                     queueElements.forEach(el => {
                         // Nome dal div .name/.building: l'alt dell'icona
@@ -736,12 +751,21 @@ class TravianParser:
                         }
                         const durationEl = el.querySelector('.buildDuration, .timer, .dur, .clocks');
                         let duration = durationEl?.innerText?.trim() || '';
-                        // Slot di origine dal link build.php?id=N (se la riga lo contiene)
-                        const link = el.querySelector('a[href*="build.php?id="]') || el.closest('a[href*="build.php?id="]');
+                        // Slot di origine dal link della riga (build.php?id=N
+                        // legacy, /slot?id=N o /building?id=N nuova UI).
+                        const link = el.querySelector(
+                            'a[href*="build.php?id="], a[href*="slot?"], ' +
+                            'a[href*="building?"]'
+                        ) || el.closest(
+                            'a[href*="build.php?id="], a[href*="slot?"], ' +
+                            'a[href*="building?"]'
+                        );
                         let slotId = null;
                         if (link) {
-                            const m = (link.getAttribute('href') || '').match(/build\\.php[?&]id=(\\d+)/);
-                            if (m) slotId = parseInt(m[1], 10);
+                            const m = (link.getAttribute('href') || '').match(
+                                /(build\\.php|slot|building)[?&][^"']*\\bid=(\\d+)/
+                            );
+                            if (m) slotId = parseInt(m[2], 10);
                         }
                         let gid = null;
                         const classStr = (el.className || '') + ' ' + Array.from(el.querySelectorAll('*')).map(c => c.className || '').join(' ');
@@ -769,6 +793,13 @@ class TravianParser:
             "#buildingContract .buildingRow",
             ".buildingsOverview .buildingRow",
             "table#building_contract tr",
+            "#building_contract li",
+            "#sidebarBoxBuilding li",
+            "#sidebarBoxBuildingQueue li",
+            "[id*='buildQueue' i] li",
+            "[class*='buildQueue' i] li",
+            "[class*='buildingQueue' i] li",
+            "[class*='queueElement' i]",
         ):
             rows = self.page.locator(sel)
             try:
