@@ -781,36 +781,32 @@
             </div>
           </div>
 
-          <div class="sub-card rounded-xl p-3 space-y-2">
-            <div class="flex items-center justify-between">
-              <label class="inline-flex items-center gap-2 cursor-pointer">
-                <input id="brain-focus-enabled" type="checkbox" onchange="toggleBrainFocus(this.checked)" class="w-4 h-4 accent-cyan-400">
-                <span class="text-xs font-semibold text-white">Abilita Focus Manuale (solo su slot liberi)</span>
-              </label>
-              <span id="brain-focus-pill" class="text-[10px] font-mono text-slate-400">Disattivato</span>
-            </div>
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 font-mono">
-              <select id="brain-focus-gid" onchange="updateBrainFocus()" class="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200">
-                <option value="17">GID 17 · Mercato</option>
-                <option value="23">GID 23 · Deposito Segreto</option>
-                <option value="25">GID 25 · Residenza</option>
-                <option value="26">GID 26 · Palazzo</option>
-                <option value="10">GID 10 · Magazzino</option>
-                <option value="11">GID 11 · Granaio</option>
-              </select>
-              <select id="brain-focus-slot" onchange="updateBrainFocus()" class="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-emerald-300">
-                <!-- Populated with safe empty slots -->
-              </select>
-            </div>
+          <div class="sub-card rounded-xl px-3 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-2 font-mono">
+            <label class="inline-flex items-center gap-2 cursor-pointer shrink-0">
+              <input id="brain-focus-enabled" type="checkbox" onchange="toggleBrainFocus(this.checked)" class="w-4 h-4 accent-cyan-400">
+              <span class="text-xs font-semibold text-white">Abilita Focus Manuale <span class="text-slate-500 font-normal">(solo su slot liberi)</span></span>
+            </label>
+            <select id="brain-focus-gid" onchange="updateBrainFocus()" class="flex-1 min-w-[150px] bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200">
+              <option value="17">GID 17 · Mercato</option>
+              <option value="23">GID 23 · Deposito Segreto</option>
+              <option value="25">GID 25 · Residenza</option>
+              <option value="26">GID 26 · Palazzo</option>
+              <option value="10">GID 10 · Magazzino</option>
+              <option value="11">GID 11 · Granaio</option>
+            </select>
+            <select id="brain-focus-slot" onchange="updateBrainFocus()" class="flex-1 min-w-[130px] bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-emerald-300">
+              <!-- Populated with safe empty slots -->
+            </select>
+            <span id="brain-focus-pill" class="text-[10px] font-mono text-slate-400 ml-auto">Disattivato</span>
           </div>
 
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div class="space-y-2">
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-3">
+            <div class="space-y-2 lg:col-span-2">
               <div class="flex items-center justify-between font-mono text-[11px]">
                 <span class="text-slate-300 font-bold">Coda Prioritaria Edifici</span>
                 <button onclick="applyRolePreset()" class="text-cyan-400 hover:underline text-[10px]">⚙ Applica Preset Ruolo</button>
               </div>
-              <div id="brain-priority-queue" class="space-y-1.5 max-h-[250px] overflow-y-auto pr-1">
+              <div id="brain-priority-queue" class="space-y-1.5 max-h-[340px] overflow-y-auto pr-1">
                 <!-- Populated by JS -->
               </div>
               <div class="flex gap-1.5 font-mono">
@@ -3013,32 +3009,34 @@
               slotOpts.push(`<option value="${s}" disabled>#${s} (${GID_LABELS[occ.gid] || 'G' + occ.gid} lv.${occ.level}) [Occupato]</option>`);
             }
           }
-          slotSelect = `<select onchange="updateQueueStepSlot(${idx}, this.value)" class="bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-[9px] text-slate-300 max-w-[130px] truncate" title="Seleziona slot Dorf2">
+          slotSelect = `<select onchange="updateQueueStepSlot(${idx}, this.value)" class="bg-slate-950 border border-slate-700 rounded-lg px-1.5 py-1 text-[10px] text-slate-300 max-w-[160px] truncate" title="Seleziona slot Dorf2">
             ${slotOpts.join('')}
           </select>`;
         }
 
         const row = document.createElement('div');
-        row.className = 'sub-card rounded-xl px-2.5 py-2 flex items-center justify-between gap-2 font-mono text-[11px]';
+        row.className = 'sub-card rounded-xl px-3 py-2.5 flex items-center justify-between gap-3 font-mono text-[11px]';
         row.innerHTML = `
           <div class="min-w-0 flex-1">
             <div class="text-slate-200 font-semibold truncate">${idx + 1}. ${esc(name)} <span class="text-cyan-400">[${esc(_stepTag(step))}]</span></div>
-            <div class="text-[10px] text-slate-400 flex items-center gap-2 mt-0.5">
+            <div class="text-[11px] text-slate-400 flex items-center gap-3 mt-1">
               <span>lv.${curLvl} →</span>
-              <span class="flex items-center gap-1">Target lv.
+              <span class="flex items-center gap-1.5">Target lv.
                 <input type="number" min="0" max="25" step="1" value="${step.target}"
                   onchange="updateQueueStepTarget(${idx}, this.value)"
-                  class="bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-[9px] text-slate-300 w-11"
+                  class="bg-slate-950 border border-slate-700 rounded-lg px-1.5 py-1 text-[11px] text-slate-200 w-12"
                   title="Livello obiettivo dello step (0 = rimuovi vincolo)">
               </span>
               ${slotSelect}
             </div>
           </div>
-          <div class="flex items-center gap-1 shrink-0">
+          <div class="flex flex-col items-center gap-1 shrink-0">
             ${badge}
-            <button onclick="moveQueueItem(${idx}, -1)" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700" title="Sposta su">↑</button>
-            <button onclick="moveQueueItem(${idx}, 1)" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700" title="Sposta giu'">↓</button>
-            <button onclick="removeQueueStep(${idx})" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-red-500/20 text-red-300 border border-slate-700" title="Rimuovi step">×</button>
+            <div class="flex items-center gap-1">
+              <button onclick="moveQueueItem(${idx}, -1)" class="w-7 h-7 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 text-sm leading-none" title="Sposta su">↑</button>
+              <button onclick="moveQueueItem(${idx}, 1)" class="w-7 h-7 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 text-sm leading-none" title="Sposta giu'">↓</button>
+              <button onclick="removeQueueStep(${idx})" class="w-7 h-7 rounded-lg bg-slate-900 hover:bg-red-500/20 text-red-300 border border-slate-700 text-sm leading-none" title="Rimuovi step">×</button>
+            </div>
           </div>`;
         box.appendChild(row);
       });
