@@ -362,6 +362,23 @@ class ActionExecutor:
         except Exception:  # noqa: BLE001
             return False
 
+    @staticmethod
+    async def _is_upgrade_blocked(block) -> bool:
+        """True se il blocco contratto mostra un blocco temporaneo.
+
+        Nuova UI: quando la costruzione e' sospesa (coda interna piena
+        senza Plus, requisiti/risorse non ancora pronti) dentro
+        #contract_building{gid} NON esiste <button class="green build">
+        ma compare <div class="upgradeBlocked"> insieme ai div
+        cliccabili .inlineIcon.resource.transfer (modale trasferimento
+        risorse eroe). Quei div non devono essere intercettati dal
+        fallback di ricerca pulsante.
+        """
+        try:
+            return await block.locator(".upgradeBlocked").count() > 0
+        except Exception:  # noqa: BLE001
+            return False
+
     async def execute(self, action: Action, village_id: int | str = 0) -> ActionResult:
         logger.info("Azione %s -> %s", action.type.value, action.reason or "-")
 
@@ -600,6 +617,10 @@ class ActionExecutor:
         # avviato — serve a record_upgrade_fail per marcare lo step
         # della Coda Prioritaria come bloccato (spec anti-starvation).
         first_structural: dict | None = None
+        # Blocco temporaneo (.upgradeBlocked): propagato nel data solo
+        # in assenza di errori strutturali — codice non strutturale,
+        # il circuit-breaker dei fail lo ignora di proposito.
+        blocked_err: dict | None = None
 
         for cand_idx, slot_id in enumerate(candidates):
             is_head = cand_idx == 0
@@ -821,6 +842,28 @@ class ActionExecutor:
                             data=_err,
                         )
                     first_structural = first_structural or _err
+                    continue
+
+                # Blocco temporaneo della nuova UI: #contract_building{gid}
+                # mostra .upgradeBlocked (coda interna occupata senza
+                # Plus, requisiti/risorse non pronti) al posto del
+                # pulsante build; i div .inlineIcon.resource.transfer
+                # presenti aprono il modale eroe e non devono essere
+                # intercettati come CTA. Skip pulito: niente fallback
+                # pulsante, niente QUEUE_UNCONFIRMED, codice NON
+                # strutturale -> record_upgrade_fail lo ignora.
+                if await self._is_upgrade_blocked(contract_block):
+                    logger.info(
+                        "Costruzione gid=%s su slot %s temporaneamente "
+                        "bloccata (.upgradeBlocked): skip candidato",
+                        gid,
+                        slot_id,
+                    )
+                    blocked_err = blocked_err or {
+                        "error": "UPGRADE_BLOCKED",
+                        "slot_id": int(slot_id),
+                        "gid": int(gid),
+                    }
                     continue
 
                 button = None
@@ -1279,7 +1322,7 @@ class ActionExecutor:
         # prioritario, il codice errore viaggia nel data per
         # record_upgrade_fail (marcatura step bloccato in dashboard).
         final_cost = blocker_cost or last_cost
-        _data: dict = dict(first_structural or {})
+        _data: dict = dict(first_structural or blocked_err or {})
         if final_cost:
             _data["cost"] = final_cost
         return ActionResult(
