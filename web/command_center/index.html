@@ -2061,19 +2061,58 @@
     };
     // Unità sbloccate per ruolo (mirror ALLOWED_UNIT_SLOTS presets.py)
     const ALLOWED_UNIT_PRESETS = {
-      early_cropper_founder: ['infantry_base'],
-      hammer: ['infantry_off', 'cavalry_off', 'ram', 'catapult'],
-      defensive: ['infantry_def', 'cavalry_def'],
-      feeder: ['infantry_base'],
-      croplog: [],
-      chiefing: ['chief', 'settler']
-    };
+      "early_cropper_founder": [
+            "infantry_base",
+            "infantry_def",
+            "scout"
+      ],
+      "hammer": [
+            "infantry_off",
+            "cavalry_off",
+            "ram",
+            "catapult"
+      ],
+      "defensive": [
+            "infantry_def",
+            "cavalry_def"
+      ],
+      "feeder": [
+            "infantry_def",
+            "infantry_base",
+            "scout"
+      ],
+      "croplog": [
+            "infantry_def",
+            "infantry_base",
+            "scout"
+      ],
+      "chiefing": [
+            "chief",
+            "settler"
+      ]
+};
 
     // Preset numerici replenishment per ruolo (mirror TROOP_REPLENISHMENT_PRESETS):
     // *_target -> slot astratto; 'settlers_target' gestito dal modulo espansione.
     const TROOP_REPLENISH_PRESETS = {
-      early_cropper_founder: { base_infantry_target: 80, settlers_target: 3 }
-    };
+      "early_cropper_founder": {
+            "base_infantry_target": 50,
+            "defensive_infantry_target": 30,
+            "settlers_target": 3
+      },
+      "croplog": {
+            "defensive_infantry_target": 40,
+            "scout_target": 10
+      },
+      "feeder": {
+            "defensive_infantry_target": 30,
+            "scout_target": 5
+      },
+      "defensive": {
+            "defensive_infantry_target": 150,
+            "defensive_cavalry_target": 50
+      }
+};
     const PRESET_SLOT_KEYS = {
       base_infantry_target: 'infantry_base',
       offensive_infantry_target: 'infantry_off',
@@ -2096,43 +2135,12 @@
     // Code edilizie complete per ruolo (mirror ROLE_PRESETS presets.py):
     // coppie [focus_key, target_level].
     const ROLE_PRESETS = {
-      early_cropper_founder: [
-        ['main_building', 5], ['rally_point', 1], ['warehouse', 10],
-        ['granary', 10], ['residence', 10], ['city_wall', 5],
-        ['marketplace', 5], ['woodcutter', 5], ['clay_pit', 5],
-        ['iron_mine', 5], ['cropland', 5], ['academy', 10]
-      ],
-      hammer: [
-        ['main_building', 20], ['rally_point', 15], ['barracks', 20],
-        ['academy', 10], ['smithy', 20], ['stable', 20], ['workshop', 15],
-        ['tournament_square', 20], ['warehouse', 20], ['granary', 20],
-        ['city_wall', 15], ['woodcutter', 10], ['clay_pit', 10],
-        ['iron_mine', 10], ['cropland', 10]
-      ],
-      defensive: [
-        ['main_building', 15], ['rally_point', 1], ['city_wall', 20],
-        ['barracks', 20], ['academy', 5], ['smithy', 20], ['stable', 20],
-        ['warehouse', 16], ['granary', 16], ['woodcutter', 10],
-        ['clay_pit', 10], ['iron_mine', 10], ['cropland', 10]
-      ],
-      feeder: [
-        ['woodcutter', 12], ['clay_pit', 12], ['iron_mine', 12],
-        ['cropland', 12], ['main_building', 10], ['warehouse', 18],
-        ['granary', 18], ['marketplace', 20], ['rally_point', 1],
-        ['city_wall', 10], ['barracks', 5]
-      ],
-      croplog: [
-        ['cropland', 15], ['main_building', 20], ['granary', 20],
-        ['grain_mill', 5], ['bakery', 5], ['warehouse', 20],
-        ['city_wall', 15], ['woodcutter', 10], ['clay_pit', 10],
-        ['iron_mine', 10]
-      ],
-      chiefing: [
-        ['main_building', 15], ['rally_point', 1], ['barracks', 3],
-        ['academy', 20], ['residence_palace', 20], ['town_hall', 10],
-        ['warehouse', 18], ['granary', 18], ['city_wall', 15]
-      ],
-      standard: []
+      "early_cropper_founder": [["main_building", 5], ["cranny", 10], ["rally_point", 1], ["warehouse", 10], ["granary", 10], ["residence", 10], ["city_wall", 5], ["barracks", 3], ["marketplace", 5], ["woodcutter", 5], ["clay_pit", 5], ["iron_mine", 5], ["cropland", 5], ["embassy", 1], ["academy", 10]],
+      "hammer": [["main_building", 5], ["rally_point", 1], ["cranny", 10], ["city_wall", 5], ["main_building", 20], ["rally_point", 15], ["barracks", 20], ["academy", 10], ["smithy", 20], ["stable", 20], ["workshop", 15], ["tournament_square", 20], ["warehouse", 20], ["granary", 20], ["city_wall", 15], ["woodcutter", 10], ["clay_pit", 10], ["iron_mine", 10], ["cropland", 10]],
+      "defensive": [["main_building", 5], ["rally_point", 1], ["cranny", 10], ["main_building", 15], ["city_wall", 20], ["barracks", 20], ["academy", 5], ["smithy", 20], ["stable", 20], ["warehouse", 16], ["granary", 16], ["woodcutter", 10], ["clay_pit", 10], ["iron_mine", 10], ["cropland", 10]],
+      "feeder": [["main_building", 5], ["cranny", 10], ["rally_point", 1], ["city_wall", 8], ["barracks", 3], ["warehouse", 10], ["granary", 10], ["marketplace", 12], ["woodcutter", 12], ["clay_pit", 12], ["iron_mine", 12], ["cropland", 12], ["main_building", 10], ["warehouse", 18], ["granary", 18], ["marketplace", 20], ["sawmill", 5], ["brickyard", 5], ["iron_foundry", 5], ["grain_mill", 5], ["bakery", 5], ["smithy", 3], ["academy", 5], ["stable", 10], ["trade_office", 10], ["city_wall", 12]],
+      "croplog": [["main_building", 5], ["cranny", 10], ["rally_point", 1], ["city_wall", 10], ["embassy", 1], ["palace", 1], ["barracks", 5], ["academy", 5], ["granary", 12], ["warehouse", 10], ["cropland", 15], ["grain_mill", 5], ["bakery", 5], ["granary", 20], ["warehouse", 20], ["city_wall", 15], ["woodcutter", 10], ["clay_pit", 10], ["iron_mine", 10]],
+      "chiefing": [["main_building", 5], ["rally_point", 1], ["cranny", 10], ["city_wall", 8], ["main_building", 15], ["barracks", 3], ["academy", 20], ["residence_palace", 20], ["town_hall", 10], ["warehouse", 18], ["granary", 18], ["city_wall", 15]],
     };
 
     // Fallback standalone: usati finche' non arriva il primo snapshot reale.

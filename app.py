@@ -1671,6 +1671,19 @@ if page == "Villaggi":
                                         for x in _gen["excluded_units"]
                                     )
                                 )
+                            # Persistenza immediata su accounts.json
+                            _pcfg = cur_acc.villages.get(vname) or VillageConfig(name=vname)
+                            _pcfg.role = role
+                            _pcfg.building_focus = [dict(s) for s in _steps]
+                            _pcfg.building_queue_plan = [dict(s) for s in _steps]
+                            _pcfg.building_focus_enabled = True
+                            if _tribe and _slots:
+                                _pcfg.allowed_units = resolve_troop_labels(_slots, _tribe)
+                            _pcfg.troop_targets = dict(_gen.get("troop_targets") or {})
+                            _pcfg.preset_applied = True
+                            _pcfg.custom_modified = False
+                            cur_acc.villages[vname] = _pcfg
+                            save_accounts(accounts)
                             return True
 
                         _preset_applied = False
