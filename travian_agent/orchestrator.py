@@ -203,6 +203,143 @@ def _record_module_paused(
     )
 
 
+# Capienza di sicurezza per i destinatari dei feeder: una spedizione
+# non deve mai portare il villaggio ricevente oltre questa quota del
+# magazzino/granaio (margine per la produzione e i premi task).
+FEED_TARGET_FILL_MARGIN = 0.85
+# Soglia "destinatario quasi pieno": sotto questo spazio libero
+# complessivo il viaggio dei mercanti non vale la candela.
+FEED_TARGET_MIN_FREE = 300
+# Filtro grano verso croplog/15c in crescita: il grano non parte se il
+# granaio del target e' gia' pieno oltre questa quota — in fase di
+# crescita servono solo legno/argilla/ferro per campi e magazzini.
+FEED_CROP_FULL_RATIO = 0.70
+# Fallback conservativo (per risorsa) se la capienza del target e'
+# ignota (villaggio mai visitato dall'agente).
+FEED_UNKNOWN_FREE = 800
+
+
+def _inbound_merchant_resources(
+    settings: Settings, village_key: str
+) -> dict[str, int]:
+    """Risorse gia' in viaggio verso ``village_key``.
+
+    Somma i carichi dei vettori mercanti 'inbound' registrati nel radar
+    store per il villaggio destinatario (incluse le spedizioni
+    specchiate registrate alla partenza e i sync live dal Mercato).
+    """
+    key = str(village_key or "").strip()
+    if not key:
+        return {}
+    out: dict[str, int] = {}
+    try:
+        moves = radar_store(settings.account_id).movements_for(key)
+    except Exception:  # noqa: BLE001
+        return {}
+    for mv in moves:
+        if (
+            str(mv.get("category") or "") != CAT_MERCHANT
+            or str(mv.get("direction") or "") != "inbound"
+        ):
+            continue
+        res = (mv.get("details") or {}).get("resources") or {}
+        for name in ("wood", "clay", "iron", "crop"):
+            try:
+                out[name] = out.get(name, 0) + int(res.get(name) or 0)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _cap_feed_shipment(
+    settings: Settings,
+    *,
+    target_key: str,
+    surplus: dict,
+    target_res: Resources | None = None,
+    target_role: str = "",
+) -> tuple[dict[str, int], dict[str, int], str]:
+    """Cappa una spedizione feeder allo spazio libero del destinatario.
+
+    - Per-risorsa: mai oltre ``FEED_TARGET_FILL_MARGIN`` della capienza
+      del magazzino/granaio target, al netto delle scorte attuali e dei
+      mercanti gia' in viaggio verso di esso (vettori inbound radar).
+    - Filtro grano su croplog/15c: il grano non parte se il granaio del
+      target e' gia' al >=``FEED_CROP_FULL_RATIO`` o la sua produzione
+      netta di grano e' positiva (``crop_balance`` > 0) — in crescita
+      il feeder manda solo legno/argilla/ferro.
+
+    Ritorna ``(surplus_cappato, spazio_libero_per_risorsa, nota_filtro)``.
+    """
+    capped: dict[str, int] = {}
+    for k, v in (surplus or {}).items():
+        try:
+            qty = int(v or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty > 0:
+            capped[str(k)] = qty
+    inbound = _inbound_merchant_resources(settings, target_key)
+    cap_wh = int(target_res.warehouse_capacity or 0) if target_res else 0
+    cap_gr = int(target_res.granary_capacity or 0) if target_res else 0
+    free: dict[str, int] = {}
+    for name in ("wood", "clay", "iron"):
+        have = int(getattr(target_res, name) or 0) if target_res else 0
+        free[name] = max(
+            0,
+            (
+                int(cap_wh * FEED_TARGET_FILL_MARGIN)
+                if cap_wh > 0
+                else FEED_UNKNOWN_FREE
+            )
+            - have
+            - inbound.get(name, 0),
+        )
+    have_crop = int(target_res.crop or 0) if target_res else 0
+    free["crop"] = max(
+        0,
+        (
+            int(cap_gr * FEED_TARGET_FILL_MARGIN)
+            if cap_gr > 0
+            else FEED_UNKNOWN_FREE
+        )
+        - have_crop
+        - inbound.get("crop", 0),
+    )
+    for name in list(capped):
+        capped[name] = min(capped[name], free.get(name, 0))
+    # Filtro grano verso croplog/15c in crescita.
+    note = ""
+    if capped.get("crop", 0) > 0:
+        is_crop_target = "crop" in str(target_role or "").strip().lower()
+        gr_full = (
+            cap_gr > 0
+            and have_crop >= int(cap_gr * FEED_CROP_FULL_RATIO)
+        )
+        crop_net_pos = (
+            target_res is not None
+            and target_res.crop_balance is not None
+            and target_res.crop_balance > 0
+        )
+        if is_crop_target and (gr_full or crop_net_pos):
+            why = (
+                f"granaio al {int(have_crop * 100 / max(1, cap_gr))}%"
+                if gr_full
+                else "produzione grano netta positiva"
+            )
+            note = (
+                f"grano escluso dal carico verso '{target_key}' "
+                f"({why}: un croplog in crescita riceve solo "
+                "legno/argilla/ferro)"
+            )
+            del capped["crop"]
+    return (
+        {k: v for k, v in capped.items() if v > 0},
+        free,
+        note,
+    )
+
+
 def _snapshot_dorf1_fields(
     settings: Settings, village: Village
 ) -> list[Field]:
@@ -4115,39 +4252,51 @@ async def monitor_all_villages(
                     # magazzino (keep_ratio dedicata al bridge).
                     b_surplus = feeder_surplus(state, keep_ratio=0.50)
                     if b_surplus:
-                        # Capping allo spazio libero del target.
-                        if b_res is not None:
-                            free_wh = max(
-                                0,
-                                (b_res.warehouse_capacity or 0)
-                                - max(b_res.wood, b_res.clay, b_res.iron),
-                            )
-                            free_gr = max(
-                                0,
-                                (b_res.granary_capacity or 0) - b_res.crop,
-                            )
-                        else:
-                            # Capacita' ignota (target mai visitato):
-                            # default conservativo dei magazzini base.
-                            free_wh = free_gr = 800
-                        solid = (
-                            b_surplus.get("wood", 0)
-                            + b_surplus.get("clay", 0)
-                            + b_surplus.get("iron", 0)
+                        # Capping allo spazio libero del target: max 85%
+                        # della capienza per risorsa, al netto dei
+                        # mercanti gia' in viaggio (radar). Su croplog /
+                        # 15c in crescita il grano resta a casa se il
+                        # granaio e' quasi pieno o il netto e' positivo:
+                        # in bootstrap servono solo legno/argilla/ferro.
+                        (
+                            b_surplus,
+                            b_free,
+                            b_note,
+                        ) = _cap_feed_shipment(
+                            settings,
+                            target_key=b_name or str(b_id),
+                            surplus=b_surplus,
+                            target_res=b_res,
+                            target_role=settings.village_role_for(
+                                b_name, b_id
+                            ),
                         )
-                        if solid > free_wh and solid > 0:
-                            scale = free_wh / solid if free_wh > 0 else 0.0
-                            for k in ("wood", "clay", "iron"):
-                                b_surplus[k] = int(
-                                    b_surplus.get(k, 0) * scale
-                                )
-                        if "crop" in b_surplus:
-                            b_surplus["crop"] = min(
-                                b_surplus["crop"], free_gr
+                        if b_note:
+                            logger.info(
+                                "%s Bootstrap bridge: %s",
+                                vprefix,
+                                b_note,
                             )
-                        b_surplus = {
-                            k: v for k, v in b_surplus.items() if v > 0
-                        }
+                        if (
+                            b_surplus
+                            and sum(b_free.values())
+                            < FEED_TARGET_MIN_FREE
+                        ):
+                            # Destinatario quasi pieno: skip + cooldown
+                            # anti-detection (SKIPPED pausa il modulo).
+                            b_surplus = {}
+                            _record_decision(
+                                settings,
+                                state=state, village=village,
+                                module="expansion",
+                                decision="BOOTSTRAP_BRIDGE",
+                                outcome=DECISION_OUTCOME_SKIPPED,
+                                reason=(
+                                    f"Bootstrap bridge verso '{b_name}' "
+                                    "saltato: destinatario quasi pieno."
+                                ),
+                                context={"target": b_name},
+                            )
                     if b_surplus:
                         b_market = find_market(state.interior_fields())
                         b_mslot = (
@@ -4290,25 +4439,32 @@ async def monitor_all_villages(
                     if p_surplus:
                         # Capping allo spazio libero del destinatario con
                         # margine di sicurezza: mai oltre l'85% della sua
-                        # capienza massima, per non bloccare i premi task.
-                        if t_res is not None:
-                            free_wh = max(
-                                0,
-                                int((t_res.warehouse_capacity or 0) * 0.85)
-                                - max(
-                                    t_res.wood, t_res.clay, t_res.iron
-                                ),
+                        # capienza massima per risorsa, al netto dei
+                        # mercanti gia' in viaggio (radar), per non
+                        # bloccare i premi task. Su croplog/15c in
+                        # crescita il grano non parte se il granaio e'
+                        # gia' al 70%+ o il netto grano e' positivo.
+                        (
+                            p_surplus,
+                            p_free,
+                            p_note,
+                        ) = _cap_feed_shipment(
+                            settings,
+                            target_key=t_name or push_target,
+                            surplus=p_surplus,
+                            target_res=t_res,
+                            target_role=settings.village_role_for(
+                                t_name,
+                                t_village.village_id
+                                if t_village is not None
+                                else 0,
+                            ),
+                        )
+                        if p_note:
+                            logger.info(
+                                "%s Feeder push: %s", vprefix, p_note
                             )
-                            free_gr = max(
-                                0,
-                                int((t_res.granary_capacity or 0) * 0.85)
-                                - t_res.crop,
-                            )
-                        else:
-                            # Capacita' ignota (target mai visitato):
-                            # default conservativo dei magazzini base.
-                            free_wh = free_gr = 800
-                        if free_wh + free_gr < 300:
+                        if sum(p_free.values()) < FEED_TARGET_MIN_FREE:
                             # Destinatario quasi pieno: salto l'invio per
                             # evitare viaggi a vuoto o sprechi. SKIPPED
                             # mette in pausa FEEDER_PUSH (cooldown).
@@ -4323,33 +4479,11 @@ async def monitor_all_villages(
                                 reason=(
                                     f"Invio surplus a '{t_name}' saltato: "
                                     "destinatario quasi pieno (meno di "
-                                    "300 risorse di spazio libero)."
+                                    f"{FEED_TARGET_MIN_FREE} risorse di "
+                                    "spazio libero)."
                                 ),
                                 context={"target": t_name},
                             )
-                        else:
-                            solid = (
-                                p_surplus.get("wood", 0)
-                                + p_surplus.get("clay", 0)
-                                + p_surplus.get("iron", 0)
-                            )
-                            if solid > free_wh and solid > 0:
-                                scale = (
-                                    free_wh / solid if free_wh > 0 else 0.0
-                                )
-                                for k in ("wood", "clay", "iron"):
-                                    p_surplus[k] = int(
-                                        p_surplus.get(k, 0) * scale
-                                    )
-                            if "crop" in p_surplus:
-                                p_surplus["crop"] = min(
-                                    p_surplus["crop"], free_gr
-                                )
-                            p_surplus = {
-                                k: v
-                                for k, v in p_surplus.items()
-                                if v > 0
-                            }
                     if p_surplus and push_mslot:
                         p_params: dict = {
                             "market_slot": push_mslot,
