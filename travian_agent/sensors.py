@@ -3307,19 +3307,26 @@ class TravianParser:
         """
         if not self.page:
             return {}
+        # tt=1: overview movimenti + tabella 'truppe nel villaggio'.
+        # Slot ignoto (dorf2 non ancora letto o gid16 non rilevato):
+        # 'gid=16' lascia al server la risoluzione dello slot reale via
+        # redirect — stessa strategia di get_incoming_attacks. Senza
+        # questo fallback la lettura partiva dalla pagina corrente e
+        # tornava 0 truppe anche con unita' in casa (bug ts30).
         if rally_slot:
-            # tt=1: overview movimenti + tabella 'truppe nel villaggio'.
             url = f"{selectors.PATH_BUILD}?id={rally_slot}&tt=1"
-            if village_id:
-                url += f"&newdid={village_id}"
-            try:
-                await self._goto(
-                    _abs_game_url(self.page.url or "", url),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "read_troops_home: navigazione rally fallita: %s", exc
-                )
+        else:
+            url = f"{selectors.PATH_BUILD}?gid=16&tt=1"
+        if village_id:
+            url += f"&newdid={village_id}"
+        try:
+            await self._goto(
+                _abs_game_url(self.page.url or "", url),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "read_troops_home: navigazione rally fallita: %s", exc
+            )
         units = await self._read_troops_dom()
         if not units:
             # Fallback panoramica: il box 'Unita' di dorf1.php mostra i

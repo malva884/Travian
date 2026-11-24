@@ -340,6 +340,38 @@ def _cap_feed_shipment(
     )
 
 
+def _next_attack_eta_seconds(settings: Settings) -> float | None:
+    """Secondi al prossimo attacco in arrivo su un villaggio proprio.
+
+    Fonte: vettori 'inbound' categoria attacco del radar store
+    (sincronizzati da rally overview e box '#movements' durante il
+    ciclo appena concluso). None = nessuna minaccia nota.
+    """
+    try:
+        rs = radar_store(settings.account_id)
+    except Exception:  # noqa: BLE001
+        return None
+    keys: set[str] = set()
+    for key, cfg in (getattr(settings, "villages", {}) or {}).items():
+        name = str(getattr(cfg, "name", "") or key or "").strip()
+        if name:
+            keys.add(name)
+    now = time.time()
+    eta: float | None = None
+    for vkey in keys:
+        try:
+            moves = rs.movements_for(vkey, now=now)
+        except Exception:  # noqa: BLE001
+            continue
+        for mv in moves:
+            if str(mv.get("category") or "") != CAT_INCOMING_ATTACK:
+                continue
+            secs = float(mv.get("arrives_at") or 0.0) - now
+            if secs > 0 and (eta is None or secs < eta):
+                eta = secs
+    return eta
+
+
 def _snapshot_dorf1_fields(
     settings: Settings, village: Village
 ) -> list[Field]:
@@ -4866,7 +4898,31 @@ async def run_single_account_loop(
                 interval = human_cycle_interval(
                     settings.loop_interval_min, settings.loop_interval_max
                 )
-                logger.info("%s Prossimo ciclo tra %.0fs", prefix, interval)
+                # Attacco in arrivo: il sonno non deve superare la
+                # finestra di difesa (impatto - margine fuga - buffer),
+                # altrimenti il modulo difesa scopre l'impatto troppo
+                # tardi (log osservato: pause ~474s vs soglia panico).
+                _attack_eta = _next_attack_eta_seconds(settings)
+                if _attack_eta is not None:
+                    _dodge_margin = float(
+                        getattr(
+                            settings.defense, "dodge_margin_seconds", 30
+                        )
+                        or 30
+                    )
+                    interval = min(
+                        interval,
+                        max(15.0, _attack_eta - _dodge_margin - 15.0),
+                    )
+                    logger.info(
+                        "%s Attacco in arrivo tra %.0fs: intervallo "
+                        "ciclo ridotto a %.0fs (margine fuga %.0fs).",
+                        prefix, _attack_eta, interval, _dodge_margin,
+                    )
+                else:
+                    logger.info(
+                        "%s Prossimo ciclo tra %.0fs", prefix, interval
+                    )
                 # Attesa a chunk: FORCE_TICK anticipa il ciclo; i flag
                 # stop/pausa vengono rilevati entro ~5s (non solo a fine
                 # attesa), cosi' Interrompi/Pausa rispondono subito.
