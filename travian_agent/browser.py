@@ -83,6 +83,13 @@ async def human_click(page: Page, locator, timeout: float = 5000) -> bool:
     realismo.
     """
     try:
+        # bounding_box() NON scrolla: senza questo, le coordinate di un
+        # elemento sotto la piega escono dalla viewport e mouse.click
+        # va a vuoto (regressione ts30: click falliti su slot bassi).
+        await locator.scroll_into_view_if_needed(timeout=timeout)
+    except Exception:
+        pass
+    try:
         box = await locator.bounding_box(timeout=timeout)
     except Exception:
         box = None

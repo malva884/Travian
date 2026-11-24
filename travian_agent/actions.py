@@ -1192,6 +1192,14 @@ class ActionExecutor:
             )
             # Post-check: snapshot della coda PRIMA del click
             queue_before = await self._build_queue_count(page)
+            # Il CTA del contratto puo' essere sotto la piega di /slot
+            # (es. #contract_building26 sotto Deposito Segreto/Reggia):
+            # portarlo in viewport — il click umano lavora su coordinate.
+            try:
+                await button.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            await sleep_human(0.2, 0.4)
             # outerHTML del CTA per diagnostica QUEUE_UNCONFIRMED (dopo
             # il redirect l'elemento e' staccato: va letto prima).
             clicked_btn_html = ""
@@ -1207,6 +1215,20 @@ class ActionExecutor:
             # redirect completo /slot?id=N -> /village (dorf2.php). Il
             # check della coda deve partire sulla pagina NUOVA — sulla
             # vecchia /slot produce falsi QUEUE_UNCONFIRMED.
+            try:
+                await page.wait_for_url(
+                    re.compile(r"/(resources|village|dorf[12]\.php)"),
+                    timeout=2500,
+                )
+            except Exception:
+                # Click a vuoto: il pulsante ha onclick="build_<token>();
+                # return false;" — fallback al click DOM nativo
+                # sull'elemento (non su coordinate) prima di attendere
+                # il redirect verso /village.
+                try:
+                    await button.click(force=True, timeout=3000)
+                except Exception:
+                    pass
             try:
                 await page.wait_for_url(
                     re.compile(r"/(resources|village|dorf[12]\.php)"),
