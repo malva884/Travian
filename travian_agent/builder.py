@@ -1353,6 +1353,24 @@ def focus_intents(state: GameState, settings: Settings) -> list[Field]:
     # slot coda effettivamente liberi (dorf1/dorf2 disaccoppiati su
     # tribu' romana/Plus, slot unico condiviso altrimenti).
     can_out, can_in = queue_slots_free(state, settings)
+    # Travian Plus (Coda:1): il 2° slot coda dorf2 accetta SOLO
+    # ampliamenti di edifici esistenti — una nuova costruzione
+    # (level == 0) viene rifiutata dal gioco con .upgradeBlocked
+    # ("Costruire con il capo cantiere") finche' il cantiere interno
+    # e' occupato. Se lo step in testa al Focus Manuale e' una nuova
+    # costruzione e inner_count >= 1, si attende che la coda dorf2 si
+    # liberi del tutto invece di scalare su step di priorita' inferiore
+    # (skip candidato -> fallback involontario).
+    if (
+        unique
+        and not unique[0].is_resource_field
+        and unique[0].level <= 0
+    ):
+        inner_count = sum(
+            1 for q in state.build_queue if not _queue_item_is_outer(q)
+        )
+        if inner_count >= 1:
+            return []
     return [
         f for f in unique
         if (can_out if f.is_resource_field else can_in)
@@ -1478,6 +1496,16 @@ def focus_skip_reasons(
                     break
                 reasons.append(f"'{label}' nuova costruzione bloccata: {why}")
                 continue
+            # Stessa attesa di focus_intents: nuova costruzione in testa
+            # con cantiere dorf2 gia' occupato -> il 2° slot Plus
+            # accetta solo ampliamenti, si attende inner_count == 0.
+            if sum(
+                1 for q in state.build_queue if not _queue_item_is_outer(q)
+            ) >= 1:
+                reasons.append(
+                    f"'{label}' nuova costruzione in attesa: coda dorf2 "
+                    "occupata (slot Plus 2 accetta solo ampliamenti)"
+                )
             break
         else:
             f = next(

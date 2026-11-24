@@ -373,8 +373,28 @@ class ActionExecutor:
         cliccabili .inlineIcon.resource.transfer (modale trasferimento
         risorse eroe). Quei div non devono essere intercettati dal
         fallback di ricerca pulsante.
+
+        Regressione ts30 (Europa 30): la classe .upgradeBlocked compare
+        ANCHE su pulsanti secondari Plus ("Costruisci con il capo
+        cantiere" / video-riduzione) o su elementi wrapper mentre il
+        pulsante primario "Costruisci edifici" (button.green.new) e'
+        verde e cliccabile. Il verdetto lo da' SOLO il primario: se
+        esiste e non e' disabled/.upgradeBlocked, il blocco e' attivo.
         """
         try:
+            primary = block.locator(
+                "button.green.new, button.textButtonV1.green.new"
+            ).first
+            if await primary.count() > 0:
+                try:
+                    if await primary.is_disabled():
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+                css = (await primary.get_attribute("class")) or ""
+                return "disabled" in css or "upgradeBlocked" in css
+            # Nessun pulsante primario: comportamento storico — il blocco
+            # e' attivo se nel contratto compare .upgradeBlocked.
             return await block.locator(".upgradeBlocked").count() > 0
         except Exception:  # noqa: BLE001
             return False

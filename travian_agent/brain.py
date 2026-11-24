@@ -819,11 +819,14 @@ class RuleBasedBrain:
     """Albero di decisione: prima regola non-None vince."""
 
     DEFAULT_RULES: tuple[Rule, ...] = (
-        rule_upgrade_storage,
         rule_grain_safety,
+        # Override manuale subito dopo la safety sul grano: il Focus
+        # impostato dall'utente batte le regole automatiche (storage,
+        # overflow, anti-raid) che altrimenti intercettavano il ciclo.
+        rule_building_focus,
+        rule_upgrade_storage,
         rule_emergency_overflow,
         rule_anti_raid,
-        rule_building_focus,
         rule_culture_boost,
         rule_role_buildings,
         rule_upgrade_weakest_field,

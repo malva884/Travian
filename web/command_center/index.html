@@ -2860,6 +2860,16 @@
         opt.textContent = `Slot #${s.slot} · Vuoto (gid==0)`;
         slotDropdown.appendChild(opt);
       });
+      // Pin configurato non fra gli slot liberi (occupato/non scansionato):
+      // va comunque reso selezionabile, altrimenti un salvataggio della
+      // scheda lo azzererebbe a Auto (slot_id null lato backend).
+      const pinned = Number(appState.manualFocus.slot) || 0;
+      if (pinned > 0 && !emptySlots.some(s => s.slot === pinned)) {
+        const opt = document.createElement('option');
+        opt.value = String(pinned);
+        opt.textContent = `Slot #${pinned} · Configurato`;
+        slotDropdown.appendChild(opt);
+      }
       slotDropdown.value = String(appState.manualFocus.slot);
 
       appState.dorf2Slots.forEach(item => {

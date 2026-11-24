@@ -567,6 +567,14 @@ def _handle_config_patch(body: dict) -> tuple[dict, int]:
         if cfg is None:
             cfg = VillageConfig(name=vname)
             acc.villages[vname] = cfg
+        # Salvataggio scheda: gli step senza slot_id nel payload
+        # (dashboard manda null se il pin non e' selezionato nel form)
+        # ereditano lo slot gia' configurato — match per key/gid.
+        for _fname in ("building_queue_plan", "building_focus"):
+            if _fname in patch:
+                patch[_fname] = _preserve_step_slots(
+                    patch.get(_fname), getattr(cfg, _fname, None) or []
+                )
         applied, diff, warnings = _apply_fields_checked(cfg, patch)
         # le personalizzazioni manuali non vengono sovrascritte dai preset
         cfg.custom_modified = True
@@ -1659,6 +1667,66 @@ def _gemini_generate_json_sync(
     return _gemini_generate_sync(prompt, api_key, model_name)
 
 
+def _preserve_step_slots(new_steps, old_steps) -> list:
+    """Ripesca lo ``slot_id`` configurato quando il patch non lo riporta.
+
+    Il salvataggio dalla dashboard rimpiazza l'intera lista step e manda
+    ``slot_id: null`` per gli step senza pin esplicito nel form: senza
+    questo merge il valore gia' configurato (Focus Manuale su slot
+    preciso) verrebbe azzerato a ogni salvataggio della scheda.
+    Match per key o gid; ogni slot eredita una sola volta (niente
+    doppioni su step duplicati).
+    """
+    if not isinstance(new_steps, list):
+        return new_steps
+
+    def _sid(step: dict) -> int:
+        try:
+            return int(step.get("slot_id") or step.get("slot") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    key_map: dict[str, int] = {}
+    gid_map: dict[int, int] = {}
+    for old in old_steps or []:
+        if not isinstance(old, dict):
+            continue
+        sid = _sid(old)
+        if sid <= 0:
+            continue
+        okey = str(old.get("key") or "").strip().lower()
+        if okey:
+            key_map.setdefault(okey, sid)
+        try:
+            ogid = int(old.get("gid") or 0)
+        except (TypeError, ValueError):
+            ogid = 0
+        if ogid > 0:
+            gid_map.setdefault(ogid, sid)
+
+    out: list = []
+    for st in new_steps:
+        if not isinstance(st, dict) or _sid(st) > 0:
+            out.append(st)
+            continue
+        sid = 0
+        nkey = str(st.get("key") or "").strip().lower()
+        if nkey and nkey in key_map:
+            sid = key_map.pop(nkey)
+        else:
+            try:
+                ngid = int(st.get("gid") or 0)
+            except (TypeError, ValueError):
+                ngid = 0
+            if ngid > 0 and ngid in gid_map:
+                sid = gid_map.pop(ngid)
+        if sid:
+            st = dict(st)
+            st["slot_id"] = sid
+        out.append(st)
+    return out
+
+
 def _clean_queue_steps(
     steps, warnings: list[str], field_name: str
 ) -> list[dict]:
@@ -1720,7 +1788,7 @@ def _clean_queue_steps(
 
 
 def _sanitize_village_patch(
-    patch: dict, warnings: list[str], vname: str
+    patch: dict, warnings: list[str], vname: str, cfg=None
 ) -> dict:
     """Pulisce il patch villaggio: ruolo valido, step coda e mappe OK.
 
@@ -1755,6 +1823,11 @@ def _sanitize_village_patch(
 
     for fname in ("building_queue_plan", "building_focus"):
         if fname in out:
+            # Patch senza slot_id: eredita il pin gia' configurato sullo
+            # step corrispondente (key/gid) — vedi _handle_config_patch.
+            out[fname] = _preserve_step_slots(
+                out.get(fname), getattr(cfg, fname, None) or []
+            )
             out[fname] = _clean_queue_steps(
                 out.get(fname), warnings, f"{vname}.{fname}"
             )
@@ -1878,7 +1951,7 @@ def _apply_strategy_patch(acc, patch: dict) -> tuple[dict, dict, list[str]]:
             warnings.append(
                 f"villaggio '{vname}' non in config: creato ex-novo"
             )
-        vp_clean = _sanitize_village_patch(vp, warnings, vname)
+        vp_clean = _sanitize_village_patch(vp, warnings, vname, cfg)
         applied, df, wn = _apply_fields_checked(cfg, vp_clean)
         if applied:
             # Le personalizzazioni esplicite (strategia compresa) non
