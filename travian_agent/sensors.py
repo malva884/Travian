@@ -2552,6 +2552,23 @@ class TravianParser:
                             }
                         }
                         if (!dir) {
+                            // Sezione genitore class-based della nuova
+                            // UI (es. <section class="troopMovements
+                            // incoming"> su gid16 ts30).
+                            const inSec = table.closest(
+                                '[class*="incoming" i]'
+                            );
+                            const outSec = table.closest(
+                                '[class*="outgoing" i]'
+                            );
+                            if (outSec &&
+                                (!inSec || outSec.contains(inSec))) {
+                                dir = 'out';
+                            } else if (inSec) {
+                                dir = 'in';
+                            }
+                        }
+                        if (!dir) {
                             const par = table.closest(
                                 'div, section, .box, .content'
                             );
@@ -2602,6 +2619,28 @@ class TravianParser:
                                 /def\\d?|defense|reinforce/.test(imgKey)
                             ) {
                                 mtype = 'reinforce';
+                            }
+                        }
+                        if (mtype === 'unknown') {
+                            // Card testuali nuova UI: niente classi
+                            // out*/in* — il tipo esce dal testo riga.
+                            const rtxt = (
+                                table.innerText || ''
+                            ).toLowerCase();
+                            if (/attacco|attack|assalt/ .test(rtxt)) {
+                                mtype = 'attack';
+                            } else if (
+                                /raid|incursione|raub/.test(rtxt)
+                            ) {
+                                mtype = 'raid';
+                            } else if (
+                                /rinforz|reinforc|unterst/.test(rtxt)
+                            ) {
+                                mtype = 'reinforce';
+                            } else if (
+                                /ritorno|return|r.ck/.test(rtxt)
+                            ) {
+                                mtype = 'return';
                             }
                         }
 
@@ -2692,8 +2731,12 @@ class TravianParser:
                         }
                         if (!summary) {
                             // Skin senza tbody.units: somma le celle
-                            // numeriche dell'intera table.
-                            table.querySelectorAll('td, span').forEach(
+                            // numeriche dell'intera table (div inclusi:
+                            // card nuova UI — i timer 'h:mm:ss' non
+                            // matchano ^\\d+$).
+                            table.querySelectorAll(
+                                'td, span, div'
+                            ).forEach(
                                 el => {
                                     const t = cleanTxt(
                                         el.innerText ||
@@ -2708,9 +2751,12 @@ class TravianParser:
                         }
 
                         // Countdown: tbody.infos .timer, poi qualunque
-                        // .timer della table.
+                        // .timer/[data-*] dell'elemento.
                         const timerEl = table.querySelector(
-                            'tbody.infos .timer, .timer, span.timer'
+                            'tbody.infos .timer, .timer, span.timer, ' +
+                            '[class*="timer" i], ' +
+                            '[class*="countdown" i], [data-countdown], ' +
+                            '[data-time], [data-seconds]'
                         );
                         const ttxt = timerEl
                             ? cleanTxt(timerEl.textContent || '')
@@ -2725,6 +2771,30 @@ class TravianParser:
                                 parseInt(m[2] || 0, 10) * 3600 +
                                 parseInt(m[3] || 0, 10) * 60 +
                                 parseInt(m[4] || 0, 10);
+                        }
+                        if (!secs) {
+                            // Nuova UI: countdown in attributi
+                            // data-time/data-countdown/data-seconds.
+                            const dEl = table.matches(
+                                '[data-time],[data-countdown],' +
+                                '[data-seconds]'
+                            ) ? table : table.querySelector(
+                                '[data-time],[data-countdown],' +
+                                '[data-seconds]'
+                            );
+                            if (dEl) {
+                                secs = parseInt(
+                                    dEl.getAttribute('data-time') ||
+                                    dEl.getAttribute('data-countdown') ||
+                                    dEl.getAttribute('data-seconds') ||
+                                    '0',
+                                    10
+                                ) || 0;
+                                // Probabilmente millisecondi.
+                                if (secs > 3000000) {
+                                    secs = Math.round(secs / 1000);
+                                }
+                            }
                         }
 
                         return {
@@ -2743,9 +2813,7 @@ class TravianParser:
                     };
                     const incoming = [];
                     const outgoing = [];
-                    document.querySelectorAll(
-                        'table.troop_details'
-                    ).forEach(table => {
+                    const pushRow = (table) => {
                         const r = parseTable(table);
                         // Sotto-elementi footer 'Arrivo in ...' /
                         // 'Arrival ...' senza truppe NON sono
@@ -2764,7 +2832,42 @@ class TravianParser:
                         const d = r.dir;
                         delete r.dir;
                         (d === 'out' ? outgoing : incoming).push(r);
-                    });
+                    };
+                    document.querySelectorAll(
+                        'table.troop_details'
+                    ).forEach(pushRow);
+                    if (!incoming.length && !outgoing.length) {
+                        // Nuova UI ts30 (gid16 '/slot?id=N&tt=1'): i
+                        // movimenti sono card/div — non esiste
+                        // table.troop_details. Riga-movimento =
+                        // elemento piu' interno con countdown
+                        // 'h:mm:ss' (esclude 'truppe nel villaggio',
+                        // senza timer).
+                        const scope = document.querySelector(
+                            '#build, #content'
+                        ) || document.body;
+                        const tmr = /\\d+:\\d{2}(:\\d{2})?/;
+                        const rows = Array.from(
+                            scope.querySelectorAll(
+                                'tr, li, ' +
+                                '[class*="troop" i], ' +
+                                '[class*="movement" i], ' +
+                                '[class*="row" i], ' +
+                                '[class*="card" i], div, section'
+                            )
+                        ).filter(el => {
+                            const t = (el.innerText || '').trim();
+                            return t && t.length < 600 && tmr.test(t);
+                        });
+                        // Solo i nodi piu' interni (card>riga non deve
+                        // contare due volte lo stesso movimento).
+                        const inner = rows.filter(
+                            el => !rows.some(
+                                o => o !== el && el.contains(o)
+                            )
+                        );
+                        inner.forEach(pushRow);
+                    }
                     return {
                         incoming: incoming,
                         outgoing: outgoing
@@ -2792,12 +2895,36 @@ class TravianParser:
                             const hasTxt =
                                 txt.includes('truppe in arrivo') ||
                                 txt.includes('truppe in partenza') ||
-                                txt.includes('incoming troops') ||
-                                txt.includes('outgoing troops');
+                                txt.includes('truppe in') ||
+                                txt.includes('troops');
                             if (!hasTbl && !hasTxt) return '';
+                            // innerHTML della sezione movimenti PIU'
+                            // PICCOLA: il dump di #content si troncava
+                            // sul tag esterno <div id="build"> senza
+                            // mostrare il markup delle card.
+                            let best = null;
+                            document.querySelectorAll(
+                                '[class*="troop" i], ' +
+                                '[class*="movement" i], section, ' +
+                                '[class*="box" i], table, div'
+                            ).forEach(el => {
+                                const t = (
+                                    el.innerText || ''
+                                ).toLowerCase();
+                                if (!t.includes('truppe') &&
+                                    !t.includes('troop')) {
+                                    return;
+                                }
+                                if (!best ||
+                                    (el.innerHTML || '').length <
+                                        (best.innerHTML || '').length) {
+                                    best = el;
+                                }
+                            });
+                            const target = best || c || document.body;
                             return (
-                                (c || document.body).innerHTML || ''
-                            ).slice(0, 800);
+                                target.innerHTML || ''
+                            ).slice(0, 1600);
                         }"""
                     )
                     if _snip:

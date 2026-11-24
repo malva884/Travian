@@ -240,3 +240,38 @@ class TestTroopsDomParser:
         src = self._src()
         # Wrapper + icona annidata non devono contare due volte.
         assert "contains(o)" in src
+
+
+class TestRallyMovementsParser:
+    """Regressione ts30: panoramica gid16 (slot?id=N&tt=1) con sezioni
+    truppe ma 0 movimenti parse — table.troop_details non esiste nella
+    nuova UI: i movimenti sono card/div con countdown."""
+
+    def _src(self) -> str:
+        import inspect
+        from travian_agent import sensors
+        return inspect.getsource(
+            sensors.TravianParser.get_troop_movements
+        )
+
+    def test_card_fallback_present(self):
+        src = self._src()
+        # Pass alternativo oltre a table.troop_details.
+        assert "pushRow" in src
+        assert '[class*="card" i]' in src
+        assert '[class*="movement" i]' in src
+
+    def test_new_ui_timer_and_direction(self):
+        src = self._src()
+        # Countdown da data-* oltre a .timer.
+        assert "data-countdown" in src
+        assert "data-seconds" in src
+        # Direzione da sezioni class-based incoming/outgoing.
+        assert '[class*="incoming" i]' in src
+        assert '[class*="outgoing" i]' in src
+
+    def test_diagnostic_dumps_inner_section(self):
+        src = self._src()
+        # Snippet diagnostico sulla sezione piu' piccola (non il tag
+        # esterno <div id="build">) e con budget maggiore.
+        assert "slice(0, 1600)" in src
