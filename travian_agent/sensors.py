@@ -3242,31 +3242,62 @@ class TravianParser:
                     const m = String(t || '').match(/(\\d[\\d.]*)/);
                     return m ? parseInt(m[1].replace(/\\./g, ''), 10) : 0;
                 };
-                // 1) Icone 'unit uN': scope documento, dedup per nodo
-                //    DOM (stessa icona non conta due volte; icone
-                //    diverse della stessa uN si sommano = contingenti
-                //    multipli a casa).
-                const icons = document.querySelectorAll(
-                    'img[class*="unit"], i[class*="unit"], ' +
-                    'a[class*="unit"], span[class*="unit"], ' +
-                    '[class*=" unit u"], [class*="unit u"]'
+                const clsUnit = /(?:^|[\\s_\\-])u(\\d{1,2})(?=[\\s\\-]|$)/;
+                // Chiave 'uN' dall'elemento: classi/data-attr; in
+                // fallback il NOME dell'unita' in title/aria-label/alt
+                // (nuova UI ts30: icone 'troopIcon'/'unitIcon', svg —
+                // non esiste piu' la classe 'unit uN').
+                const keyOf = (el) => {
+                    const c = (el.getAttribute('class') || '') + ' ' +
+                        (el.getAttribute('data-unit') || '') + ' ' +
+                        (el.getAttribute('data-unit-id') || '') + ' ' +
+                        (el.getAttribute('data-unitid') || '');
+                    const m = c.match(clsUnit);
+                    if (m) return 'u' + m[1];
+                    const t = ((el.getAttribute('title') || '') + ' ' +
+                        (el.getAttribute('aria-label') || '') + ' ' +
+                        (el.getAttribute('alt') || '')).toLowerCase();
+                    for (const nm in labelMap) {
+                        if (nm && t.indexOf(nm) >= 0) return labelMap[nm];
+                    }
+                    return null;
+                };
+                // 1) Icone unita': classi classiche 'unit uN' +
+                //    varianti nuova UI. Dedup: si tengono solo i nodi
+                //    piu' interni (wrapper+icona non contano due volte;
+                //    icone diverse della stessa uN si sommano =
+                //    contingenti multipli a casa).
+                const allIcons = Array.from(document.querySelectorAll(
+                    'img[class*="unit" i], i[class*="unit" i], ' +
+                    'a[class*="unit" i], span[class*="unit" i], ' +
+                    'div[class*="unit" i], [class*=" unit u"], ' +
+                    '[class*="unit u"], [class*="unitIcon" i], ' +
+                    '[class*="troopIcon" i], [class*="troop-icon" i], ' +
+                    '[class*="troop_icon" i], [data-unit], ' +
+                    '[data-unit-id], [data-unitid], ' +
+                    'svg[class*="unit" i], svg[class*="troop" i], ' +
+                    'img[src*="unit"], [title][class*="unit" i], img[alt]'
+                ));
+                const icons = allIcons.filter(
+                    el => !allIcons.some(o => o !== el && el.contains(o))
                 );
                 const seen = new Set();
                 icons.forEach(icon => {
                     if (seen.has(icon)) return;
                     seen.add(icon);
-                    const cls = icon.getAttribute('class') || '';
-                    const m = cls.match(/(?:^|[\\s_\\-])u(\\d{1,2})(?=[\\s\\-]|$)/);
-                    if (!m) return;
-                    const key = 'u' + m[1];
-                    let qty = 0;
+                    const key = keyOf(icon);
+                    if (!key) return;
+                    let qty =
+                        num(icon.getAttribute('data-count')) ||
+                        num(icon.getAttribute('data-amount')) ||
+                        num(icon.getAttribute('data-quantity'));
                     // NOTA: '.unit' escluso da closest() — matcherebbe
                     // l'icona stessa (class 'unit uN') fermando la
                     // ricerca della quantita' sul nodo sbagliato.
                     const cell = icon.closest(
                         'td, a, li, .col, .troop, div'
                     );
-                    if (cell) {
+                    if (!qty && cell) {
                         qty = num(cell.innerText || '');
                         if (!qty && cell.nextElementSibling)
                             qty = num(cell.nextElementSibling.innerText || '');
@@ -3284,12 +3315,26 @@ class TravianParser:
                             }
                         }
                     }
+                    if (!qty) {
+                        qty = num(
+                            (icon.getAttribute('aria-label') || '') + ' ' +
+                            (icon.getAttribute('title') || '') + ' ' +
+                            (icon.innerText || '')
+                        );
+                    }
                     if (qty > 0) out[key] = (out[key] || 0) + qty;
                 });
-                // 2) Fallback testuale: righe 'Nome Unita' 826' senza icone.
+                // 2) Fallback testuale: righe 'Nome Unita' 826' senza
+                //    icone — incluse le righe div-based della nuova UI
+                //    sotto container troop/unit.
                 if (!Object.keys(out).length) {
                     const rows = document.querySelectorAll(
-                        'tr, li, .troop_details div, .troopDetails div'
+                        'tr, li, .troop_details div, .troopDetails div, ' +
+                        '[id*="troop" i] [class*="row" i], ' +
+                        '[id*="unit" i] [class*="row" i], ' +
+                        '[class*="troop" i] [class*="row" i], ' +
+                        '[class*="unit" i] [class*="row" i], ' +
+                        '[id*="troop" i] div, [class*="troopTable" i] div'
                     );
                     rows.forEach(r => {
                         const raw = (r.innerText || '').replace(/\\s+/g, ' ').trim();

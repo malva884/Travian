@@ -206,3 +206,37 @@ class TestModels:
         assert v.role == "standard"
         assert v.village_id == 0
         assert not v.is_active
+
+
+# ---------------------------------------------------------------------------
+# Regressione ts30: read_troops_home / _read_troops_dom (nuova UI)
+# ---------------------------------------------------------------------------
+
+class TestTroopsDomParser:
+    """Il parser deve coprire la nuova UI di Travian Legends
+    (slot?id=N&tt=1, icone troopIcon/svg/data-unit): sulla classe
+    'unit uN' legacy restituiva 0 truppe (bug dodge + farming)."""
+
+    def _src(self) -> str:
+        import inspect
+        from travian_agent import sensors
+        return inspect.getsource(sensors.TravianParser._read_troops_dom)
+
+    def test_new_ui_icon_selectors(self):
+        src = self._src()
+        assert "troopIcon" in src
+        assert "data-unit" in src
+        assert 'svg[class*="unit"' in src or "svg[class*=\"unit\"" in src
+
+    def test_quantity_from_attrs_and_labels(self):
+        src = self._src()
+        assert "data-count" in src
+        assert "aria-label" in src
+        assert "title" in src
+        # Risoluzione uN anche via nome unita' localizzato.
+        assert "keyOf" in src
+
+    def test_innermost_dedup(self):
+        src = self._src()
+        # Wrapper + icona annidata non devono contare due volte.
+        assert "contains(o)" in src
