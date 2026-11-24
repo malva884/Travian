@@ -897,14 +897,25 @@ class ActionExecutor:
                     f".buildingWrapper.gid{gid} button.green",
                     f".buildingWrapper.gid{gid} .contractLink button.green",
                     f"#contract_building{gid} button[type='button'].green",
-                    # Fallback generici: alcune skin della nuova UI non
-                    # usano la classe 'green' sul CTA primario, oppure
-                    # rendono cliccabile l'intera riga contractLink.
-                    f"#contract_building{gid} button",
-                    f".buildingWrapper.gid{gid} button",
+                    # NIENTE fallback 'button' generico (regressione
+                    # ts30: cliccava il primo button del contratto —
+                    # Plus 'capo cantiere'/NPC/video — click a vuoto e
+                    # QUEUE_UNCONFIRMED). Skin senza classe 'green':
+                    # fallback filtrato JS piu' sotto; restano i link
+                    # di riga contractLink.
                     f"#contract_building{gid} a.contractLink",
                     f".buildingWrapper.gid{gid} a.contractLink",
                 ]
+                # CTA da escludere nella scelta del pulsante primario:
+                # i secondari Plus/NPC possono condividere 'green'.
+                _bad_cta_classes = (
+                    "disabled", "gold", "npc", "video", "instant",
+                    "exchange", "upgradeblocked",
+                )
+                _bad_cta_texts = (
+                    "npc", "video", "istantane", "instant",
+                    "capo cantiere", "exchange",
+                )
                 for _idx, sel in enumerate(
                     self.profile.ordered_selectors(
                         "new_building_button", new_btn_selectors
@@ -916,16 +927,80 @@ class ActionExecutor:
                             continue
                         if await loc.is_disabled():
                             continue
-                        css = (await loc.get_attribute("class")) or ""
-                        if "disabled" not in css and "gold" not in css:
-                            button = loc
-                            if _idx > 0:
-                                self.profile.promote_selector(
-                                    "new_building_button", sel
-                                )
-                            break
+                        css = (
+                            (await loc.get_attribute("class")) or ""
+                        ).lower()
+                        if any(t in css for t in _bad_cta_classes):
+                            continue
+                        # Filtro testo solo sui <button> (i contractLink
+                        # contengono anche i testi dei pulsanti interni).
+                        if "contractLink" not in sel:
+                            try:
+                                txt = (
+                                    (await loc.inner_text()) or ""
+                                ).lower()
+                            except Exception:
+                                txt = ""
+                            if any(t in txt for t in _bad_cta_texts):
+                                continue
+                        button = loc
+                        if _idx > 0:
+                            self.profile.promote_selector(
+                                "new_building_button", sel
+                            )
+                        break
                     except Exception:
                         continue
+
+                if button is None:
+                    # Fallback filtrato (ticket ts30): valido solo un
+                    # button il cui onclick/testo punta alla costruzione
+                    # di questo gid — esclusi npc, video, instant,
+                    # exchange e i pulsanti Plus 'capo cantiere'.
+                    try:
+                        marked = await page.evaluate(
+                            """
+                            (gid) => {
+                                const scope = document.querySelector(
+                                    '#contract_building' + gid
+                                ) || document.querySelector(
+                                    '.buildingWrapper.gid' + gid
+                                );
+                                if (!scope) return false;
+                                const badRe = /npc|video|instant|exchange|capo cantiere|gold|upgradeBlocked/i;
+                                const txtRe = /build|costruisci|upgrade|migliora|bauen|ausbau/i;
+                                for (const b of scope.querySelectorAll('button')) {
+                                    const cls = b.className || '';
+                                    const oc = b.getAttribute('onclick') || '';
+                                    const txt = (b.innerText || '').trim();
+                                    if (b.disabled || /disabled/i.test(cls)) continue;
+                                    if (badRe.test(cls) || badRe.test(txt)) continue;
+                                    const ok = new RegExp(
+                                        'a=' + gid + '(?!\\d)'
+                                    ).test(oc) ||
+                                        /build|dorf|village|slot/i.test(oc) ||
+                                        txtRe.test(txt);
+                                    if (!ok) continue;
+                                    b.setAttribute('data-cascade-cta', '1');
+                                    return true;
+                                }
+                                return false;
+                            }
+                            """,
+                            gid,
+                        )
+                    except Exception:
+                        marked = False
+                    if marked:
+                        loc = page.locator(
+                            f"#contract_building{gid} [data-cascade-cta='1'], "
+                            f".buildingWrapper.gid{gid} [data-cascade-cta='1']"
+                        ).first
+                        try:
+                            if await loc.count() > 0:
+                                button = loc
+                        except Exception:
+                            pass
 
                 cost = await self._read_contract_cost(page)
                 if cost:
@@ -1117,12 +1192,31 @@ class ActionExecutor:
             )
             # Post-check: snapshot della coda PRIMA del click
             queue_before = await self._build_queue_count(page)
+            # outerHTML del CTA per diagnostica QUEUE_UNCONFIRMED (dopo
+            # il redirect l'elemento e' staccato: va letto prima).
+            clicked_btn_html = ""
+            try:
+                clicked_btn_html = (
+                    await button.evaluate("el => el.outerHTML") or ""
+                )[:200]
+            except Exception:  # noqa: BLE001
+                clicked_btn_html = ""
             await human_click(page, button)
 
+            # Legends ts30: il click 'Costruisci edifici' esegue un
+            # redirect completo /slot?id=N -> /village (dorf2.php). Il
+            # check della coda deve partire sulla pagina NUOVA — sulla
+            # vecchia /slot produce falsi QUEUE_UNCONFIRMED.
             try:
                 await page.wait_for_url(
                     re.compile(r"/(resources|village|dorf[12]\.php)"),
-                    timeout=5000,
+                    timeout=8000,
+                )
+            except Exception:
+                pass
+            try:
+                await page.wait_for_load_state(
+                    "domcontentloaded", timeout=8000
                 )
             except Exception:
                 pass
@@ -1284,12 +1378,13 @@ class ActionExecutor:
             if not confirmed:
                 logger.warning(
                     "Click su costruisci/migliora senza effetto osservabile sullo "
-                    "slot %s (coda %s->%s, marker=%s, url=%s): QUEUE_UNCONFIRMED",
+                    "slot %s (coda %s->%s, marker=%s, url=%s, btn=%r): QUEUE_UNCONFIRMED",
                     slot_id,
                     queue_before,
                     queue_after,
                     confirm_kind,
                     page.url,
+                    clicked_btn_html,
                 )
                 await self._capture(
                     page,
@@ -1301,6 +1396,8 @@ class ActionExecutor:
                         "queue_before": queue_before,
                         "queue_after": queue_after,
                         "confirm_kind": confirm_kind,
+                        "clicked_button": clicked_btn_html,
+                        "page_url": page.url,
                     },
                 )
                 _err = {
