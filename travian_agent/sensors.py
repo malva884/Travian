@@ -2085,10 +2085,15 @@ class TravianParser:
             try:
                 _snip = await self.page.evaluate(
                     """() => {
-                        const txt = (document.body.innerText || '')
-                            .toLowerCase();
-                        if (!txt.includes('truppe in') &&
-                            !txt.includes('troops')) {
+                        const cleanTxt = (document.body.innerText || '')
+                            .toLowerCase()
+                            .replace(/truppe in questo villaggio[^\\n]*/g, '')
+                            .replace(/truppe in questo[^\\n]*/g, '');
+                        const hasMoveKw = (
+                            /truppe in (arrivo|partenza|uscita|viaggio|marcia|ritorno)/.test(cleanTxt) ||
+                            /\\b(in arrivo|in partenza|troops)\\b/.test(cleanTxt)
+                        );
+                        if (!hasMoveKw) {
                             return '';
                         }
                         let best = document.querySelector(
@@ -2104,14 +2109,19 @@ class TravianParser:
                                 'section, aside, div'
                             ).forEach(el => {
                                 const t = (el.innerText || '')
-                                    .toLowerCase();
-                                if (!t.includes('truppe in') &&
-                                    !t.includes('troops')) {
+                                    .toLowerCase()
+                                    .replace(/truppe in questo villaggio[^\\n]*/g, '')
+                                    .replace(/truppe in questo[^\\n]*/g, '');
+                                const elHasMove = (
+                                    /truppe in (arrivo|partenza|uscita|viaggio|marcia|ritorno)/.test(t) ||
+                                    /\\b(in arrivo|in partenza|troops)\\b/.test(t)
+                                );
+                                if (!elHasMove) {
                                     return;
                                 }
                                 if (!best ||
                                     t.length <
-                                        (best.innerText || '').length) {
+                                    (best.innerText || '').length) {
                                     best = el;
                                 }
                             });

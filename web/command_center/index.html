@@ -57,14 +57,16 @@
       color: #22d3ee;
       box-shadow: inset 3px 0 0 #00e5ff;
     }
-    @keyframes radarSpin {
-      from { transform: rotate(0deg); }
-      to { transform: rotate(360deg); }
+
+    #cc-radar-moves {
+      width: 100%;
+      margin-top: 8px;
+      max-height: 120px;
+      overflow-y: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
     }
-    .radar-sweep {
-      transform-origin: 140px 140px;
-      animation: radarSpin 6s linear infinite;
-    }
+
     @keyframes radarPulse {
       0%, 100% { stroke-opacity: 1; }
       50% { stroke-opacity: 0.35; }
@@ -537,22 +539,21 @@
             <span id="cc-radar-alert" class="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-red-500/20 text-red-400 border border-red-500/40 animate-pulse">0 RAID</span>
           </div>
           <svg viewBox="0 0 280 280" class="w-full max-w-[270px] h-auto rounded-full bg-slate-950 border border-cyan-500/35 shadow-[inset_0_0_24px_rgba(0,229,255,0.12)]">
-            <defs>
-              <linearGradient id="ccSweep" x1="0%" y1="0%" x2="100%" y2="0%">
-                <stop offset="0%" stop-color="rgba(0, 229, 255, 0.32)" />
-                <stop offset="100%" stop-color="rgba(0, 229, 255, 0)" />
-              </linearGradient>
-            </defs>
-            <circle cx="140" cy="140" r="42" fill="none" stroke="rgba(51,65,85,0.5)" stroke-dasharray="3 3" />
-            <circle cx="140" cy="140" r="84" fill="none" stroke="rgba(51,65,85,0.5)" stroke-dasharray="3 3" />
-            <circle cx="140" cy="140" r="126" fill="none" stroke="rgba(0,229,255,0.28)" />
-            <line x1="140" y1="10" x2="140" y2="270" stroke="rgba(51,65,85,0.45)" />
-            <line x1="10" y1="140" x2="270" y2="140" stroke="rgba(51,65,85,0.45)" />
-            <path d="M140,140 L140,14 A126,126 0 0,1 248,76 Z" fill="url(#ccSweep)" class="radar-sweep" />
+            <circle cx="140" cy="140" r="50" fill="none" stroke="rgba(51,65,85,0.55)" stroke-dasharray="3 3" />
+            <circle cx="140" cy="140" r="100" fill="none" stroke="rgba(56,189,248,0.28)" stroke-dasharray="4 3" />
+            <circle cx="140" cy="140" r="126" fill="none" stroke="rgba(0,229,255,0.24)" />
+            <line x1="140" y1="12" x2="140" y2="268" stroke="rgba(51,65,85,0.45)" />
+            <line x1="12" y1="140" x2="268" y2="140" stroke="rgba(51,65,85,0.45)" />
+            <text x="143" y="20" fill="#64748b" font-size="7.5" font-family="JetBrains Mono">N (+Y)</text>
+            <text x="143" y="274" fill="#64748b" font-size="7.5" font-family="JetBrains Mono">S (-Y)</text>
+            <text x="248" y="136" fill="#64748b" font-size="7.5" font-family="JetBrains Mono">E (+X)</text>
+            <text x="16" y="136" fill="#64748b" font-size="7.5" font-family="JetBrains Mono">O (-X)</text>
+            <text x="143" y="96" fill="#38bdf8" font-size="7" font-family="JetBrains Mono">4c</text>
+            <text x="143" y="46" fill="#38bdf8" font-size="7" font-family="JetBrains Mono">8c</text>
             <g id="cc-radar-dynamic"></g>
-            <circle cx="140" cy="140" r="10" fill="rgba(0,229,255,0.2)" stroke="#00e5ff" stroke-width="1.5" />
-            <circle cx="140" cy="140" r="4" fill="#22d3ee" />
-            <text id="cc-radar-center-label" x="108" y="126" fill="#ffffff" font-size="8.5" font-family="JetBrains Mono" font-weight="bold">HIPPONION</text>
+            <circle cx="140" cy="140" r="9" fill="rgba(0,229,255,0.2)" stroke="#00e5ff" stroke-width="1.5" />
+            <circle cx="140" cy="140" r="3.5" fill="#22d3ee" />
+            <text id="cc-radar-center-label" x="140" y="156" text-anchor="middle" fill="#ffffff" font-size="8.5" font-family="JetBrains Mono" font-weight="bold"></text>
           </svg>
           <div id="cc-radar-legend" class="w-full flex flex-wrap gap-1 mt-2 justify-center"></div>
         </div>
@@ -3767,14 +3768,19 @@
       };
       const villages = (appState.villages || []).filter(v => v.x !== null && v.x !== undefined);
       const founder = villages.find(v => /founder|cropper/i.test(String(v.role || ''))) || villages[0];
-      if (!founder) return;
+      const centerLbl = document.getElementById('cc-radar-center-label');
+      const movesBox = document.getElementById('cc-radar-moves');
+      if (!founder) {
+        if (centerLbl) centerLbl.textContent = '';
+        if (movesBox) movesBox.innerHTML = '';
+        return;
+      }
 
       document.getElementById('cc-radar-title').textContent =
         `Radar Settore (${founder.x}|${founder.y})`;
-      document.getElementById('cc-radar-center-label').textContent =
-        String(founder.name || '').toUpperCase().slice(0, 12);
+      if (centerLbl) centerLbl.textContent = String(founder.name || '');
 
-      const scale = 100 / 8; // ~8 caselle raggio utile
+      const scale = 100 / 8; // 8 caselle = 100px, 4 caselle = 50px
       const P = p => {
         const px = 140 + (p.x - founder.x) * scale;
         const py = 140 - (p.y - founder.y) * scale;
@@ -3788,43 +3794,38 @@
         if (t.x === null || t.x === undefined) return;
         const [tx, ty] = P(t);
         mk('polygon', {
-          points: `${tx},${ty - 7} ${tx + 7},${ty} ${tx},${ty + 7} ${tx - 7},${ty}`,
-          fill: 'rgba(0,229,255,0.25)', stroke: '#00e5ff', 'stroke-width': 1.5
+          points: `${tx},${ty - 6} ${tx + 6},${ty} ${tx},${ty + 6} ${tx - 6},${ty}`,
+          fill: 'rgba(0,229,255,0.22)', stroke: '#00e5ff', 'stroke-width': 1.4
         });
         const lbl = mk('text', {
-          x: tx - 30, y: ty - 10, fill: '#22d3ee', 'font-size': 8,
-          'font-family': 'JetBrains Mono', 'font-weight': 'bold'
+          x: tx, y: ty - 9, 'text-anchor': 'middle', fill: '#22d3ee',
+          'font-size': 7.5, 'font-family': 'JetBrains Mono', 'font-weight': 'bold'
         });
-        lbl.textContent = `${t.type || '15c'} (${t.x}|${t.y})`;
+        lbl.textContent = `${t.type || 'target'} (${t.x}|${t.y})`;
       });
 
       const inc = [];
       villages.forEach(v => {
         if (v === founder) return;
         const [vx, vy] = P(v);
-        mk('line', { x1: vx, y1: vy, x2: 140, y2: 140, stroke: '#10b981', 'stroke-width': 1.5, 'stroke-dasharray': '4 3' });
         mk('rect', { x: vx - 4.5, y: vy - 4.5, width: 9, height: 9, rx: 2, fill: '#10b981' });
-        const lbl = mk('text', { x: vx - 22, y: vy + 16, fill: '#34d399', 'font-size': 8, 'font-family': 'JetBrains Mono' });
-        lbl.textContent = String(v.name || '').slice(0, 10);
+        const lbl = mk('text', {
+          x: vx, y: vy + 14, 'text-anchor': 'middle', fill: '#34d399',
+          'font-size': 8, 'font-family': 'JetBrains Mono'
+        });
+        lbl.textContent = `${String(v.name || '')} (${v.x}|${v.y})`;
         (v.incoming_attacks || []).forEach(a => inc.push({ a, v }));
       });
       (founder.incoming_attacks || []).forEach(a => inc.push({ a, v: founder }));
 
       inc.slice(0, 3).forEach(({ a }) => {
         const m = /\((-?\d+)\s*\|\s*(-?\d+)\)/.exec(a.label || a.who || '');
-        let ox, oy;
-        if (m) {
-          [ox, oy] = P({ x: +m[1], y: +m[2] });
-        } else {
-          ox = 140 + 120; oy = 140 + 60;
-        }
+        if (!m) return;
+        const [ox, oy] = P({ x: +m[1], y: +m[2] });
         mk('line', { x1: ox, y1: oy, x2: 140, y2: 140, stroke: '#ef4444', 'stroke-width': 1.5, 'stroke-dasharray': '2 2' });
         mk('circle', { cx: ox, cy: oy, r: 4.5, fill: '#ef4444' });
       });
 
-      // =============================================================
-      // VETTORI MOVIMENTO LIVE (radar_movements per villaggio)
-      // =============================================================
       const RADAR_CATS = {
         merchant:        { color: '#38bdf8', icon: '◆', label: 'Mercanti' },
         hero_adventure:  { color: '#c084fc', icon: '★', label: 'Eroe' },
@@ -3840,8 +3841,8 @@
       villages.forEach(v => {
         (v.radar_movements || []).forEach(m => allMoves.push({ ...m, village: v }));
       });
-      // Cleanup lato UI: movimenti scaduti eliminati al prossimo tick.
       const liveMoves = allMoves.filter(m => (m.arrives_at || 0) > nowSec);
+
       const legendEl = document.getElementById('cc-radar-legend');
       const counts = {};
       liveMoves.forEach(m => { counts[m.category] = (counts[m.category] || 0) + 1; });
@@ -3858,7 +3859,7 @@
           pill.style.background = meta.color + '14';
           pill.textContent = `${meta.icon} ${meta.label} ${c}`;
           pill.onclick = () => {
-            appState.radarFilter[cat] = off;
+            appState.radarFilter[cat] = !off;
             renderRadarCC();
           };
           legendEl.appendChild(pill);
@@ -3873,7 +3874,7 @@
         const ss = String(left % 60).padStart(2, '0');
         const meta = RADAR_CATS[m.category] || {};
         const res = (m.details && m.details.resources) || {};
-        const resTxt = Object.entries(res).filter(([k, v]) => v > 0)
+        const resTxt = Object.entries(res).filter(([, v]) => v > 0)
           .map(([k, v]) => `${k[0].toUpperCase()}${v}`).join(' ');
         const trp = (m.details && m.details.troops_summary) || '';
         const dirTxt = m.direction === 'inbound' ? '→ te' : m.direction === 'return' ? '↩ rientro' : '→';
@@ -3888,17 +3889,21 @@
       };
       const hideTip = () => { if (tip) tip.style.display = 'none'; };
 
-      liveMoves.forEach(m => {
-        if (appState.radarFilter[m.category] === false) return;
-        const meta = RADAR_CATS[m.category] || { color: '#94a3b8', icon: '●' };
-        // Origine/destinazione: coordinate mancanti -> bordo radar.
+      const visibleMoves = liveMoves.filter(m => appState.radarFilter[m.category] !== false);
+      visibleMoves.forEach((m, idx) => {
+        const meta = RADAR_CATS[m.category] || { color: '#94a3b8', icon: '●', label: m.category };
+        const hasFrom = m.from_x !== null && m.from_x !== undefined && m.from_y !== null && m.from_y !== undefined;
+        const hasTo = m.to_x !== null && m.to_x !== undefined && m.to_y !== null && m.to_y !== undefined;
         let x1, y1, x2, y2;
-        const hasFrom = m.from_x !== null && m.from_x !== undefined;
-        const hasTo = m.to_x !== null && m.to_x !== undefined;
-        if (hasFrom) { [x1, y1] = P({ x: m.from_x, y: m.from_y }); }
-        else { x1 = 140 + 118; y1 = 140 + 55; }
-        if (hasTo) { [x2, y2] = P({ x: m.to_x, y: m.to_y }); }
-        else { x2 = 140; y2 = 140; }
+        if (hasFrom && hasTo) {
+          [x1, y1] = P({ x: m.from_x, y: m.from_y });
+          [x2, y2] = P({ x: m.to_x, y: m.to_y });
+        } else {
+          const ang = ((idx * 52) % 360) * Math.PI / 180;
+          x1 = 140 + Math.cos(ang) * 122;
+          y1 = 140 + Math.sin(ang) * 122;
+          [x2, y2] = P(m.village || founder);
+        }
         const started = m.started_at || 0;
         const total = Math.max(1, (m.arrives_at || 0) - started);
         const prog = started > 0
@@ -3912,39 +3917,18 @@
         ln.setAttribute('x2', x2); ln.setAttribute('y2', y2);
         ln.setAttribute('stroke', meta.color);
         ln.setAttribute('stroke-width', m.category === 'incoming_attack' ? 2 : 1.4);
-        ln.setAttribute('stroke-dasharray',
-          m.direction === 'return' ? '2 4' : '5 3');
-        if (m.category === 'incoming_attack') {
-          ln.classList.add('radar-incoming');
-        }
+        ln.setAttribute('stroke-dasharray', m.direction === 'return' ? '2 4' : '5 3');
+        if (m.category === 'incoming_attack') ln.classList.add('radar-incoming');
         grp.appendChild(ln);
-        // Marker mobile lungo la traiettoria: <animate> calcolato sui
-        // timestamp reali (progresso → arrivo tra 'remaining' secondi).
+
         const dot = document.createElementNS(NS, 'circle');
         dot.setAttribute('cx', mx); dot.setAttribute('cy', my);
         dot.setAttribute('r', 3.4);
         dot.setAttribute('fill', meta.color);
         dot.setAttribute('stroke', '#0f172a');
         dot.setAttribute('stroke-width', '1');
-        const remaining = Math.max(0.5, (m.arrives_at || 0) - nowSec);
-        if (prog < 1 && remaining > 0.5) {
-          const ax = document.createElementNS(NS, 'animate');
-          ax.setAttribute('attributeName', 'cx');
-          ax.setAttribute('from', mx);
-          ax.setAttribute('to', x2);
-          ax.setAttribute('dur', remaining.toFixed(1) + 's');
-          ax.setAttribute('fill', 'freeze');
-          ax.setAttribute('calcMode', 'linear');
-          const ay = document.createElementNS(NS, 'animate');
-          ay.setAttribute('attributeName', 'cy');
-          ay.setAttribute('from', my);
-          ay.setAttribute('to', y2);
-          ay.setAttribute('dur', remaining.toFixed(1) + 's');
-          ay.setAttribute('fill', 'freeze');
-          ay.setAttribute('calcMode', 'linear');
-          dot.appendChild(ax); dot.appendChild(ay);
-        }
-        // Icona categoria sulla destinazione.
+        grp.appendChild(dot);
+
         const ic = document.createElementNS(NS, 'text');
         ic.setAttribute('x', x2 + 4); ic.setAttribute('y', y2 - 4);
         ic.setAttribute('fill', meta.color);
@@ -3952,23 +3936,28 @@
         ic.setAttribute('font-family', 'JetBrains Mono');
         ic.textContent = meta.icon;
         grp.appendChild(ic);
-        grp.appendChild(dot);
+
         grp.addEventListener('mousemove', ev => showTip(ev, m));
         grp.addEventListener('mouseleave', hideTip);
         g.appendChild(grp);
       });
 
-      const alertEl = document.getElementById('cc-radar-alert');
-      const incLive = liveMoves.filter(m => m.category === 'incoming_attack').length;
-      if (alertEl) {
-        const n = inc.length || incLive;
-        alertEl.textContent = incLive
-          ? 'ALLERTA ATTACCO'
-          : (n ? `${n} RAID` : 'SICURO');
-        alertEl.className = 'px-2 py-0.5 rounded text-[10px] font-mono font-bold border ' +
-          (n
-            ? 'bg-red-500/20 text-red-400 border-red-500/40 animate-pulse'
-            : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40');
+      if (movesBox) {
+        if (!visibleMoves.length) {
+          movesBox.innerHTML = '<div class="text-slate-500 text-center py-1">Nessun movimento attivo</div>';
+        } else {
+          movesBox.innerHTML = visibleMoves.slice(0, 6).map(m => {
+            const meta = RADAR_CATS[m.category] || { color: '#94a3b8', icon: '●', label: m.category };
+            const left = Math.max(0, Math.round((m.arrives_at || 0) - nowSec));
+            const mm = String(Math.floor(left / 60)).padStart(2, '0');
+            const ss = String(left % 60).padStart(2, '0');
+            const dst = m.label || m.counterpart || ((m.village && m.village.name) || '');
+            return `<div class="flex items-center justify-between gap-2 px-2 py-1 rounded bg-slate-900/90 border border-slate-800">` +
+              `<span style="color:${meta.color}" class="truncate">${meta.icon} ${esc(meta.label)} · ${esc(dst)}</span>` +
+              `<span class="text-slate-200 tabular-nums shrink-0">${mm}:${ss}</span>` +
+              `</div>`;
+          }).join('');
+        }
       }
     }
 
