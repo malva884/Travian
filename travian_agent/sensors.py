@@ -3381,11 +3381,10 @@ class TravianParser:
     async def _read_troops_dom(self) -> dict[str, int]:
         """Estrae {'uN': qty} dalla pagina corrente.
 
-        Parser tollerante al markup (T4.4/T4.6): la quantita' viene
-        cercata in catena — cella dell'icona, cella adiacente,
-        genitore, prima cella solo-numerica della riga. Se non ci sono
-        icone 'unit uN', fallback testuale su righe "Nome Unita' NNN"
-        con mappa nomi localizzati -> uN (spec bugfix parser truppe).
+        Supporta sia la struttura tabellare Travian (icone in
+        `tbody.units tr#unitRowAtTown` e quantita' in
+        `tbody.units.last td.unit`) sia i layout con quantita' inline
+        o fallback testuale.
         """
         data = await self.page.evaluate(
             """
@@ -3397,10 +3396,6 @@ class TravianParser:
                     return m ? parseInt(m[1].replace(/\\./g, ''), 10) : 0;
                 };
                 const clsUnit = /(?:^|[\\s_\\-])u(\\d{1,2})(?=[\\s\\-]|$)/;
-                // Chiave 'uN' dall'elemento: classi/data-attr; in
-                // fallback il NOME dell'unita' in title/aria-label/alt
-                // (nuova UI ts30: icone 'troopIcon'/'unitIcon', svg —
-                // non esiste piu' la classe 'unit uN').
                 const keyOf = (el) => {
                     const c = (el.getAttribute('class') || '') + ' ' +
                         (el.getAttribute('data-unit') || '') + ' ' +
@@ -3416,71 +3411,89 @@ class TravianParser:
                     }
                     return null;
                 };
-                // 1) Icone unita': classi classiche 'unit uN' +
-                //    varianti nuova UI. Dedup: si tengono solo i nodi
-                //    piu' interni (wrapper+icona non contano due volte;
-                //    icone diverse della stessa uN si sommano =
-                //    contingenti multipli a casa).
-                const allIcons = Array.from(document.querySelectorAll(
-                    'img[class*="unit" i], i[class*="unit" i], ' +
-                    'a[class*="unit" i], span[class*="unit" i], ' +
-                    'div[class*="unit" i], [class*=" unit u"], ' +
-                    '[class*="unit u"], [class*="unitIcon" i], ' +
-                    '[class*="troopIcon" i], [class*="troop-icon" i], ' +
-                    '[class*="troop_icon" i], [data-unit], ' +
-                    '[data-unit-id], [data-unitid], ' +
-                    'svg[class*="unit" i], svg[class*="troop" i], ' +
-                    'img[src*="unit"], [title][class*="unit" i], img[alt]'
-                ));
-                const icons = allIcons.filter(
-                    el => !allIcons.some(o => o !== el && el.contains(o))
-                );
-                const seen = new Set();
-                icons.forEach(icon => {
-                    if (seen.has(icon)) return;
-                    seen.add(icon);
-                    const key = keyOf(icon);
-                    if (!key) return;
-                    let qty =
-                        num(icon.getAttribute('data-count')) ||
-                        num(icon.getAttribute('data-amount')) ||
-                        num(icon.getAttribute('data-quantity'));
-                    // NOTA: '.unit' escluso da closest() — matcherebbe
-                    // l'icona stessa (class 'unit uN') fermando la
-                    // ricerca della quantita' sul nodo sbagliato.
-                    const cell = icon.closest(
-                        'td, a, li, .col, .troop, div'
+
+                // 0) Struttura tabella Travian: icone in
+                //    `tbody.units tr#unitRowAtTown` e valori in
+                //    `tbody.units.last td.unit`.
+                const troopTables = document.querySelectorAll('table.troop_details');
+                troopTables.forEach(tbl => {
+                    const iconRow = tbl.querySelector('tbody.units tr#unitRowAtTown, tbody.units tr');
+                    const valCells = Array.from(tbl.querySelectorAll('tbody.units.last tr td.unit, tbody.units.last td.unit'));
+                    if (!iconRow || !valCells.length) return;
+                    const rawIcons = Array.from(iconRow.querySelectorAll(
+                        'td.uniticon img, td.uniticon [class*="unit" i], img[class*="unit" i], [class*="unitIcon" i], [class*="troopIcon" i]'
+                    ));
+                    const leafIcons = rawIcons.filter(
+                        el => !rawIcons.some(o => o !== el && el.contains(o))
                     );
-                    if (!qty && cell) {
-                        qty = num(cell.innerText || '');
-                        if (!qty && cell.nextElementSibling)
-                            qty = num(cell.nextElementSibling.innerText || '');
-                        if (!qty && cell.parentElement)
-                            qty = num(cell.parentElement.innerText || '');
-                    }
-                    if (!qty) {
-                        const row = icon.closest('tr, li');
-                        if (row) {
-                            const cells = row.querySelectorAll('td, span, div');
-                            for (const c of cells) {
-                                if (c === cell || c.contains(icon)) continue;
-                                const t = (c.innerText || '').trim();
-                                if (/^\\d[\\d.]*$/.test(t)) { qty = num(t); break; }
+                    const colKeys = leafIcons.map(el => keyOf(el));
+                    valCells.forEach((td, idx) => {
+                        const key = colKeys[idx];
+                        if (!key) return;
+                        const qty = num(td.innerText || td.textContent || '');
+                        if (qty > 0) out[key] = (out[key] || 0) + qty;
+                    });
+                });
+
+                // 1) Icone unita' con quantita' adiacente / inline.
+                if (!Object.keys(out).length) {
+                    const allIcons = Array.from(document.querySelectorAll(
+                        'img[class*="unit" i], i[class*="unit" i], ' +
+                        'a[class*="unit" i], span[class*="unit" i], ' +
+                        'div[class*="unit" i], [class*=" unit u"], ' +
+                        '[class*="unit u"], [class*="unitIcon" i], ' +
+                        '[class*="troopIcon" i], [class*="troop-icon" i], ' +
+                        '[class*="troop_icon" i], [data-unit], ' +
+                        '[data-unit-id], [data-unitid], ' +
+                        'svg[class*="unit" i], svg[class*="troop" i], ' +
+                        'img[src*="unit"], [title][class*="unit" i], img[alt]'
+                    ));
+                    const icons = allIcons.filter(
+                        el => !allIcons.some(o => o !== el && el.contains(o))
+                    );
+                    const seen = new Set();
+                    icons.forEach(icon => {
+                        if (seen.has(icon)) return;
+                        seen.add(icon);
+                        const key = keyOf(icon);
+                        if (!key) return;
+                        let qty =
+                            num(icon.getAttribute('data-count')) ||
+                            num(icon.getAttribute('data-amount')) ||
+                            num(icon.getAttribute('data-quantity'));
+                        const cell = icon.closest(
+                            'td, a, li, .col, .troop, div'
+                        );
+                        if (!qty && cell) {
+                            qty = num(cell.innerText || '');
+                            if (!qty && cell.nextElementSibling)
+                                qty = num(cell.nextElementSibling.innerText || '');
+                            if (!qty && cell.parentElement)
+                                qty = num(cell.parentElement.innerText || '');
+                        }
+                        if (!qty) {
+                            const row = icon.closest('tr, li');
+                            if (row) {
+                                const cells = row.querySelectorAll('td, span, div');
+                                for (const c of cells) {
+                                    if (c === cell || c.contains(icon)) continue;
+                                    const t = (c.innerText || '').trim();
+                                    if (/^\\d[\\d.]*$/.test(t)) { qty = num(t); break; }
+                                }
                             }
                         }
-                    }
-                    if (!qty) {
-                        qty = num(
-                            (icon.getAttribute('aria-label') || '') + ' ' +
-                            (icon.getAttribute('title') || '') + ' ' +
-                            (icon.innerText || '')
-                        );
-                    }
-                    if (qty > 0) out[key] = (out[key] || 0) + qty;
-                });
-                // 2) Fallback testuale: righe 'Nome Unita' 826' senza
-                //    icone — incluse le righe div-based della nuova UI
-                //    sotto container troop/unit.
+                        if (!qty) {
+                            qty = num(
+                                (icon.getAttribute('aria-label') || '') + ' ' +
+                                (icon.getAttribute('title') || '') + ' ' +
+                                (icon.innerText || '')
+                            );
+                        }
+                        if (qty > 0) out[key] = (out[key] || 0) + qty;
+                    });
+                }
+
+                // 2) Fallback testuale: righe 'Nome Unita' 826'.
                 if (!Object.keys(out).length) {
                     const rows = document.querySelectorAll(
                         'tr, li, .troop_details div, .troopDetails div, ' +
