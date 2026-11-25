@@ -2761,7 +2761,16 @@ class TravianParser:
                         const ttxt = timerEl
                             ? cleanTxt(timerEl.textContent || '')
                             : '';
+                        // Card nuova UI: il nodo 'riga' puo' essere il
+                        // countdown stesso (il piu' interno col testo
+                        // 'h:mm:ss'); querySelector non include self ->
+                        // timerEl nullo, secs=0 e pushRow scarta il
+                        // movimento. Fallback sul testo del nodo.
                         const m = ttxt.match(
+                            /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
+                        ) || cleanTxt(
+                            table.innerText || ''
+                        ).match(
                             /(?:(\\d+)\\s*[-+]\\s*)?(?:(\\d+):)?(\\d+):(\\d{2})/
                         );
                         let secs = 0;
@@ -3355,6 +3364,17 @@ class TravianParser:
                     (self.page.url or "")[:120],
                 )
             except Exception:
+                pass
+            # Fixture automatica: l'HTML reale di gid16/dorf1 serve a
+            # calibrare _read_troops_dom sul markup ts30 (report '0
+            # truppe nonostante unita' in casa').
+            try:
+                await capture_anomaly(
+                    self.page,
+                    "TROOPS_UNREAD",
+                    village_id=village_id,
+                )
+            except Exception:  # noqa: BLE001
                 pass
         return units
 
