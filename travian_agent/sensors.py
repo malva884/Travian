@@ -3401,8 +3401,15 @@ class TravianParser:
             (params) => {
                 const out = {};
                 const labelMap = params.labels || {};
+                // Marcatori Unicode invisibili/bidirezionali che la UI
+                // moderna Travian avvolge attorno ai numeri: vanno
+                // rimossi prima di regex full-match e parse numerici.
+                const cleanTxt = (t) => String(t || '').replace(
+                    /[\\u200b\\u200c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\u00ad]/g,
+                    ''
+                );
                 const num = (t) => {
-                    const m = String(t || '').match(/(\\d[\\d.]*)/);
+                    const m = cleanTxt(t).match(/(\\d[\\d.]*)/);
                     return m ? parseInt(m[1].replace(/\\./g, ''), 10) : 0;
                 };
                 const clsUnit = /(?:^|[\\s_\\-])u(\\d{1,2})(?=[\\s\\-]|$)/;
@@ -3444,6 +3451,101 @@ class TravianParser:
                         if (qty > 0) out[key] = (out[key] || 0) + qty;
                     });
                 });
+
+                // 0.5) Nuova UI (buildRallyPoint '/slot?id=N&tt=1'): il
+                //      vecchio 'table.troop_details' non esiste — le
+                //      quantita' sono celle `div.unit` con testo
+                //      'N (+M)' (N = truppe in casa inviabili, usate
+                //      per il dodge; +M = rinforzi ospitati, non
+                //      inviabili da questo villaggio — ignorati).
+                if (!Object.keys(out).length) {
+                    const uSel2 = [];
+                    for (let n = 1; n <= 30; n++) {
+                        uSel2.push('[class*="u' + n + '"]');
+                    }
+                    uSel2.push(
+                        '[data-unit]', '[data-unit-id]', '[data-unitid]',
+                        'img.unit, i.unit, span.unit'
+                    );
+                    const iconSel2 = uSel2.join(',');
+                    // Cella valore: solo cifre con separatore migliaia
+                    // e opzionale '(+M)' — es. '1.234 (+5)' o '0'.
+                    const valRe = /^\\s*\\d[\\d.]*\\s*(\\(\\s*\\+?\\s*\\d[\\d.]*\\s*\\))?\\s*$/;
+                    const valCells = Array.from(document.querySelectorAll(
+                        'div.unit, span.unit, td.unit, ' +
+                        '[class*="unitValue" i], [class*="unit-value" i]'
+                    )).filter(
+                        c => valRe.test(cleanTxt(c.innerText).trim())
+                    );
+                    const qtyOf = (c) => num(c.innerText);
+                    // a) Tipo unita' risolto nel contesto della cella:
+                    //    icona 'uN' dentro la cella, oppure icona
+                    //    unica nel wrapper genitore (.unit/td/li).
+                    valCells.forEach(cell => {
+                        let key = keyOf(cell);
+                        if (!key) {
+                            const own = cell.querySelectorAll(iconSel2);
+                            for (const ic of own) {
+                                key = keyOf(ic);
+                                if (key) break;
+                            }
+                        }
+                        if (!key && cell.parentElement) {
+                            const par = cell.parentElement;
+                            if (par.matches(
+                                '.unit, td, li, [class*="unit" i], ' +
+                                '[class*="cell" i], [class*="col" i]'
+                            )) {
+                                const sib = par.querySelectorAll(iconSel2);
+                                // Solo se l'icona e' univoca nel
+                                // contenitore: con piu' icone nel
+                                // parente l'associazione sarebbe
+                                // ambigua (ci pensa l'allineamento b).
+                                if (sib.length === 1) key = keyOf(sib[0]);
+                            }
+                        }
+                        if (!key) return;
+                        const qty = qtyOf(cell);
+                        if (qty > 0) out[key] = (out[key] || 0) + qty;
+                    });
+                    // b) Righe separate icone/quantita' senza <table>:
+                    //    allineamento per indice dentro lo stesso
+                    //    contenitore (specchio della logica di step 0).
+                    if (!Object.keys(out).length && valCells.length) {
+                        const roots = document.querySelectorAll(
+                            '[class*="troop" i], [class*="units" i], ' +
+                            '[id*="troop" i], #build, #content, ' +
+                            '.content, main'
+                        );
+                        for (const root of roots) {
+                            const rawIcons = Array.from(
+                                root.querySelectorAll(iconSel2)
+                            );
+                            const leafIcons = rawIcons.filter(
+                                el => !rawIcons.some(
+                                    o => o !== el && el.contains(o)
+                                )
+                            );
+                            const colKeys = leafIcons.map(keyOf);
+                            const cells = valCells.filter(
+                                c => root.contains(c)
+                            );
+                            if (!leafIcons.length ||
+                                leafIcons.length !== cells.length ||
+                                colKeys.some(k => !k)) {
+                                continue;
+                            }
+                            cells.forEach((td, idx) => {
+                                const qty = qtyOf(td);
+                                if (qty > 0) {
+                                    const k = colKeys[idx];
+                                    out[k] = (out[k] || 0) + qty;
+                                }
+                            });
+                            if (Object.keys(out).length) break;
+                        }
+                    }
+                }
 
                 // 1) Icone unita' con quantita' adiacente / inline.
                 if (!Object.keys(out).length) {
@@ -3514,7 +3616,8 @@ class TravianParser:
                         '[id*="troop" i] div, [class*="troopTable" i] div'
                     );
                     rows.forEach(r => {
-                        const raw = (r.innerText || '').replace(/\\s+/g, ' ').trim();
+                        const raw = cleanTxt(r.innerText || '')
+                            .replace(/\\s+/g, ' ').trim();
                         const low = raw.toLowerCase();
                         for (const name in labelMap) {
                             const idx = low.indexOf(name);

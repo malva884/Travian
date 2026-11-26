@@ -241,6 +241,22 @@ class TestTroopsDomParser:
         # Wrapper + icona annidata non devono contare due volte.
         assert "contains(o)" in src
 
+    def test_modern_div_unit_cells(self):
+        src = self._src()
+        # Nuova UI rally ('/slot?id=N&tt=1'): celle `div.unit` con
+        # testo 'N (+M)' — il parser deve leggerle o resta cieco e
+        # il dodge risulta sempre sotto soglia (bug Pizzo 38553).
+        assert "div.unit" in src
+        # Il valore 'N (+M)' si distingue dalle icone vuote.
+        assert "+?" in src or "\\+" in src
+        # La quantita' inviabile e' il numero PRIMA della parentesi:
+        # si usa solo il primo match numerico (qtyOf), non il '+M'.
+        assert "qtyOf" in src
+        # I marcatori Unicode bidi della UI moderna (\\u200e, \\u202a-e)
+        # avvolgono i numeri e rompono i match: vanno rimossi prima.
+        assert "cleanTxt" in src
+        assert "200e" in src and "202a" in src
+
 
 class TestRallyMovementsParser:
     """Regressione ts30: panoramica gid16 (slot?id=N&tt=1) con sezioni
