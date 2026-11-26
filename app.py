@@ -2184,6 +2184,43 @@ if page == "Villaggi":
                             if _alerts:
                                 st.caption(" · ".join(_alerts))
 
+                    st.divider()
+
+                    # --- SEZIONE 4: FILTRO RISORSE FEEDER PUSH (lato destinatario) ---
+                    # La config si legge sul villaggio DESTINATARIO delle
+                    # spedizioni (es. il cropper Pizzo), non sul feeder:
+                    # l'orchestratore filtra p_surplus su target's
+                    # feed_requested_resources prima del capping — se dopo il
+                    # filtro non resta surplus spedibile il ciclo cade su
+                    # FEEDER_PUSH_IDLE (esente da pausa anti-detection).
+                    st.markdown("##### 🚚 Risorse Accettate dai Feeder")
+                    _feed_res_options = ["wood", "clay", "iron", "crop"]
+                    _feed_res_labels = {
+                        "wood": "🪵 Legno",
+                        "clay": "🧱 Argilla",
+                        "iron": "⚙️ Ferro",
+                        "crop": "🌾 Grano",
+                    }
+                    parsed_feed_req = st.multiselect(
+                        "Spedisci a QUESTO villaggio solo:",
+                        options=_feed_res_options,
+                        default=[
+                            r
+                            for r in (old_cfg.feed_requested_resources or [])
+                            if r in _feed_res_options
+                        ],
+                        format_func=lambda r: _feed_res_labels.get(r, r),
+                        key=f"feedreq_{cur_acc.account_id}_{vkey}",
+                        help="Filtro lato destinatario: i feeder inviano qui "
+                             "solo le risorse selezionate (es. solo Ferro per "
+                             "un campo coltivato). Selezione vuota = nessun "
+                             "filtro, viene spedito tutto il surplus.",
+                    )
+                    st.caption(
+                        "ℹ️ Si imposta sul villaggio **destinatario**, non sul "
+                        "feeder. Vuoto = nessun filtro attivo (tutto il surplus)."
+                    )
+
                     updated_villages[vname] = VillageConfig(
                         name=vname,
                         role=new_role,
@@ -2217,6 +2254,11 @@ if page == "Villaggi":
                                 bqsmithy_key,
                                 old_cfg.smithy_auto_upgrade,
                             ) or {}
+                        ),
+                        # Selezione vuota -> None (nessun filtro); lista non
+                        # vuota -> solo le risorse richieste dal destinatario.
+                        feed_requested_resources=(
+                            list(parsed_feed_req) if parsed_feed_req else None
                         ),
                     )
 
