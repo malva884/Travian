@@ -950,6 +950,19 @@
                 </div>
               </div>
             </div>
+            <!-- Filtro FEEDER_PUSH lato destinatario: le checkbox spuntate sono
+                 le sole risorse che i feeder possono spedire a QUESTO villaggio.
+                 Nessuna spunta = null = nessun filtro (tutto il surplus). -->
+            <div>
+              <label class="block text-[10px] uppercase text-slate-400 mb-1">Risorse accettate dai feeder <span class="text-slate-600 normal-case">(vuoto = tutte)</span></label>
+              <div class="flex flex-wrap gap-2 text-[11px]">
+                <label class="flex items-center gap-1 text-slate-300"><input id="vset-feed-wood" type="checkbox" class="w-3.5 h-3.5 accent-amber-500">🪵 Legno</label>
+                <label class="flex items-center gap-1 text-slate-300"><input id="vset-feed-clay" type="checkbox" class="w-3.5 h-3.5 accent-orange-500">🧱 Argilla</label>
+                <label class="flex items-center gap-1 text-slate-300"><input id="vset-feed-iron" type="checkbox" class="w-3.5 h-3.5 accent-slate-400">⚙️ Ferro</label>
+                <label class="flex items-center gap-1 text-slate-300"><input id="vset-feed-crop" type="checkbox" class="w-3.5 h-3.5 accent-yellow-500">🌾 Grano</label>
+              </div>
+              <div class="text-[9px] text-slate-500 mt-0.5">Si configura sul villaggio destinatario (es. il cropper), non sul feeder.</div>
+            </div>
             <button onclick="saveVillageExtras()" class="w-full px-2 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/35 text-[11px] font-bold">Salva Impostazioni Avanzate Villaggio</button>
           </div>
         </div>
@@ -2598,6 +2611,8 @@
         renderTroopTargetBadges();
         renderSmithyBadges();
         renderDorf2Map();
+        ['vset-feed-wood', 'vset-feed-clay', 'vset-feed-iron', 'vset-feed-crop']
+          .forEach(id => { const el = document.getElementById(id); if (el) el.checked = false; });
         return;
       }
       const roleSel = document.getElementById('brain-role-select');
@@ -2651,6 +2666,16 @@
       sv('vset-reclaim-x', cfg.reclaim_village_x);
       sv('vset-reclaim-y', cfg.reclaim_village_y);
       sv('vset-keep', cfg.resource_keep);
+      // Filtro FEEDER_PUSH lato destinatario -> checkbox risorse.
+      // null = nessun filtro (tutte deselezionate); [] = 'non spedire
+      // nulla', ma la UI lo rappresenta come 'nessun filtro' (limite
+      // noto: via UI non si distingue [] da null).
+      const _feedReq = Array.isArray(cfg.feed_requested_resources)
+        ? cfg.feed_requested_resources : [];
+      ['wood', 'clay', 'iron', 'crop'].forEach(r => {
+        const el = document.getElementById('vset-feed-' + r);
+        if (el) el.checked = _feedReq.includes(r);
+      });
       // Obiettivi truppe -> badge (chiavi tN; le label legacy vengono
       // risolte via TROOP_INFO in _unitKey).
       appState.troopTargets = {};
@@ -3572,6 +3597,15 @@
           priority_units: smithyUnits,
           unit_levels: smithyLevels,
         },
+        // Filtro FEEDER_PUSH lato destinatario: lista delle risorse
+        // spuntate; null (incluso sempre) resetta il filtro a 'tutte'.
+        feed_requested_resources: (() => {
+          const sel = ['wood', 'clay', 'iron', 'crop'].filter(r => {
+            const el = document.getElementById('vset-feed-' + r);
+            return el && el.checked;
+          });
+          return sel.length ? sel : null;
+        })(),
       };
       [['vset-farm-qty', 'farm_unit_qty'],
        ['vset-market-slot', 'market_slot'],

@@ -450,7 +450,14 @@ def _apply_fields_checked(
             warnings.append(f"chiave '{k}' sconosciuta: ignorata")
             continue
         cur = getattr(obj, k)
-        new, ok, note = _coerce_checked(v, cur)
+        _ftype = str(fields[k].type)
+        if v is None and ("None" in _ftype or "Optional" in _ftype):
+            # null esplicito su campo Optional (es. feed_requested_resources):
+            # resetta a None — _coerce_checked lo rifiuterebbe quando il
+            # valore corrente e' una lista/dict/int/float/bool.
+            new, ok, note = None, True, ""
+        else:
+            new, ok, note = _coerce_checked(v, cur)
         if not ok:
             warnings.append(
                 f"campo '{k}': {note} (mantenuto {cur!r})"
