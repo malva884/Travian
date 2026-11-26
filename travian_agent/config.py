@@ -113,6 +113,7 @@ class VillageConfig:
     # Riserva risorse: quantita' minima per tipo da non spendere/spedire
     # (0 = nessuna riserva, spec Impostazioni Avanzate Villaggio).
     resource_keep: int = 0
+    feed_requested_resources: list[str] | None = None
 
     def __post_init__(self) -> None:
         if not self.priority_units and self.allowed_units:
@@ -394,6 +395,24 @@ def _read_accounts_json(path: Path) -> list | None:
     except Exception:  # noqa: BLE001
         return None
 
+_VALID_FEED_RESOURCES = ("wood", "clay", "iron", "crop")
+
+
+def _normalize_feed_requested_resources(raw: object) -> list[str] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        res_name = item.strip().lower()
+        if res_name in _VALID_FEED_RESOURCES and res_name not in seen:
+            seen.add(res_name)
+            normalized.append(res_name)
+    return normalized
 
 def _parse_account_item(item: dict) -> Settings:
     """Costruisce un Settings da una voce di accounts.json."""
@@ -506,6 +525,9 @@ def _parse_account_item(item: dict) -> Settings:
                             village_roles=dict(item.get("village_roles", {})),
                             villages={
                                 str(key): VillageConfig(
+                                    feed_requested_resources=_normalize_feed_requested_resources(
+                                        cfg.get("feed_requested_resources")
+                                    ),
                                     name=str(cfg.get("name", key)),
                                     role=str(cfg.get("role", "standard")),
                                     target_village=str(cfg.get("target_village", "")),
@@ -779,6 +801,11 @@ def save_accounts(accounts: list[Settings], allow_empty: bool = False) -> None:
                     "reclaim_village_x": cfg.reclaim_village_x,
                     "reclaim_village_y": cfg.reclaim_village_y,
                     "resource_keep": int(cfg.resource_keep or 0),
+                    "feed_requested_resources": (
+                        list(cfg.feed_requested_resources)
+                        if cfg.feed_requested_resources is not None
+                        else None
+                    ),
                     "resource_weights": dict(cfg.resource_weights),
                 }
                 for key, cfg in acc.villages.items()

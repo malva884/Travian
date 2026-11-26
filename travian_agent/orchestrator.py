@@ -252,6 +252,40 @@ def _inbound_merchant_resources(
                 continue
     return out
 
+def _filter_feed_surplus_by_target_request(
+    surplus: dict[str, int] | None,
+    requested_resources: list[str] | None,
+) -> dict[str, int]:
+    """Filtra il surplus in base alle risorse richieste dal villaggio target.
+
+    - ``requested_resources is None``: applica la logica intelligente standard
+      (nessun filtraggio esplicito qui, restano attive le regole di surplus,
+      capping e filtro croplog in ``_cap_feed_shipment``).
+    - ``requested_resources == []``: nessun invio esplicito (ritorna ``{}``).
+    - ``requested_resources`` lista non vuota: mantiene solo le risorse
+      dichiarate dal villaggio destinatario con quantità positiva.
+    """
+    base: dict[str, int] = {}
+    for k, v in (surplus or {}).items():
+        try:
+            qty = int(v or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty > 0:
+            base[str(k).strip().lower()] = qty
+
+    if requested_resources is None:
+        return base
+
+    allowed = {
+        str(r).strip().lower()
+        for r in requested_resources
+        if isinstance(r, str) and str(r).strip()
+    }
+    if not allowed:
+        return {}
+
+    return {res: qty for res, qty in base.items() if res in allowed}
 
 def _cap_feed_shipment(
     settings: Settings,
@@ -4725,6 +4759,21 @@ async def monitor_all_villages(
                         if t_village is not None and t_village.name
                         else push_target
                     )
+                    t_cfg = settings.village_config_for(
+                        t_name,
+                        t_village.village_id
+                        if t_village is not None
+                        else 0,
+                    )
+                    target_requested = getattr(
+                        t_cfg, "feed_requested_resources", None
+                    )
+                    if target_requested is not None:
+                        p_surplus = _filter_feed_surplus_by_target_request(
+                            p_surplus,
+                            target_requested,
+                        )
+                    p_had_surplus = bool(p_surplus)
                     t_res = (
                         state.peer_villages.get(t_name)
                         or state.peer_villages.get(push_target)
