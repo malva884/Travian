@@ -125,19 +125,9 @@ class DefenseManager:
     state_path: Path | None = None
     dodges: dict[str, PendingDodge] = field(default_factory=dict)   # key: village_id
     recalls: list[PendingRecall] = field(default_factory=list)
-    # Smart Reinforce Coordinator:
-    # - threats: str(village_id) -> {name, x, y, arrival_ts, count, read_ts}
-    #   registro delle minacce reali viste sull'account (aggiornato a
-    #   ogni visita del villaggio, consumato dai donatori);
-    # - reinforces: rinforzi gia' inviati (deduplica + feed dashboard).
     threats: dict[str, dict] = field(default_factory=dict)
     reinforces: list[PendingReinforce] = field(default_factory=list)
-    # Lock temporaneo (spec 4.1): village_id -> ts di fine emergenza.
-    # Mentre attivo, replenishment.py viene congelato dall'orchestrator per
-    # evitare conflitti sulla spesa delle risorse appena svuotate.
     emergency_until: dict[str, float] = field(default_factory=dict)
-    # Buffer Decision Audit Log: eventi decisionali del ciclo in corso,
-    # svuotato dall'orchestrator via drain_audit() (non persistito).
     _audit: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -218,12 +208,6 @@ class DefenseManager:
     def is_emergency_locked(
         self, village_id: int | str, now: float | None = None
     ) -> bool:
-        """True se il villaggio e' in lock d'emergenza difesa.
-
-        Il lock copre la finestra tra l'allarme sotto soglia di panico e
-        l'impatto + recall_delay: in quel periodo il modulo di rimpiazzo
-        non deve spendere le risorse appena svuotate dal drain.
-        """
         now = time.time() if now is None else now
         until = self.emergency_until.get(str(village_id), 0.0)
         return now < until
@@ -241,12 +225,6 @@ class DefenseManager:
         threats: list[IncomingAttack],
         now: float,
     ) -> None:
-        """Aggiorna il registro minacce per il villaggio appena visitato.
-
-        Una voce vive finche' le minacce restano reali: quando il
-        villaggio e' di nuovo pulito la voce viene rimossa, cosi' i
-        donatori non inseguono allarmi rientrati.
-        """
         key = str(village.village_id or 0)
         if threats:
             nearest = min(threats, key=lambda a: a.arrival_ts)
@@ -266,7 +244,6 @@ class DefenseManager:
             self._save()
 
     def active_threats(self, now: float) -> dict[str, dict]:
-        """Registro minacce reali non scadute (village_id -> info)."""
         changed = False
         for vid in list(self.threats):
             arrival = float(self.threats[vid].get("arrival_ts") or 0.0)
@@ -280,12 +257,6 @@ class DefenseManager:
     def reinforce_sent(
         self, target_village_id: int, donor_village_id: int, arrival_ts: float
     ) -> bool:
-        """True se il donatore ha gia' un muro in viaggio su quel bersaglio.
-
-        La finestra +-5 minuti copre le ondate dello stesso assalto:
-        un rinforzo spedito per la prima ondata vale anche per quelle
-        ravvicinate senza duplicare l'invio.
-        """
         for r in self.reinforces:
             if (
                 r.target_village_id == int(target_village_id or 0)
@@ -304,12 +275,6 @@ class DefenseManager:
         recall_delay_seconds: float,
         auto_recall: bool = True,
     ) -> None:
-        """Registra il rinforzo inviato e programma il rientro (spec 3).
-
-        Il PendingRecall punta al villaggio bersaglio (host): quando
-        l'orchestratore lo visita dopo l'impatto, le truppe tornano al
-        donatore (home). ``auto_recall=False`` lascia il muro in sede.
-        """
         self.reinforces.append(rec)
         if auto_recall:
             self.recalls.append(
@@ -334,7 +299,6 @@ class DefenseManager:
         ]
 
     def reinforce_status(self, now: float) -> list[PendingReinforce]:
-        """Rinforzi ancora rilevanti per il feed della dashboard."""
         return [
             r
             for r in self.reinforces
@@ -357,9 +321,22 @@ class DefenseManager:
         )
 
     def drain_audit(self) -> list[dict]:
-        """Svuota il buffer degli eventi decisionali del ciclo."""
         events, self._audit = self._audit, []
         return events
+
+    def _should_reset_dodge(
+        self, pending: PendingDodge | None, attack_arrival_ts: float, now: float
+    ) -> bool:
+        """Restituisce True se il record di fuga esistente va scartato."""
+        if pending is None:
+            return False
+        # Attacco precedente già superato da oltre _THREAT_STALE_SECONDS
+        if now > pending.attack_arrival_ts + _THREAT_STALE_SECONDS:
+            return True
+        # Nuova ondata chiaramente distinta rispetto a quella già gestita
+        if abs(pending.attack_arrival_ts - attack_arrival_ts) > 10.0:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Entry point: chiamato dall'orchestrator per ogni villaggio del ciclo
@@ -399,8 +376,10 @@ class DefenseManager:
             observer=observer,
         )
 
+        vid_key = str(village.village_id)
+
         # B) Fuga programmata scaduta (registrata in un ciclo precedente)
-        pending = self.dodges.get(str(village.village_id))
+        pending = self.dodges.get(vid_key)
         if pending and not pending.sent and now >= pending.dodge_at_ts:
             await self._execute_dodge(
                 executor=executor,
@@ -421,9 +400,6 @@ class DefenseManager:
             a for a in attacks
             if a.is_threat and not a.is_likely_fake(cfg.fake_troop_threshold)
         ]
-        # Registro minacce inter-villaggio (Smart Reinforce Coordinator):
-        # le minacce reali restano disponibili ai villaggi donatori
-        # visitati nei passi successivi del ciclo.
         self.record_threats(village, threats, now)
         if not threats:
             return
@@ -444,7 +420,14 @@ class DefenseManager:
             label=nearest.label or "",
         )
 
-        # D) Emergenza: sotto la soglia di panico -> drain + dodge
+        # Ripulisce eventuale dodge scaduto o relativo ad altra ondata
+        pending = self.dodges.get(vid_key)
+        if self._should_reset_dodge(pending, nearest.arrival_ts, now):
+            self.dodges.pop(vid_key, None)
+            self._save()
+            pending = None
+
+        # D) Monitoraggio se sopra la soglia di panico
         if secs > cfg.panic_threshold_seconds:
             logger.info(
                 "%s Attacco a %ds (soglia %ds): monitorato, nessuna azione.",
@@ -459,7 +442,6 @@ class DefenseManager:
                 seconds_to_impact=secs,
                 panic_threshold_seconds=cfg.panic_threshold_seconds,
             )
-            # Registra la fuga programmata se ancora assente
             if not pending:
                 await self._schedule_dodge(
                     observer=observer,
@@ -505,8 +487,8 @@ class DefenseManager:
             prefix=prefix,
         )
 
-        # Fase 3: troop dodging (se non gia' inviata)
-        pending = self.dodges.get(str(village.village_id))
+        # Fase 3: troop dodging
+        pending = self.dodges.get(vid_key)
         if not pending:
             pending = await self._schedule_dodge(
                 observer=observer,
@@ -518,6 +500,14 @@ class DefenseManager:
                 prefix=prefix,
                 now=now,
             )
+        elif pending.sent:
+            self._audit_event(
+                "TROOP_DODGE",
+                "SKIPPED",
+                "Evacuazione gia' eseguita per l'ondata corrente",
+                attack_arrival_ts=pending.attack_arrival_ts,
+            )
+
         if pending and not pending.sent:
             await self._execute_dodge(
                 executor=executor,
@@ -566,7 +556,6 @@ class DefenseManager:
             total_resources=total,
         )
 
-        # 1) Addestramento massivo nei trainer del villaggio
         trainer_slots = [
             f.slot_id for f in state.interior_fields() if f.gid in _TRAINER_GIDS
         ]
@@ -576,14 +565,8 @@ class DefenseManager:
             ):
                 break
 
-        # 2) Upgrade piu' costoso accodabile
         await self._emergency_upgrade(browser, village, prefix)
 
-        # 3) Evasione risorse via mercato (spec anti-razzia): se il
-        #    surplus supera la capacita' protetta dai Depositi Segreti
-        #    spedisce automaticamente il residuo a un altro villaggio
-        #    dell'account (o alla destinazione drain_target_village).
-        cfg = settings.defense
         if market_slot:
             await self._drain_via_market(
                 executor=executor,
@@ -605,7 +588,6 @@ class DefenseManager:
         trainer_slot: int,
         prefix: str,
     ) -> bool:
-        """Compila l'input del lotto massimo sostenibile e avvia il training."""
         page = executor.browser.page
         if page is None:
             return False
@@ -640,12 +622,6 @@ class DefenseManager:
     async def _emergency_upgrade(
         self, browser: "TravianBrowser", village: "Village", prefix: str
     ) -> bool:
-        """Accoda l'upgrade piu' costoso disponibile (dorf2, poi dorf1).
-
-        Spec anti-razzia 2: in pre-impatto la priorita' e' spendere —
-        se nessun edificio e' migliorabile si ripiega su un campo
-        risorsa, che comunque converte risorse in struttura.
-        """
         page = browser.page
         if page is None:
             return False
@@ -715,16 +691,6 @@ class DefenseManager:
         market_slot: int,
         prefix: str,
     ) -> None:
-        """Spec anti-razzia 3: evasione automatica del surplus non
-        protetto dai Depositi Segreti.
-
-        Solo le risorse che eccedono ``cranny_protected_capacity`` (o il
-        floor minimo ``_DRAIN_KEEP``) vengono spedite — il resto resta
-        al sicuro. Destinazione: ``defense.drain_target_village`` se
-        configurato, altrimenti il villaggio dell'account piu' vicino
-        (alleato fidato). Se non ci sono mercanti liberi l'esecutore
-        rifiuta con BLOCKED, senza danni.
-        """
         cfg = settings.defense
         try:
             st = await observer.read_state()
@@ -752,8 +718,6 @@ class DefenseManager:
                 )
                 return
 
-            # Destinazione: config esplicita oppure villaggio proprio
-            # piu' vicino con coordinate note.
             target_name = (cfg.drain_target_village or "").strip()
             tx = ty = None
             if target_name:
@@ -819,18 +783,14 @@ class DefenseManager:
         village: "Village",
         villages: list["Village"],
     ) -> tuple[int | None, int | None, int]:
-        """Destinazione fuga: config dodge_target ('x|y' o nome) oppure il
-        villaggio proprio piu' vicino. Ritorna (x, y, host_village_id)."""
         tgt = (settings.defense.dodge_target or "").strip()
         if tgt:
-            # formato "x|y"
             if "|" in tgt:
                 try:
                     sx, sy = tgt.split("|", 1)
                     return int(sx), int(sy), 0
                 except ValueError:
                     pass
-            # nome villaggio proprio
             for v in villages or []:
                 if v.name == tgt and v.x is not None and v.y is not None:
                     return v.x, v.y, v.village_id
@@ -838,7 +798,6 @@ class DefenseManager:
             if t_cfg and t_cfg.x is not None and t_cfg.y is not None:
                 return t_cfg.x, t_cfg.y, 0
 
-        # Default: villaggio proprio piu' vicino con coordinate note
         if village.x is not None and village.y is not None:
             best = None
             best_d = None
@@ -867,7 +826,6 @@ class DefenseManager:
         prefix: str,
         now: float,
     ) -> PendingDodge | None:
-        """Registra la fuga programmata (truppe lette ora, esecuzione poi)."""
         cfg = settings.defense
         troops = await observer.read_troops_home(rally_slot, village.village_id)
         dodge_troops = {k: int(v) for k, v in troops.items() if int(v or 0) > 0}
@@ -943,7 +901,6 @@ class DefenseManager:
         rally_slot: int,
         prefix: str,
     ) -> None:
-        """Invia le truppe in rinforzo alla destinazione sicura."""
         action = Action(
             type=ActionType.SEND_CUSTOM_RAID,
             params={
@@ -1004,13 +961,11 @@ class DefenseManager:
         now: float,
         observer: "GameObserver | None" = None,
     ) -> None:
-        """Se questo villaggio ospita truppe evacuate scadute, le rimanda a casa."""
         if not self.recalls or not rally_slot:
             return
         remaining: list[PendingRecall] = []
         upcoming: list[IncomingAttack] | None = None
         for rec in self.recalls:
-            # Il rientro parte dal villaggio che ospita le truppe
             if rec.host_village_id and rec.host_village_id != village.village_id:
                 remaining.append(rec)
                 continue
@@ -1018,12 +973,8 @@ class DefenseManager:
                 remaining.append(rec)
                 continue
             if rec.home_x is None or rec.home_y is None or not rec.troops:
-                continue  # dati insufficienti: scarta
+                continue
 
-            # Spec 3: niente rientro se sul villaggio ospite stanno
-            # arrivando altre ondate reali entro 15 minuti — il muro
-            # serve ancora. Il rientro e' riprogrammato dopo l'ultima
-            # ondata nota (lettura condivisa tra i recall del ciclo).
             if observer is not None:
                 if upcoming is None:
                     upcoming = await observer.get_incoming_attacks(
@@ -1069,7 +1020,6 @@ class DefenseManager:
                     "%s Smart Recall eseguito: %s", prefix, result.message
                 )
             else:
-                # Riprova al prossimo passaggio su questo villaggio
                 remaining.append(rec)
                 logger.warning(
                     "%s Smart Recall fallito: %s", prefix, result.message
