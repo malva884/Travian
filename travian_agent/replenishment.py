@@ -475,28 +475,63 @@ class TroopReplenishmentManager:
         village_name: str = "",
         reserve_settlers: bool = False,
     ) -> dict[str, int]:
-        """Filtra il deficit in un piano sostenibile {tN: qty}.
+        """Piano di addestramento {tN: qty} (vedi ``plan_training_detailed``)."""
+        plan, _reason, _ctx = self.plan_training_detailed(
+            deficit,
+            state,
+            settings,
+            village_name=village_name,
+            reserve_settlers=reserve_settlers,
+        )
+        return plan
 
-        - villaggio congelato (sotto assedio): niente piano;
-        - ``skip_while_building``: cede il passo alle code di sviluppo;
-        - guardia grano: se il bilancio netto ufficiale (crop_balance da
-          production.php) scende sotto la soglia configurata, l'addestramento
-          che consuma grano viene sospeso (Grain Safety Net, spec 1.1);
+    def plan_training_detailed(
+        self,
+        deficit: dict[str, int],
+        state: "GameState",
+        settings: "Settings",
+        *,
+        village_name: str = "",
+        reserve_settlers: bool = False,
+    ) -> tuple[dict[str, int], str, dict]:
+        """Filtra il deficit in un piano sostenibile {tN: qty} con diagnosi.
+
+        Ritorna ``(piano, motivo, contesto)``: ``motivo`` e' "" quando il
+        piano e' non vuoto, altrimenti uno fra:
+
+        - ``frozen_village``: villaggio sotto assedio (difesa preserva
+          l'esercito) — blocco strutturale;
+        - ``building_queue``: coda costruzioni attiva, l'addestramento cede
+          il passo allo sviluppo (``skip_while_building``);
+        - ``pending_upgrade``: upgrade critico (storage/grain safety/
+          bootstrap) in attesa di risorse;
+        - ``grain_net``: bilancio grano netto sotto soglia (Grain Safety
+          Net) — attesa naturale di riequilibrio;
+        - ``crop_reserve``: grano sotto la riserva configurata — attesa
+          naturale di accumulo;
+        - ``empty_plan``: deficit presente ma nessuna unita' pianificabile;
+        - ``insufficient_resources``: scorte insufficienti al netto delle
+          riserve — attesa naturale; ``ctx['missing']`` stima il deficit
+          per risorsa dell'unita' piu' vicina all'addestrabilita'.
+
+        Regole applicate:
         - ``reserve_settlers``: il villaggio e' il fondatore (o la rete
           feeder e' attiva) — la riserva ``3 x costo colono`` non puo'
           essere spesa in addestramento (spec 2.1);
+        - ruolo ``feeder`` con ``target_village``: la caserma non intacca la
+          riserva ``keep_ratio`` del push (FEEDER_PUSH resta alimentabile);
         - il piano e' comunque limitato al surplus disponibile: mai spendere
-          oltre le scorte meno la riserva coloni.
+          oltre le scorte meno le riserve attive.
         """
         if not deficit:
-            return {}
+            return {}, "", {}
         if village_name and self.is_village_frozen(village_name):
             logger.info(
                 "[%s] Replenishment: villaggio '%s' sotto assedio, rimpiazzo sospeso",
                 self.account_id,
                 village_name,
             )
-            return {}
+            return {}, "frozen_village", {}
 
         cfg = settings.replenishment
         res = state.resources
@@ -511,7 +546,7 @@ class TroopReplenishmentManager:
                 self.account_id,
                 village_name,
             )
-            return {}
+            return {}, "building_queue", {}
 
         # Priorita' anche agli upgrade critici in attesa (spec 3): se il
         # planner ha un upgrade Storage / Grain Safety / Bootstrap che non
@@ -534,7 +569,7 @@ class TroopReplenishmentManager:
                     village_name,
                     pending.kind,
                 )
-                return {}
+                return {}, "pending_upgrade", {"kind": pending.kind}
 
         # Grain Safety Net: usa il bilancio netto ufficiale letto da
         # production.php (crop_balance). None = dato non letto: si ripiega
@@ -565,7 +600,10 @@ class TroopReplenishmentManager:
                 threshold,
                 village_name,
             )
-            return {}
+            return {}, "grain_net", {
+                "net_crop": int(net_crop),
+                "threshold": float(threshold),
+            }
 
         # Guardia scorte: mai intaccare la riserva di grano configurata
         granary = res.granary_capacity or 0
@@ -580,33 +618,105 @@ class TroopReplenishmentManager:
                 crop_reserve,
                 net_crop,
             )
-            return {}
+            return {}, "crop_reserve", {
+                "crop": int(res.crop),
+                "crop_reserve": int(crop_reserve),
+            }
 
         plan = {u: q for u, q in deficit.items() if q > 0}
         if not plan:
-            return {}
+            return {}, "empty_plan", {}
 
-        # Anti-saturazione: limita la spesa al surplus. Se il villaggio e'
-        # il fondatore (rete feeder attiva), la riserva 3x colono non si tocca.
-        budget = {
-            "wood": res.wood,
-            "clay": res.clay,
-            "iron": res.iron,
-            "crop": max(0, res.crop - crop_reserve),
+        # Riserve minime per risorsa: nessun piano puo' intaccarle.
+        # - riserva grano configurata (sempre);
+        # - riserva 3x colono se il villaggio e' il fondatore designato o la
+        #   rete feeder gli sta' spedendo risorse (spec 2.1);
+        # - riserva keep_ratio su un villaggio feeder con target: la caserma
+        #   non drena il surplus destinato a FEEDER_PUSH (coordinamento).
+        reserve: dict[str, int] = {
+            "wood": 0,
+            "clay": 0,
+            "iron": 0,
+            "crop": crop_reserve,
         }
         if reserve_settlers:
-            reserve = settler_reserve()
-            for k, v in reserve.items():
-                budget[k] = max(0, budget.get(k, 0) - v)
+            for k, v in settler_reserve().items():
+                reserve[k] = max(reserve.get(k, 0), v)
             logger.debug(
-                "[%s] Replenishment: riserva coloni attiva in '%s' (%s) — "
-                "budget addestramento %s",
+                "[%s] Replenishment: riserva coloni attiva in '%s' (%s)",
+                self.account_id,
+                village_name,
+                settler_reserve(),
+            )
+        feeder_active = bool(
+            vcfg is not None
+            and str(getattr(vcfg, "role", "") or "").strip().lower() == "feeder"
+            and str(getattr(vcfg, "target_village", "") or "").strip()
+        )
+        if feeder_active:
+            try:
+                from .expansion import (  # no cicli a import
+                    FEEDER_CROP_KEEP_RATIO,
+                    FEEDER_KEEP_RATIO,
+                )
+            except Exception:  # noqa: BLE001
+                FEEDER_KEEP_RATIO, FEEDER_CROP_KEEP_RATIO = 0.55, 0.25
+            wh_cap = res.warehouse_capacity or 0
+            if wh_cap > 0:
+                keep_wh = int(wh_cap * FEEDER_KEEP_RATIO)
+                for k in ("wood", "clay", "iron"):
+                    reserve[k] = max(reserve.get(k, 0), keep_wh)
+            if granary > 0:
+                reserve["crop"] = max(
+                    reserve["crop"], int(granary * FEEDER_CROP_KEEP_RATIO)
+                )
+            logger.debug(
+                "[%s] Replenishment: riserva feeder attiva in '%s' (%s)",
                 self.account_id,
                 village_name,
                 reserve,
-                budget,
             )
+
+        budget = {
+            "wood": max(0, res.wood - reserve.get("wood", 0)),
+            "clay": max(0, res.clay - reserve.get("clay", 0)),
+            "iron": max(0, res.iron - reserve.get("iron", 0)),
+            "crop": max(0, res.crop - reserve.get("crop", 0)),
+        }
         clamped = clamp_plan_to_budget(plan, budget)
+        if not clamped:
+            # Diagnosi 'insufficient_resources': per ogni unita' richiesta,
+            # deficit per risorsa per addestrare UNA unita'; si riporta
+            # quella piu' vicina all'addestrabilita' (min deficit totale).
+            costs = _troop_costs()
+            best_missing: dict[str, int] = {}
+            best_unit = ""
+            best_total: int | None = None
+            for unit in plan:
+                cost = costs.get(normalize_unit_key(unit)) or {}
+                missing = {
+                    k: max(0, int(cost.get(k, 0) or 0) - budget.get(k, 0))
+                    for k in _RES_KEYS
+                }
+                total = sum(missing.values())
+                if best_total is None or total < best_total:
+                    best_total = total
+                    best_missing = missing
+                    best_unit = unit
+            logger.info(
+                "[%s] Replenishment: piano per '%s' vuoto — budget %s, "
+                "deficit unita' %s: %s",
+                self.account_id,
+                village_name,
+                budget,
+                best_unit,
+                best_missing,
+            )
+            return {}, "insufficient_resources", {
+                "budget": dict(budget),
+                "missing": best_missing,
+                "unit": best_unit,
+            }
         if len(clamped) < len(plan) or any(
             clamped.get(u, 0) < q for u, q in plan.items()
         ):
@@ -618,11 +728,11 @@ class TroopReplenishmentManager:
                 clamped,
                 plan,
             )
-        elif clamped:
+        else:
             logger.info(
                 "[%s] Replenishment: piano rimpiazzo per '%s': %s",
                 self.account_id,
                 village_name,
                 clamped,
             )
-        return clamped
+        return clamped, "", {}

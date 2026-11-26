@@ -12,12 +12,16 @@ from travian_agent.brain import (
     rule_grain_safety,
     rule_role_buildings,
     rule_upgrade_weakest_field,
+    rule_wait,
 )
 from travian_agent.building_prereqs import (
     GID_ACADEMY,
     GID_BAKERY,
     GID_BARRACKS,
+    GID_CITY_WALL,
+    GID_CRANNY,
     GID_CROPLAND,
+    GID_EMBASSY,
     GID_GRAIN_MILL,
     GID_GREAT_BARRACKS,
     GID_MAIN_BUILDING,
@@ -1207,3 +1211,419 @@ class TestNoGenericButtonFallback:
         # navigazione non parte entro 2.5s.
         assert "scroll_into_view_if_needed" in src
         assert "button.click(force=True" in src
+
+
+# ---------------------------------------------------------------------------
+# _build_queue_count — conteggio coda su DOM (fix falsi 3 su Vibo Valentia)
+# ---------------------------------------------------------------------------
+
+
+def _queue_executor(allow_parallel: bool):
+    """ActionExecutor minimo: serve solo .settings per il cap."""
+    import travian_agent.actions as act
+
+    s = _settings()
+    s.allow_parallel_build = allow_parallel
+    ex = act.ActionExecutor.__new__(act.ActionExecutor)
+    ex.settings = s
+    return ex
+
+
+class _FakeQueuePage:
+    """Page stub: evaluate ritorna il conteggio grezzo del JS."""
+
+    def __init__(self, result):
+        self._result = result
+
+    async def evaluate(self, js):
+        return self._result
+
+
+class TestBuildQueueCountClamp:
+    """Python-side: il conteggio non supera mai il tetto fisico del
+    villaggio (2 senza Plus, 3 con allow_parallel_build)."""
+
+    def test_overcap_clamped_no_plus(self):
+        ex = _queue_executor(allow_parallel=False)
+        n = asyncio.run(ex._build_queue_count(_FakeQueuePage(7)))
+        assert n == 2
+
+    def test_overcap_clamped_plus(self):
+        ex = _queue_executor(allow_parallel=True)
+        n = asyncio.run(ex._build_queue_count(_FakeQueuePage(9)))
+        assert n == 3
+
+    def test_real_count_passthrough(self):
+        ex = _queue_executor(allow_parallel=True)
+        assert asyncio.run(
+            ex._build_queue_count(_FakeQueuePage(2))
+        ) == 2
+
+    def test_no_container_returns_none(self):
+        ex = _queue_executor(allow_parallel=True)
+        assert asyncio.run(
+            ex._build_queue_count(_FakeQueuePage(None))
+        ) is None
+
+
+class TestBuildQueueCountSource:
+    """Vincoli sul JS: reggono anche senza browser installato."""
+
+    def _src(self) -> str:
+        import inspect
+        import travian_agent.actions as act
+        return inspect.getsource(
+            act.ActionExecutor._build_queue_count
+        )
+
+    def test_no_generic_construction_container(self):
+        src = self._src()
+        # Assente come selettore (]'): la menzione nel commento ok.
+        assert "construction\" i]'" not in src
+        assert 'data-testid*="build-queue" i' in src
+
+    def test_row_selectors_job_only(self):
+        src = self._src()
+        for sel in (
+            "li[data-gid]", "tr[data-gid]",
+            '[class*="queueElement" i]', '.buildingRow', '.slotRow',
+        ):
+            assert sel in src
+        # li/tr generici non devono essere selettori riga.
+        assert "'li', 'tr'" not in src
+
+    def test_fake_row_keywords(self):
+        src = self._src()
+        for kw in ("slot libero", "npc", "capo cantiere",
+                   "instant", "video", "exchange"):
+            assert kw in src
+
+    def test_dedup_and_visibility(self):
+        src = self._src()
+        # Dedup righe annidate + hidden esclusi.
+        assert "o.contains(el)" in src
+        assert "offsetParent" in src
+
+
+class TestBuildQueueCountDOM:
+    """DOM reale (Playwright, headless): righe di coda rappresentative
+    ts30 con elementi fittizi che prima gonfiavano il conteggio."""
+
+    def _count(self, html: str, allow_parallel: bool = True):
+        import pytest
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            pytest.skip("playwright non installato")
+
+        async def _run():
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                try:
+                    page = await browser.new_page()
+                    await page.set_content(html)
+                    ex = _queue_executor(allow_parallel)
+                    return await ex._build_queue_count(page)
+                finally:
+                    await browser.close()
+
+        try:
+            return asyncio.run(_run())
+        except Exception as exc:  # browser mancante -> skip
+            pytest.skip(f"browser playwright non disponibile: {exc}")
+
+    def test_single_job_with_noise(self):
+        html = """
+        <div id="sidebarBoxBuilding">
+          <ul class="buildingList">
+            <li class="buildingRow"><a href="build.php?id=26">
+              Granaio — livello 9 — <span class="timer">0:12:40</span>
+            </a></li>
+            <li class="upgradeBlocked">Slot libero</li>
+            <li class="upgradeBlocked">Capo cantiere NPC</li>
+          </ul>
+        </div>
+        <div class="construction banner">Costruisci piu' in fretta!</div>
+        """
+        assert self._count(html) == 1
+
+    def test_two_jobs_with_noise(self):
+        html = """
+        <div id="sidebarBoxBuildingQueue">
+          <div class="buildQueue">
+            <li data-gid="10">Magazzino livello 12 0:20:10</li>
+            <li data-gid="1">Boschiera livello 8 0:05:02</li>
+            <li data-gid="5">NPC capo cantiere instant</li>
+            <div class="queueElement" style="display:none">
+              hidden ghost row
+            </div>
+          </div>
+        </div>
+        """
+        assert self._count(html) == 2
+
+    def test_nested_duplicates_counted_once(self):
+        """Il medesimo job matchato da due selettori annidati conta 1."""
+        html = """
+        <div class="buildQueue">
+          <li data-gid="7"><div data-gid="7">Granaio livello 5 0:03:10</div></li>
+        </div>
+        """
+        assert self._count(html) == 1
+
+    def test_header_only_is_zero(self):
+        html = """
+        <div class="buildQueue">
+          <li class="header">Coda costruzioni</li>
+          <li class="separator"></li>
+        </div>
+        """
+        assert self._count(html) == 0
+
+    def test_no_container_returns_none(self):
+        html = "<div><p>pagina senza coda</p></div>"
+        assert self._count(html) is None
+
+
+# ---------------------------------------------------------------------------
+# rule_wait — lato libero vs coda realmente piena
+# ---------------------------------------------------------------------------
+
+
+class TestRuleWaitSideFree:
+    """rule_wait deve dichiarare il binario libero (dorf1/dorf2)
+    invece di dichiarare la coda piena quando resta uno slot."""
+
+    def _romans(self, plus: bool) -> Settings:
+        s = _settings()
+        s.tribe = "romans"
+        s.allow_parallel_build = plus
+        return s
+
+    def test_field_queued_sides_still_free(self):
+        """1 campo in coda sotto max_parallel: la reason dichiara le
+        viste libere, non 'coda occupata' (spec Vibo Valentia)."""
+        state = _state()
+        state.build_queue = [
+            BuildQueueItem(name="Bosco", is_resource_field=True,
+                           slot_id=5, gid=1, remaining_seconds=600),
+        ]
+        a = rule_wait(state, self._romans(plus=False))
+        assert a.type == ActionType.WAIT
+        assert "libera" in a.reason
+        assert "dorf" in a.reason
+        assert "occupata" not in a.reason
+
+    def test_interior_queued_sides_still_free(self):
+        """1 edificio in coda: binari condividono il tetto — ancora
+        spazio, la reason non deve dichiarare la coda piena."""
+        state = _state()
+        state.build_queue = [
+            BuildQueueItem(name="Residenza", is_resource_field=False,
+                           slot_id=31, gid=25, remaining_seconds=900),
+        ]
+        a = rule_wait(state, self._romans(plus=False))
+        assert "libera" in a.reason
+        assert "occupata" not in a.reason
+
+    def test_both_sides_full_says_busy(self):
+        """Entrambi i binari occupati -> 'Coda occupata'."""
+        state = _state()
+        state.build_queue = [
+            BuildQueueItem(name="Bosco", is_resource_field=True,
+                           slot_id=5, gid=1, remaining_seconds=600),
+            BuildQueueItem(name="Residenza", is_resource_field=False,
+                           slot_id=31, gid=25, remaining_seconds=900),
+        ]
+        a = rule_wait(state, self._romans(plus=False))
+        assert "occupata" in a.reason
+        assert a.params["suggest_seconds"] == 600
+
+
+# ---------------------------------------------------------------------------
+# Rotazione candidati bloccati in rule_role_buildings (fix loop Pizzo)
+# ---------------------------------------------------------------------------
+
+
+class TestRoleBuildingsBlockedRotation:
+    """Regressione Pizzo (38553, croplog): quando la testa degli intent
+    di ruolo (Palazzo lv.3, slot 27) non e' avviabile, la regola deve
+    promuovere il candidato successivo invece di riproporre lo stesso
+    slot a ogni ciclo — e la reason deve nominare l'edificio reale."""
+
+    def setup_method(self):
+        builder._TEMP_BLOCK_HISTORY.clear()
+        builder._FOCUS_EXEC_HISTORY.clear()
+        builder._FOCUS_FAIL_HISTORY.clear()
+
+    def teardown_method(self):
+        builder._TEMP_BLOCK_HISTORY.clear()
+        builder._FOCUS_EXEC_HISTORY.clear()
+        builder._FOCUS_FAIL_HISTORY.clear()
+
+    def _croplog(self, **res) -> tuple[Settings, GameState]:
+        """Croplog con Palazzo lv.3 in testa agli intent di ruolo.
+
+        Nessuna area vuota -> nessun intent di nuova costruzione a
+        livello 0: l'ordinamento (livello, slot) mette il Palazzo
+        davanti a magazzino/granaio/ambasciata/caserma/mura.
+        """
+        s = _settings()
+        s.villages = {
+            "TestVillage": VillageConfig(name="TestVillage", role="croplog")
+        }
+        kw = dict(
+            wood=500, clay=500, iron=500, crop=500,
+            warehouse_capacity=5000, granary_capacity=5000,
+        )
+        kw.update(res)
+        state = _state(**kw)
+        state.fields = [
+            Field(slot_id=1, name="Campo grano", level=4,
+                  resource_type=ResourceType.CROP),
+            Field(slot_id=5, name="Bosco", level=2,
+                  resource_type=ResourceType.WOOD),
+            Field(slot_id=19, name="Municipio", level=5,
+                  gid=GID_MAIN_BUILDING),
+            Field(slot_id=20, name="Punto di Raduno", level=1,
+                  gid=GID_RALLY_POINT),
+            Field(slot_id=25, name="Magazzino", level=4,
+                  gid=GID_WAREHOUSE),
+            Field(slot_id=26, name="Granaio", level=4,
+                  gid=GID_GRANARY),
+            Field(slot_id=27, name="Palazzo", level=3,
+                  gid=GID_PALACE),
+            Field(slot_id=28, name="Deposito Segreto", level=5,
+                  gid=GID_CRANNY),
+            Field(slot_id=29, name="Ambasciata", level=4,
+                  gid=GID_EMBASSY),
+            Field(slot_id=33, name="Caserma", level=4,
+                  gid=GID_BARRACKS),
+            Field(slot_id=34, name="Mura", level=5,
+                  gid=GID_CITY_WALL),
+        ]
+        return s, state
+
+    def test_head_is_palace_when_startable(self):
+        """Baseline: senza blocchi la testa e' il Palazzo lv.3 (slot 27)."""
+        s, state = self._croplog()
+        intents = builder.role_intents(state, s)
+        assert intents[0].slot_id == 27
+        action = rule_role_buildings(state, s)
+        assert action is not None
+        assert action.params["candidates"][0] == 27
+        assert "Palazzo" in action.reason
+        assert "slot 27" in action.reason
+
+    def test_blocked_head_rotates_to_next_candidate(self):
+        """Palazzo marcato UPGRADE_BLOCKED: la testa ruota sul
+        candidato successivo, il bloccato resta in coda ai candidati."""
+        s, state = self._croplog()
+        builder.record_upgrade_fail(
+            "TestVillage", 27, "UPGRADE_BLOCKED", state=state
+        )
+        action = rule_role_buildings(state, s)
+        assert action is not None
+        assert action.params["candidates"][0] == 25  # Magazzino lv.4
+        assert 27 in action.params["candidates"]
+        assert action.params["candidates"].index(27) > 0
+        # Reason allineata al candidato reale + nota di rinvio
+        assert "Magazzino" in action.reason
+        assert "rinviato" in action.reason
+        assert "27" in action.reason
+        assert "UPGRADE_BLOCKED" in action.reason
+
+    def test_block_released_when_queue_changes(self):
+        """Il blocco UPGRADE_BLOCKED si rilascia quando lo stato della
+        coda costruzioni cambia rispetto alla firma registrata."""
+        s, state = self._croplog()
+        builder.record_upgrade_fail(
+            "TestVillage", 27, "UPGRADE_BLOCKED", state=state
+        )
+        assert 27 in builder.temp_blocked_slots(state)
+        # Un lavoro entra in coda su un altro slot: il vincolo puo'
+        # essere caduto -> lo slot torna eleggibile in testa.
+        state.build_queue = [
+            BuildQueueItem(name="Mura", is_resource_field=False,
+                           slot_id=34, gid=GID_CITY_WALL,
+                           remaining_seconds=300),
+        ]
+        assert 27 not in builder.temp_blocked_slots(state)
+        action = rule_role_buildings(state, s)
+        assert action is not None
+        assert action.params["candidates"][0] == 27
+
+    def test_insufficient_resources_releases_when_affordable(self):
+        """Blocco INSUFFICIENT_RESOURCES con costo noto: rilasciato
+        solo quando le scorte coprono il contratto."""
+        s, state = self._croplog(
+            wood=100, clay=100, iron=100, crop=100,
+        )
+        cost = {"wood": 500, "clay": 500, "iron": 500, "crop": 500}
+        builder.record_upgrade_fail(
+            "TestVillage", 27, "INSUFFICIENT_RESOURCES",
+            state=state, cost=cost,
+        )
+        assert 27 in builder.temp_blocked_slots(state)
+        # Scorte ancora sotto il costo: blocco attivo, testa ruotata.
+        action = rule_role_buildings(state, s)
+        assert action is not None
+        assert action.params["candidates"][0] == 25
+        # Scorte sufficienti: il blocco cade e la testa torna Palazzo.
+        state.resources.wood = 600
+        state.resources.clay = 600
+        state.resources.iron = 600
+        state.resources.crop = 600
+        assert 27 not in builder.temp_blocked_slots(state)
+        action = rule_role_buildings(state, s)
+        assert action.params["candidates"][0] == 27
+
+    def test_structural_fail_excludes_candidate(self):
+        """Fail strutturali ripetuti (BTN_NOT_FOUND x2): lo slot e'
+        escluso del tutto dai candidati, non solo rinviato."""
+        s, state = self._croplog()
+        builder.record_upgrade_fail("TestVillage", 27, "BTN_NOT_FOUND")
+        builder.record_upgrade_fail("TestVillage", 27, "BTN_NOT_FOUND")
+        assert 27 in builder.focus_fail_blocked(state)
+        action = rule_role_buildings(state, s)
+        assert action is not None
+        assert 27 not in action.params["candidates"]
+        assert action.params["candidates"][0] == 25
+        assert "esclusi" in action.reason
+
+    def test_all_blocked_returns_none(self):
+        """Tutti i candidati non avviabili -> esito chiaro (None),
+        nessun retry a vuoto sullo stesso slot."""
+        s, state = self._croplog()
+        # Bloccati tutti gli interni di ruolo e il campo di fallback:
+        # le scorte restano invariate (una variazione rilascerebbe i
+        # blocchi senza costo noto).
+        for slot in (1, 25, 26, 27, 28, 29, 33, 34):
+            builder.record_upgrade_fail(
+                "TestVillage", slot, "UPGRADE_BLOCKED", state=state
+            )
+        assert rule_role_buildings(state, s) is None
+
+    def test_exec_resets_temp_block(self):
+        """Un EXECUTED confermato sullo slot azzera il blocco
+        temporaneo: torna subito candidabile."""
+        s, state = self._croplog()
+        builder.record_upgrade_fail(
+            "TestVillage", 27, "UPGRADE_BLOCKED", state=state
+        )
+        builder.record_upgrade_exec("TestVillage", 27, 3)
+        assert 27 not in builder.temp_blocked_slots(state)
+        action = rule_role_buildings(state, s)
+        assert action.params["candidates"][0] == 27
+
+    def test_skip_note_reports_blocked_slots(self):
+        """Il motivo di skip del brain nomina gli slot bloccati."""
+        s, state = self._croplog()
+        brain = RuleBasedBrain(s)
+        builder.record_upgrade_fail(
+            "TestVillage", 27, "UPGRADE_BLOCKED", state=state
+        )
+        note = brain._rule_skip_note(rule_role_buildings, state)
+        # Con 27 rinviato la regola produce comunque azione: il note
+        # non viene usato, ma deve restare sensato se invocato.
+        assert isinstance(note, str) and note

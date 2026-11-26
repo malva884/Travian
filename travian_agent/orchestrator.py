@@ -51,6 +51,8 @@ from .config import (
 )
 from .defense import DefenseManager, PendingReinforce
 from .expansion import (
+    FEEDER_CROP_KEEP_RATIO,
+    FEEDER_KEEP_RATIO,
     ExpansionManager,
     cropper_store,
     effective_expansion_config,
@@ -1601,6 +1603,7 @@ _PAUSE_EXEMPT_DECISIONS = frozenset(
         "MODULE_PAUSED",        # esito del gate stesso: non ri-pausare
         "MODULE_EVENT",         # fallback generico dei moduli
         "NEW_VILLAGE_BOOTSTRAP",
+        "FEEDER_PUSH_IDLE",     # 'nessun surplus' e' benigno: niente pausa
     }
 )
 _PAUSE_EXEMPT_PREFIXES = ("MANUAL_",)  # comandi utente dal Command Center
@@ -1932,6 +1935,96 @@ def _academy_pending_units(
                 "reason": reason,
             })
     return out
+
+
+def _apply_slot_corrections(
+    settings: Settings,
+    village_id: int,
+    fields: list[Field],
+) -> int:
+    """Applica le rettifiche persistenti slot->gid alla scansione dorf2.
+
+    Le voci in ``slot_corrections`` (DB) sono state verificate su pagina
+    edificio (``div#build.gidN``), fonte autoritativa rispetto alla
+    mappa dorf2 — che su alcune UI associa gid errati agli slot.
+
+    - mappa ancora coerente col ``detected_gid`` registrato (o gid non
+      letto): il campo assume l'``actual_gid`` verificato;
+    - mappa concorda gia' con ``actual_gid``: rettifica superflua,
+      rimossa;
+    - gid diverso da entrambi: lo slot e' cambiato davvero
+      (costruzione/demolizione) -> voce invalidata, non congelata.
+
+    Ritorna il numero di campi rettificati.
+    """
+    vid = int(village_id or 0)
+    if vid <= 0 or not fields:
+        return 0
+    stored = db.slot_corrections_load(settings.account_id, vid)
+    if not stored:
+        return 0
+    stale: list[int] = []
+    applied = 0
+    for f in fields:
+        entry = stored.get(int(f.slot_id or 0))
+        if entry is None:
+            continue
+        fresh = int(f.gid if f.gid is not None else -1)
+        detected = int(entry.get("detected_gid", -1))
+        actual = int(entry.get("actual_gid", -1))
+        if actual < 0 or fresh == actual:
+            # Voce priva di gid verificato o mappa ora concorde col
+            # reale: la rettifica non serve piu'.
+            stale.append(f.slot_id)
+            continue
+        if fresh == detected or fresh < 0:
+            f.gid = actual
+            applied += 1
+            continue
+        stale.append(f.slot_id)
+    if stale:
+        db.slot_corrections_delete(settings.account_id, vid, stale)
+    return applied
+
+
+def _persist_slot_corrections(
+    settings: Settings,
+    village: Village,
+    fields: list[Field],
+    corrections: dict,
+    resolved_slot: int = 0,
+) -> None:
+    """Salva su DB le rettifiche slot->gid emesse dai sensori.
+
+    ``corrections`` = ``{slot_id: gid_reale}`` da ``read_academy_state``;
+    ``detected_gid`` e' il valore che la mappa corrente associa allo
+    slot (pre-correzione): serve in lettura a distinguere una mappa
+    ancora errata da uno slot davvero cambiato. ``resolved_slot`` marca
+    la sede risolta dell'edificio cercato (es. Accademia gid 22).
+    """
+    vid = int(village.village_id or 0)
+    if vid <= 0 or not corrections:
+        return
+    pre_gid = {
+        int(f.slot_id or 0): int(f.gid if f.gid is not None else -1)
+        for f in fields or []
+    }
+    entries = [
+        {
+            "slot_id": int(sid),
+            "detected_gid": pre_gid.get(int(sid), -1),
+            "actual_gid": int(g),
+            "source": "academy_probe",
+        }
+        for sid, g in corrections.items()
+        if int(sid or 0) > 0
+    ]
+    db.slot_corrections_upsert(
+        settings.account_id,
+        vid,
+        entries,
+        resolved_slot=int(resolved_slot or 0) or None,
+    )
 
 
 INITIAL_BACKOFF = 10.0
@@ -2443,6 +2536,15 @@ async def monitor_all_villages(
             # Edifici interni del dorf2 (slot 19-40): fusi in state.fields
             interior = await observer.read_interior_fields()
             if interior:
+                # Rettifiche persistenti slot->gid (mappa dorf2 errata su
+                # alcune UI): applicate al caricamento, prima che brain,
+                # Accademia e planner valutino i campi. Le voci stale
+                # (slot cambiato davvero) vengono invalidate sul DB.
+                _apply_slot_corrections(
+                    settings,
+                    int(village.village_id or state.village_id or 0),
+                    interior,
+                )
                 state.fields = [f for f in state.fields if f.is_resource_field] + interior
                 interior_map[village.name or str(village.village_id)] = interior
                 logger.debug(
@@ -2927,6 +3029,8 @@ async def monitor_all_villages(
                                 ),
                                 int(_fd["slot_id"]),
                                 str(_fd["error"]),
+                                state=state,
+                                cost=_fd.get("cost"),
                             )
                     except Exception:
                         logger.debug(
@@ -3494,6 +3598,14 @@ async def monitor_all_villages(
                     _corr = (ac_state or {}).get("slot_corrections") or {}
                     _resolved = int((ac_state or {}).get("resolved_slot") or 0)
                     if _corr:
+                        # Persistenza per (village_id, slot_id): le
+                        # rettifiche sopravvivono al ciclo e al riavvio —
+                        # al prossimo giro _apply_slot_corrections le
+                        # applica gia' in fase di lettura del dorf2.
+                        _persist_slot_corrections(
+                            settings, village, state.fields, _corr,
+                            resolved_slot=_resolved,
+                        )
                         for _f in state.fields:
                             _g = _corr.get(_f.slot_id)
                             if _g is not None and _f.gid != int(_g):
@@ -3522,6 +3634,29 @@ async def monitor_all_villages(
                             reason=(
                                 "Accademia: stato ricerche non "
                                 "leggibile dalla pagina"
+                            ),
+                        )
+                    elif "units" not in ac_state:
+                        # Solo rettifiche (o snapshot non parsabile):
+                        # nessuno slot gid22 verificato o pagina
+                        # illeggibile. Le correzioni sono gia' persistite:
+                        # dal ciclo successivo la mappa e' corretta e il
+                        # modulo non riprova a vuoto.
+                        _record_decision(
+                            settings,
+                            state=state, village=village,
+                            module="academy",
+                            decision="UNIT_RESEARCH",
+                            outcome=DECISION_OUTCOME_SKIPPED,
+                            reason=(
+                                "Accademia non accessibile: "
+                                + (
+                                    f"slot {_resolved} aperto ma stato "
+                                    "ricerche non leggibile"
+                                    if _resolved
+                                    else "nessuno slot gid22 verificato "
+                                         "dopo correzione mappa"
+                                )
                             ),
                         )
                     elif ac_state.get("research_active"):
@@ -3880,7 +4015,11 @@ async def monitor_all_villages(
                             expansion_mgr is not None
                             and expansion_mgr.feed_target == vname
                         )
-                        plan = replenish_mgr.plan_training(
+                        (
+                            plan,
+                            plan_reason,
+                            plan_ctx,
+                        ) = replenish_mgr.plan_training_detailed(
                             deficit, state, settings, village_name=vname,
                             reserve_settlers=reserve_settlers,
                         )
@@ -3889,6 +4028,7 @@ async def monitor_all_villages(
                         # coloni non sono completi.
                         if expansion_freeze(state, settings):
                             plan = {}
+                            plan_reason = "expansion_freeze"
                         if plan and trainer_slots_rep:
                             rep_action = Action(
                                 type=ActionType.TRAIN_TROOPS,
@@ -3909,6 +4049,30 @@ async def monitor_all_villages(
                                 "%s Replenishment: %s",
                                 vprefix, rep_res.message,
                             )
+                            if rep_res.success:
+                                # Stesso ciclo: FEEDER_PUSH valuta il surplus
+                                # piu' avanti sullo stesso state. Le risorse
+                                # spese server-side vanno scalate anche qui o
+                                # il push proporrebbe stock non piu' presente
+                                # (invii sotto la riserva keep o BLOCKED).
+                                spent = (rep_res.data or {}).get("spent") or {}
+                                for _rk in ("wood", "clay", "iron", "crop"):
+                                    _sv = int(spent.get(_rk) or 0)
+                                    if _sv > 0:
+                                        setattr(
+                                            state.resources,
+                                            _rk,
+                                            max(
+                                                0,
+                                                int(
+                                                    getattr(
+                                                        state.resources, _rk, 0
+                                                    )
+                                                    or 0
+                                                )
+                                                - _sv,
+                                            ),
+                                        )
                             _record_decision(
                                 settings,
                                 state=state, village=village,
@@ -3929,26 +4093,126 @@ async def monitor_all_villages(
                                 },
                             )
                         elif deficit:
+                            # Diagnosi esplicita: attesa naturale per risorse
+                            # (insufficient_resources / grain_net /
+                            # crop_reserve) vs blocco strutturale (villaggio
+                            # congelato, trainer assenti, freeze espansione).
+                            if plan and not trainer_slots_rep:
+                                _skip_outcome = DECISION_OUTCOME_BLOCKED
+                                _skip_reason = (
+                                    "Deficit truppe presente ma nessun "
+                                    "edificio di addestramento disponibile "
+                                    "(caserma/scuderia/officina assenti)"
+                                )
+                            else:
+                                _skip_outcome = DECISION_OUTCOME_SKIPPED
+                                _skip_reasons = {
+                                    "frozen_village": (
+                                        "Rimpiazzo sospeso: villaggio sotto "
+                                        "assedio (la difesa preserva "
+                                        "l'esercito)"
+                                    ),
+                                    "building_queue": (
+                                        "Addestramento rimandato: coda "
+                                        "costruzioni attiva (priorita' allo "
+                                        "sviluppo economico)"
+                                    ),
+                                    "pending_upgrade": (
+                                        "Addestramento sospeso: upgrade "
+                                        "critico in attesa di risorse "
+                                        f"({plan_ctx.get('kind', '')})"
+                                    ),
+                                    "grain_net": (
+                                        "Addestramento sospeso: bilancio "
+                                        "grano netto sotto soglia "
+                                        f"({plan_ctx.get('net_crop')}/h < "
+                                        f"{plan_ctx.get('threshold')}/h) — "
+                                        "attesa riequilibrio"
+                                    ),
+                                    "crop_reserve": (
+                                        "Addestramento sospeso: grano sotto "
+                                        "la riserva configurata "
+                                        f"({plan_ctx.get('crop')} < "
+                                        f"{plan_ctx.get('crop_reserve')}) — "
+                                        "attesa accumulo"
+                                    ),
+                                    "insufficient_resources": (
+                                        "Risorse insufficienti per le unita' "
+                                        "richieste al netto delle riserve "
+                                        f"(manca {plan_ctx.get('missing')}"
+                                        f" per {plan_ctx.get('unit')}) — "
+                                        "attesa accumulo naturale"
+                                    ),
+                                    "expansion_freeze": (
+                                        "Addestramento congelato: freeze "
+                                        "espansione attivo finche' i 3 "
+                                        "coloni non sono pronti"
+                                    ),
+                                }
+                                _skip_reason = _skip_reasons.get(
+                                    plan_reason,
+                                    "Deficit truppe presente ma "
+                                    "addestramento non avviabile "
+                                    "(riserve attive o unita' non "
+                                    "pianificabili)",
+                                )
                             _record_decision(
                                 settings,
                                 state=state, village=village,
                                 module="replenishment",
                                 decision="TROOP_TRAINING",
-                                outcome=DECISION_OUTCOME_SKIPPED,
-                                reason=(
-                                    "Deficit truppe presente ma "
-                                    "addestramento non avviabile "
-                                    "(trainer assenti, riserva coloni "
-                                    "o risorse insufficienti)"
-                                ),
+                                outcome=_skip_outcome,
+                                reason=_skip_reason,
                                 context={
                                     "deficit": dict(deficit),
                                     "reserve_settlers": reserve_settlers,
                                     "trainer_slots": len(
                                         trainer_slots_rep
                                     ),
+                                    "plan_reason": plan_reason,
+                                    **{
+                                        k: v
+                                        for k, v in plan_ctx.items()
+                                        if k in ("missing", "unit", "kind")
+                                    },
                                 },
                             )
+                            # Attesa naturale per risorse: pausa calcolata
+                            # sul tempo di produzione reale del deficit
+                            # (Resource-ETA Sleep, come UPGRADE_FIELD) —
+                            # niente polling a vuoto ne' circuit-breaker
+                            # impropri su condizioni che si risolvono da
+                            # sole quando le scorte maturano.
+                            if plan_reason == "insufficient_resources":
+                                _missing = plan_ctx.get("missing") or {}
+                                _prod = {
+                                    str(getattr(k, "value", k)): int(v or 0)
+                                    for k, v in (
+                                        state.resources.production_per_hour
+                                        or {}
+                                    ).items()
+                                }
+                                _eta = resource_eta_seconds(_missing, _prod)
+                                if _eta and _eta > 0:
+                                    _lo, _hi = eta_pause_bounds(_eta)
+                                    _module_pauses.register(
+                                        settings.account_id,
+                                        str(
+                                            village.village_id
+                                            or village.name
+                                            or "0"
+                                        ),
+                                        "replenishment",
+                                        "TROOP_TRAINING",
+                                        resources=state.resources,
+                                        min_seconds=_lo,
+                                        max_seconds=_hi,
+                                    )
+                                    logger.info(
+                                        "%s Replenishment in pausa ETA "
+                                        "%.0fmin: deficit %s",
+                                        vprefix, _eta / 60.0, _missing,
+                                    )
                 except Exception as rep_exc:
                     logger.warning(
                         "%s Errore modulo replenishment: %s",
@@ -4437,8 +4701,15 @@ async def monitor_all_villages(
                         )
                     )
                     p_surplus = feeder_surplus(
-                        state, keep_ratio=0.55, crop_keep_ratio=0.25
+                        state,
+                        keep_ratio=FEEDER_KEEP_RATIO,
+                        crop_keep_ratio=FEEDER_CROP_KEEP_RATIO,
                     )
+                    # Surplus calcolato prima del capping al destinatario:
+                    # serve a distinguere "niente da spedire" (stato
+                    # benigno, nessuna pausa) da "destinatario senza
+                    # spazio libero per questo surplus" (cooldown).
+                    p_had_surplus = bool(p_surplus)
                     # Destinatario per nome o newdid: le coordinate del
                     # payload si leggono SOLO dal suo record, mai dal
                     # villaggio mittente.
@@ -4604,19 +4875,43 @@ async def monitor_all_villages(
                                 },
                             )
                     elif not p_skip_logged:
+                        if not push_mslot:
+                            # Strutturale: senza mercato il push non puo'
+                            # partire — SKIPPED sotto FEEDER_PUSH applica
+                            # il cooldown standard anti-rilevamento.
+                            _push_dec = "FEEDER_PUSH"
+                            _push_reason = (
+                                f"Invio surplus a '{t_name}' non "
+                                "partito: mercato assente"
+                            )
+                        elif p_had_surplus:
+                            # Il surplus c'era ma il destinatario non ha
+                            # spazio libero per quelle risorse: cooldown
+                            # come 'destinatario quasi pieno'.
+                            _push_dec = "FEEDER_PUSH"
+                            _push_reason = (
+                                f"Invio surplus a '{t_name}' saltato: "
+                                "destinatario senza spazio libero per "
+                                "il surplus disponibile."
+                            )
+                        else:
+                            # Stato benigno: il villaggio non ha ancora
+                            # accumulato oltre la riserva. Decisione
+                            # esente da pausa: rivaluto a ogni ciclo
+                            # senza churn SKIPPED -> pausa -> retry.
+                            _push_dec = "FEEDER_PUSH_IDLE"
+                            _push_reason = (
+                                f"Invio surplus a '{t_name}' non "
+                                "partito: nessun surplus oltre la "
+                                "riserva keep_ratio."
+                            )
                         _record_decision(
                             settings,
                             state=state, village=village,
                             module="expansion",
-                            decision="FEEDER_PUSH",
+                            decision=_push_dec,
                             outcome=DECISION_OUTCOME_SKIPPED,
-                            reason=(
-                                f"Invio surplus a '{t_name}' non "
-                                "partito: mercato assente"
-                                if not push_mslot
-                                else f"Invio surplus a '{t_name}' non "
-                                     "partito: nessun surplus spedibile"
-                            ),
+                            reason=_push_reason,
                             context={"target": t_name},
                         )
 

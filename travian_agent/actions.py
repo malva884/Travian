@@ -542,32 +542,127 @@ class ActionExecutor:
             count = await page.evaluate(
                 """
                 () => {
+                    // Solo blocchi reali della coda di costruzione:
+                    // [class*="construction" i] escluso — matchava
+                    // banner/pannelli non legati alla coda (falsi
+                    // positivi su queue_before/queue_after).
                     const containers = document.querySelectorAll(
                         '#buildingContract, #building_contract, ' +
                         '.buildingList, .buildingsOverview, ' +
                         '#sidebarBoxBuilding, #sidebarBoxBuildingQueue, ' +
+                        '[data-testid*="build-queue" i], ' +
+                        '[class*="buildingList" i], ' +
                         '[id*="buildQueue" i], [id*="buildingQueue" i], ' +
-                        '[class*="buildQueue" i], [class*="buildingQueue" i], ' +
-                        '[class*="construction" i]'
+                        '[class*="buildQueue" i], [class*="buildingQueue" i]'
                     );
                     if (!containers.length) return null;
-                    const rowSels = [
-                        '.buildingRow', 'li', 'tr',
-                        '[class*="queueElement" i]', '[class*="entry" i]',
-                        '[class*="queue" i] > div', '.slotRow',
-                    ];
+                    // Solo righe che rappresentano un lavoro di
+                    // costruzione/ampliamento — niente li/tr generici,
+                    // intestazioni, separatori, pulsanti NPC/capo
+                    // cantiere, voci vuote o invisibili.
+                    const rowSel =
+                        '.buildingRow, .slotRow, li[data-gid], ' +
+                        'tr[data-gid], [class*="queueElement" i], ' +
+                        '[class*="buildQueue" i] > li, ' +
+                        '[class*="buildQueue" i] > div[data-gid]';
+                    // Righe fittizie: slot libero e CTA premium (Gold,
+                    // Plus, NPC, capo cantiere, instant, video,
+                    // exchange) — non sono lavori in coda.
+                    const fakeRe = new RegExp(
+                        'slot libero|free slot|npc|capo cantiere|' +
+                        'instant|video|exchange|gold|plus', 'i'
+                    );
+                    const isVisible = (el) => {
+                        // offsetParent === null -> display:none o fuori
+                        // layout; pos:fixed e' l'unica eccezione legit.
+                        const st = getComputedStyle(el);
+                        if (st.display === 'none' ||
+                            st.visibility === 'hidden') return false;
+                        if (el.offsetParent === null &&
+                            st.position !== 'fixed') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    const rowText = (el) => (
+                        (el.innerText || '') + ' ' +
+                        (el.getAttribute('title') || '') + ' ' +
+                        (el.getAttribute('aria-label') || '')
+                    ).trim();
+                    const isJobRow = (el) => {
+                        if (!isVisible(el)) return false;
+                        if (el.closest('thead')) return false;
+                        if (el.matches(
+                            'button, th, [class*="btn" i], ' +
+                            '[class*="header" i], [class*="separator" i], ' +
+                            '[class*="npc" i], [class*="foreman" i], ' +
+                            '[class*="empty" i], a[href*="npc" i]'
+                        )) return false;
+                        const txt = rowText(el);
+                        if (!txt) return false;
+                        if (fakeRe.test(txt)) return false;
+                        return true;
+                    };
+                    // Dedup container annidati: si tengono solo i piu'
+                    // esterni (un box dentro un box conta una volta).
+                    const topContainers = Array.from(containers).filter(
+                        c => !Array.from(containers).some(
+                            o => o !== c && o.contains(c)
+                        )
+                    );
                     let best = 0;
-                    for (const c of containers) {
-                        for (const s of rowSels) {
-                            const n = c.querySelectorAll(s).length;
-                            if (n > best) best = n;
+                    for (const c of topContainers) {
+                        // Dedup righe annidate: match di qualsiasi
+                        // selettore dentro una riga matchata non
+                        // ri-conta — si tiene il nodo piu' esterno.
+                        const nodes = Array.from(
+                            c.querySelectorAll(rowSel)
+                        ).filter(isJobRow).filter(
+                            (el, _i, arr) => !arr.some(
+                                o => o !== el && o.contains(el)
+                            )
+                        );
+                        // Dedup semantica: stesso job ripetuto in DOM
+                        // paralleli del container (gid + testo, che
+                        // include il countdown → job doppi col medesimo
+                        // gid restano distinti).
+                        const seen = new Set();
+                        let n = 0;
+                        for (const el of nodes) {
+                            const key =
+                                (el.getAttribute('data-gid') || '') +
+                                '|' + rowText(el).slice(0, 80);
+                            if (seen.has(key)) continue;
+                            seen.add(key);
+                            n++;
                         }
+                        if (n > best) best = n;
                     }
                     return best;
                 }
                 """
             )
-            return int(count) if count is not None else None
+            if count is None:
+                return None
+            count = int(count)
+            # Tetto fisico del gioco: senza Plus (allow_parallel_build
+            # False) max 2 lavori in coda, con Plus 3 — coerente con
+            # max_parallel di builder.queue_slots_free. Oltre e' rumore
+            # di parsing (righe fittizie/annidate sfuggite ai filtri):
+            # clamp per non falsare il confronto queue_before/after.
+            cap = (
+                3
+                if getattr(self.settings, "allow_parallel_build", False)
+                else 2
+            )
+            if count > cap:
+                logger.warning(
+                    "_build_queue_count: %d righe > tetto fisico %d "
+                    "(clamp) — markup coda sospetto",
+                    count,
+                    cap,
+                )
+                count = cap
+            return count
         except Exception:  # noqa: BLE001
             return None
 
@@ -1063,7 +1158,11 @@ class ActionExecutor:
                                 return ActionResult(
                                     False,
                                     f"candidato prioritario pagabile tra ~{int(_eta)}s: attendo C1",
-                                    data={"cost": cost, "error": err},
+                                    data={
+                                        "cost": cost,
+                                        "error": err,
+                                        "slot_id": int(slot_id),
+                                    },
                                 )
                             blocker_cost, blocker_eta = cost, _eta
                     continue
@@ -1147,20 +1246,34 @@ class ActionExecutor:
                         slot_id,
                         village_id,
                     )
+                    _err_code = "UPGRADE_BLOCKED"
                     if blocker_cost is None and cost:
                         _def = {
                             k: max(0, int(cost.get(k) or 0) - stock.get(k, 0))
                             for k in _res_keys
                         }
                         if any(v > 0 for v in _def.values()):
+                            _err_code = "INSUFFICIENT_RESOURCES"
                             _eta = resource_eta_seconds(_def, prod_h)
                             if _eta is not None and _eta <= 900.0:
                                 return ActionResult(
                                     False,
                                     f"candidato prioritario pagabile tra ~{int(_eta)}s: attendo C1",
-                                    data={"cost": cost},
+                                    data={
+                                        "cost": cost,
+                                        "error": "INSUFFICIENT_RESOURCES",
+                                        "slot_id": int(slot_id),
+                                    },
                                 )
                             blocker_cost, blocker_eta = cost, _eta
+                    # Blocco temporaneo anche per gli ampliamenti: senza
+                    # slot_id nel data il brain riproporrebbe questo
+                    # candidato in testa a ogni ciclo (loop Pizzo).
+                    blocked_err = blocked_err or {
+                        "error": _err_code,
+                        "slot_id": int(slot_id),
+                        "gid": 0,
+                    }
                     continue
 
             # Fallback opportunistico se blocker C1 attivo
@@ -4507,6 +4620,7 @@ class ActionExecutor:
             return ActionResult(False, "nessuna unita' da addestrare nel piano")
 
         trained: list[str] = []
+        spent: dict[str, int] = {}
         remaining = dict(wanted)
 
         for trainer_slot in trainer_slots:
@@ -4532,6 +4646,7 @@ class ActionExecutor:
             # Per ogni unita' disponibile nel form: quantita' = min(richiesta,
             # budget/costo). Ogni input compilato aggiorna il budget residuo.
             fills: list[tuple[str, int, str]] = []
+            costs_by_input: dict[str, dict] = {}
             for unit in training_data.get("units") or []:
                 input_name = (unit.get("inputName") or "").strip().lower()
                 label = (unit.get("label") or "").strip() or input_name
@@ -4547,6 +4662,7 @@ class ActionExecutor:
                 if affordable <= 0:
                     continue
                 fills.append((input_name, int(affordable), label))
+                costs_by_input[input_name] = costs
                 for key in ("wood", "clay", "iron", "crop"):
                     cost = int(costs.get(key) or 0)
                     budget[key] -= cost * int(affordable)
@@ -4555,6 +4671,8 @@ class ActionExecutor:
                 continue
 
             filled_ok = False
+            slot_trained: list[str] = []
+            slot_spent: dict[str, int] = {}
             for input_name, qty, label in fills:
                 try:
                     await page.locator(
@@ -4563,7 +4681,11 @@ class ActionExecutor:
                     remaining[input_name] = remaining.get(input_name, 0) - qty
                     if remaining[input_name] <= 0:
                         remaining.pop(input_name, None)
-                    trained.append(f"{qty}x {label}")
+                    slot_trained.append(f"{qty}x {label}")
+                    for key, ucost in (costs_by_input.get(input_name) or {}).items():
+                        slot_spent[key] = slot_spent.get(key, 0) + (
+                            int(ucost or 0) * qty
+                        )
                     filled_ok = True
                 except Exception as exc:  # noqa: BLE001
                     logger.debug(
@@ -4580,15 +4702,20 @@ class ActionExecutor:
             )
             if await self._click_first(page, selectors.TRAIN_SUBMIT, timeout_ms=2000):
                 await sleep_human(1.0, 2.0)
+                trained.extend(slot_trained)
+                for key, amount in slot_spent.items():
+                    spent[key] = spent.get(key, 0) + amount
                 logger.info(
                     "Replenishment: addestramento avviato nello slot %s "
                     "(villaggio %s): %s",
-                    trainer_slot, village_id, ", ".join(trained),
+                    trainer_slot, village_id, ", ".join(slot_trained),
                 )
 
         if trained:
             return ActionResult(
-                True, f"rimpiazzo avviato: {', '.join(trained)}"
+                True,
+                f"rimpiazzo avviato: {', '.join(trained)}",
+                data={"spent": spent},
             )
         return ActionResult(
             False,

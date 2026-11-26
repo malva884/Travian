@@ -70,6 +70,12 @@ SETTLER_ICONS = ("u10", "u20", "u30")
 FEED_CAP_PER_RESOURCE = 2000
 # Quota di riempimento che il feeder mantiene per se' (sopra -> spedisce)
 FEEDER_KEEP_RATIO = 0.55
+# Quota del granaio trattenuta dal feeder (sopra -> spedisce)
+FEEDER_CROP_KEEP_RATIO = 0.25
+# Con bilancio grano netto negativo il grano spedisce solo oltre questa
+# quota piu' prudente: un granaio in eccesso puo' comunque alimentare la
+# rete, ma senza affamare le truppe del villaggio.
+FEEDER_CROP_NEGATIVE_KEEP_RATIO = 0.60
 # Cooldown tra tentativi di fondazione falliti (evita spam di navigazione)
 FOUND_RETRY_SECONDS = 900.0
 # Piccole Feste (Culture Points Booster): retry breve su click fallito,
@@ -172,9 +178,15 @@ def save_culture_points(
 def feeder_surplus(
     state: GameState,
     keep_ratio: float = FEEDER_KEEP_RATIO,
-    crop_keep_ratio: float = 0.25,
+    crop_keep_ratio: float = FEEDER_CROP_KEEP_RATIO,
 ) -> dict[str, int]:
     """Surplus spedibile da un feeder: quantita' sopra keep_ratio di capienza.
+
+    Valutato per risorsa: una scorta bassa di legno/argilla/ferro non blocca
+    l'invio di un'altra risorsa realmente in eccesso (es. grano). Con
+    bilancio grano netto negativo (truppe a upkeep) il grano spedisce solo
+    la quota oltre ``FEEDER_CROP_NEGATIVE_KEEP_RATIO`` del granaio: un
+    granaio comunque in eccesso alimenta la rete senza affamare il villaggio.
 
     Ritorna {wood, clay, iron, crop} con solo voci positive, cappate a
     FEED_CAP_PER_RESOURCE per spedizione.
@@ -189,8 +201,11 @@ def feeder_surplus(
         if excess > 0:
             out[name] = min(excess, FEED_CAP_PER_RESOURCE)
     cap = res.granary_capacity
-    if cap > 0 and (res.crop_balance is None or res.crop_balance >= 0):
-        excess = int(res.crop - cap * crop_keep_ratio)
+    if cap > 0:
+        keep = crop_keep_ratio
+        if res.crop_balance is not None and res.crop_balance < 0:
+            keep = max(keep, FEEDER_CROP_NEGATIVE_KEEP_RATIO)
+        excess = int(res.crop - cap * keep)
         if excess > 0:
             out["crop"] = min(excess, FEED_CAP_PER_RESOURCE)
     return out

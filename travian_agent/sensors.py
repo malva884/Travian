@@ -5189,6 +5189,14 @@ def check_state_health(state: GameState, account_id: str = "") -> list[str]:
             anomalies.append(
                 f"coda costruzioni: {unnamed} item senza nome"
             )
+        # Oltre 3 lavori in coda e' fisicamente impossibile (tetto
+        # Plus): il parser sta contando righe non-job e queue_used /
+        # queue_slots_free / rule_wait ricevono un dato falsato.
+        if len(state.build_queue) > 3:
+            anomalies.append(
+                f"coda costruzioni: {len(state.build_queue)} item "
+                "oltre il tetto fisico (3) — parser inflazionato"
+            )
     except Exception:  # noqa: BLE001
         logger.debug("check_state_health fallito", exc_info=True)
         return []

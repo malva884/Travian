@@ -99,6 +99,21 @@ CREATE TABLE IF NOT EXISTS map_tile_cache (
     checked_ts REAL NOT NULL,
     PRIMARY KEY (account_id, x, y)
 );
+-- Rettifiche persistenti slot->gid per villaggio: la mappa dorf2 di
+-- alcune UI associa gid errati agli slot (es. data-aid ambiguo). La
+-- verifica su pagina edificio (div#build.gidN) e' autoritativa: il gid
+-- reale sopravvive al ciclo/riavvio e viene applicato a ogni scansione.
+CREATE TABLE IF NOT EXISTS slot_corrections (
+    account_id TEXT NOT NULL,
+    village_id INTEGER NOT NULL,
+    slot_id INTEGER NOT NULL,
+    detected_gid INTEGER DEFAULT -1,
+    actual_gid INTEGER DEFAULT -1,
+    source TEXT DEFAULT '',
+    resolved INTEGER DEFAULT 0,
+    updated_ts REAL DEFAULT 0,
+    PRIMARY KEY (account_id, village_id, slot_id)
+);
 """
 
 _MIGRATION_FLAG = "_migration_v1"
@@ -563,6 +578,134 @@ def tile_cache_put(account_id: str, tiles: list[dict]) -> None:
             )
     except Exception:
         logger.debug("tile_cache_put fallito", exc_info=True)
+
+
+# ----------------------------------------------------------------------
+# Slot corrections: gid reali verificati su pagina edificio, per villaggio
+# ----------------------------------------------------------------------
+
+def slot_corrections_load(
+    account_id: str, village_id: int
+) -> dict[int, dict]:
+    """Rettifiche note del villaggio: ``{slot_id: {...}}``.
+
+    Ogni voce: ``detected_gid`` (valore della mappa dorf2 osservato al
+    momento della correzione), ``actual_gid`` (gid reale verificato),
+    ``source``, ``resolved`` e ``updated_at``.
+    """
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT slot_id, detected_gid, actual_gid, source,"
+                " resolved, updated_ts"
+                " FROM slot_corrections"
+                " WHERE account_id = ? AND village_id = ?",
+                (account_id, int(village_id or 0)),
+            ).fetchall()
+        return {
+            int(r[0]): {
+                "detected_gid": int(r[1]) if r[1] is not None else -1,
+                "actual_gid": int(r[2]) if r[2] is not None else -1,
+                "source": str(r[3] or ""),
+                "resolved": bool(r[4]),
+                "updated_at": float(r[5] or 0.0),
+            }
+            for r in rows
+        }
+    except Exception:
+        logger.debug(
+            "slot_corrections_load(%s, %s) fallito",
+            account_id, village_id, exc_info=True,
+        )
+        return {}
+
+
+def slot_corrections_upsert(
+    account_id: str,
+    village_id: int,
+    entries: list[dict],
+    *,
+    resolved_slot: int | None = None,
+) -> None:
+    """Upsert delle rettifiche ``[{slot_id, detected_gid, actual_gid,
+    source}]``. Con ``resolved_slot`` marca lo slot risolto (es. sede
+    reale dell'Accademia) e azzera il flag sugli altri slot del
+    villaggio: una sola sede e' valida alla volta.
+    """
+    if not entries and resolved_slot is None:
+        return
+    vid = int(village_id or 0)
+    if vid <= 0:
+        return
+    now = time.time()
+    try:
+        with _db() as conn:
+            conn.executemany(
+                "INSERT INTO slot_corrections"
+                " (account_id, village_id, slot_id, detected_gid,"
+                "  actual_gid, source, resolved, updated_ts)"
+                " VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(account_id, village_id, slot_id)"
+                " DO UPDATE SET"
+                "  detected_gid=excluded.detected_gid,"
+                "  actual_gid=excluded.actual_gid,"
+                "  source=excluded.source,"
+                "  resolved=excluded.resolved,"
+                "  updated_ts=excluded.updated_ts",
+                [
+                    (
+                        str(account_id), vid, int(e.get("slot_id") or 0),
+                        int(e.get("detected_gid", -1)),
+                        int(e.get("actual_gid", -1)),
+                        str(e.get("source") or ""),
+                        1
+                        if (
+                            resolved_slot is not None
+                            and int(e.get("slot_id") or 0)
+                            == int(resolved_slot)
+                        )
+                        else 0,
+                        now,
+                    )
+                    for e in entries
+                    if int(e.get("slot_id") or 0) > 0
+                ],
+            )
+            if resolved_slot is not None:
+                conn.execute(
+                    "UPDATE slot_corrections SET resolved = 0"
+                    " WHERE account_id = ? AND village_id = ?"
+                    " AND slot_id != ?",
+                    (str(account_id), vid, int(resolved_slot)),
+                )
+    except Exception:
+        logger.debug(
+            "slot_corrections_upsert(%s, %s) fallito",
+            account_id, village_id, exc_info=True,
+        )
+
+
+def slot_corrections_delete(
+    account_id: str, village_id: int, slot_ids: list[int]
+) -> None:
+    """Rimuove le rettifiche degli slot indicati (voce stale/invalidata)."""
+    ids = [int(s) for s in (slot_ids or []) if int(s or 0) > 0]
+    if not ids:
+        return
+    try:
+        marks = ",".join("?" for _ in ids)
+        with _db() as conn:
+            conn.execute(
+                "DELETE FROM slot_corrections"
+                " WHERE account_id = ? AND village_id = ?"
+                f" AND slot_id IN ({marks})",
+                (str(account_id), int(village_id or 0), *ids),
+            )
+    except Exception:
+        logger.debug(
+            "slot_corrections_delete(%s, %s) fallito",
+            account_id, village_id, exc_info=True,
+        )
 
 
 # ----------------------------------------------------------------------

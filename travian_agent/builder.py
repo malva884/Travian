@@ -1224,8 +1224,10 @@ def record_upgrade_exec(village_id: int | str, slot_id: int, level: int) -> None
     hist.append((int(level), time.monotonic()))
     del hist[:-8]
     # Un EXECUTED riuscito resetta anche la storia dei fallimenti
-    # strutturali: lo slot torna candidabile.
+    # strutturali e l'eventuale blocco temporaneo: lo slot torna
+    # candidabile.
     _FOCUS_FAIL_HISTORY.pop(key, None)
+    _TEMP_BLOCK_HISTORY.pop(key, None)
 
 
 def focus_stuck_slots(state: GameState) -> set[int]:
@@ -1304,15 +1306,45 @@ STRUCTURAL_EXEC_ERRORS = frozenset(
 
 
 def record_upgrade_fail(
-    village_id: int | str, slot_id: int, error: str
+    village_id: int | str,
+    slot_id: int,
+    error: str,
+    *,
+    state: GameState | None = None,
+    cost: dict | None = None,
 ) -> None:
-    """Registra un fallimento strutturale dell'esecutore su ``slot_id``."""
+    """Registra un fallimento dell'esecutore su ``slot_id``.
+
+    Codici strutturali (``STRUCTURAL_EXEC_ERRORS``) alimentano il
+    circuit-breaker dei fail ripetuti; codici transienti
+    (``TRANSIENT_EXEC_ERRORS``: UPGRADE_BLOCKED, INSUFFICIENT_RESOURCES)
+    marcanno uno stop temporaneo — lo slot resta rinviato finche' non
+    cambiano risorse o stato della coda, o fino alla scadenza del TTL.
+    """
     if not slot_id or int(slot_id) <= 0:
         return
     code = str(error or "").strip().upper()
+    key = (str(village_id or "0"), int(slot_id))
+    if code in TRANSIENT_EXEC_ERRORS:
+        res_sig = queue_sig = cost_sig = None
+        if state is not None:
+            r = state.resources
+            res_sig = (r.wood, r.clay, r.iron, r.crop)
+            queue_sig = frozenset(queued_slot_ids(state))
+        if cost:
+            try:
+                cost_sig = tuple(
+                    int(cost.get(k) or 0)
+                    for k in ("wood", "clay", "iron", "crop")
+                )
+            except (TypeError, ValueError, AttributeError):
+                cost_sig = None
+        _TEMP_BLOCK_HISTORY[key] = (
+            time.monotonic(), code, res_sig, queue_sig, cost_sig
+        )
+        return
     if code not in STRUCTURAL_EXEC_ERRORS:
         return
-    key = (str(village_id or "0"), int(slot_id))
     hist = _FOCUS_FAIL_HISTORY.setdefault(key, [])
     if hist and hist[-1] != code:
         # Codice diverso: la storia riparte (nuovo modo di fallire).
@@ -1335,6 +1367,70 @@ def focus_fail_blocked(state: GameState) -> dict[int, str]:
         if slot not in levels or slot in queued:
             continue
         out[slot] = hist[-1]
+    return out
+
+
+# Blocchi temporanei dell'esecutore (UPGRADE_BLOCKED: coda piena /
+# 'capo cantiere' Plus / vincoli di ciclo; INSUFFICIENT_RESOURCES:
+# contratto non pagabile con le scorte attuali). A differenza dei fail
+# strutturali non servono ripetizioni: un solo esito basta perche' la
+# causa e' osservabile dallo stato. Il blocco si rilascia quando
+# cambiano le scorte o la coda costruzioni, oppure alla scadenza del
+# TTL; un EXECUTED riuscito sullo slot azzera la voce.
+# (timestamp, codice, firma risorse, firma coda, costo contratto)
+_TEMP_BLOCK_HISTORY: dict[
+    tuple[str, int],
+    tuple[float, str, tuple | None, frozenset | None, tuple | None],
+] = {}
+TRANSIENT_EXEC_ERRORS = frozenset(
+    {"UPGRADE_BLOCKED", "INSUFFICIENT_RESOURCES"}
+)
+_TEMP_BLOCK_TTL_S = 600.0
+
+
+def temp_blocked_slots(state: GameState) -> dict[int, str]:
+    """slot_id -> codice per slot con blocco temporaneo attivo.
+
+    Uno slot marcato UPGRADE_BLOCKED/INSUFFICIENT_RESOURCES resta
+    rinviato finche' non cambiano le scorte o lo stato della coda
+    (firme registrate al momento del blocco): senza il filtro il brain
+    riproporrebbe la stessa testa a ogni ciclo bruciando navigazioni
+    su un candidato che l'esecutore puo' solo saltare.
+    """
+    vkeys = {
+        str(v) for v in (state.village_id, state.village_name) if v
+    }
+    levels = {f.slot_id: int(f.level) for f in state.fields}
+    queued = queued_slot_ids(state)
+    res = state.resources
+    stock = (res.wood, res.clay, res.iron, res.crop)
+    now = time.monotonic()
+    out: dict[int, str] = {}
+    for (vid, slot), entry in list(_TEMP_BLOCK_HISTORY.items()):
+        ts, code, res_sig, queue_sig, cost_sig = entry
+        if vid not in vkeys:
+            continue
+        if (
+            now - ts > _TEMP_BLOCK_TTL_S
+            or slot not in levels
+            or slot in queued
+        ):
+            del _TEMP_BLOCK_HISTORY[(vid, slot)]
+            continue
+        released = False
+        if queue_sig is not None and queued != set(queue_sig):
+            released = True  # la coda e' cambiata: il vincolo puo' esser caduto
+        if res_sig is not None and stock != res_sig:
+            # Scorte variate: con il costo noto il rilascio e' preciso
+            # (pagabile ora), altrimenti vale il semplice cambiamento.
+            released = (
+                cost_sig is None
+                or all(stock[i] >= cost_sig[i] for i in range(4))
+            )
+        if released:
+            del _TEMP_BLOCK_HISTORY[(vid, slot)]
+            continue
+        out[slot] = code
     return out
 
 

@@ -745,10 +745,41 @@ def rule_role_buildings(state: GameState, settings: Settings) -> Action | None:
     intents = builder.role_intents(state, settings)
     if not intents:
         return None
-    head = intents[0]
-    if not _queue_free(state, settings, head.is_resource_field):
-        return None
     role = settings.village_role_for(state.village_name, state.village_id)
+
+    # Filtro anti-loop: i candidati marcati bloccati dall'esecutore
+    # (UPGRADE_BLOCKED / INSUFFICIENT_RESOURCES / fail strutturali o
+    # STUCK) o senza corsia coda libera NON restano in testa — vengono
+    # rinviati in coda alla lista o esclusi, cosi' il prossimo ciclo
+    # non riprova a vuoto lo stesso slot (es. Palazzo lv.3, Pizzo).
+    blocked = dict(builder.temp_blocked_slots(state))
+    fail_blocked = builder.focus_fail_blocked(state)
+    for slot, code in fail_blocked.items():
+        blocked.setdefault(slot, code)
+    stuck = builder.focus_stuck_slots(state)
+    for slot in stuck:
+        blocked.setdefault(slot, "STUCK")
+    can_out, can_in = builder.queue_slots_free(state, settings)
+    parallel = builder.parallel_build_enabled(settings)
+
+    def _queue_ok(f: Field) -> bool:
+        if not parallel:
+            return not state.build_queue
+        return can_out if f.is_resource_field else can_in
+
+    def _defer_reason(f: Field) -> str:
+        """'' se avviabile ora, altrimenti codice del vincolo attivo."""
+        code = blocked.get(f.slot_id)
+        if code:
+            return code
+        if not _queue_ok(f):
+            return "QUEUE_BUSY"
+        if (
+            f.is_resource_field
+            and not _field_upgrade_affordable(state, f)
+        ):
+            return "INSUFFICIENT_RESOURCES"
+        return ""
 
     # Fallback automatico: se gli edifici interni del ruolo non sono ancora
     # pagabili (es. carenza di ferro/grano), l'esecutore ripiega sul campo
@@ -762,21 +793,54 @@ def rule_role_buildings(state: GameState, settings: Settings) -> Action | None:
             f for f in builder.economy_intents(state, settings)
             if f.slot_id not in seen_slots
         ]
-    all_candidates = [f.slot_id for f in intents] + [
-        f.slot_id for f in fallback_fields
-    ]
+
+    pool = [*intents, *fallback_fields]
+    # Blocchi strutturali (STUCK/fail ripetuti): esclusi del tutto —
+    # riprovarli e' spreco garantito finche' la causa non viene
+    # risolta fuori dal bot.
+    structurally_dead = {f.slot_id for f in pool} & stuck
+    live = [f for f in pool if f.slot_id not in structurally_dead]
+    eligible: list[Field] = []
+    deferred: list[Field] = []
+    for f in live:
+        (eligible if not _defer_reason(f) else deferred).append(f)
+    candidates = eligible + deferred
+    if not candidates:
+        return None
+    head = candidates[0]
+    if not eligible:
+        # Nessun candidato avviabile nel ciclo: meglio un esito chiaro
+        # (WAIT) che riprovare a vuoto lo stesso slot bloccato.
+        return None
+
+    all_candidates = [f.slot_id for f in candidates]
+    reason = (
+        f"Sviluppo ruolo '{role}': upgrade di "
+        f"'{builder.field_label(head)}' "
+        f"(livello {head.level}, slot {head.slot_id})"
+    )
+    notes: list[str] = []
+    if head.slot_id != intents[0].slot_id:
+        first = intents[0]
+        notes.append(
+            f"rinviato '{builder.field_label(first)}' slot "
+            f"{first.slot_id} [{_defer_reason(first)}]"
+        )
+    if structurally_dead:
+        notes.append(
+            "esclusi bloccati: "
+            + ",".join(str(s) for s in sorted(structurally_dead))
+        )
+    if notes:
+        reason += " — " + "; ".join(notes)
 
     return Action(
         type=ActionType.UPGRADE_FIELD,
         params={
             "candidates": all_candidates,
-            "construct": builder.construct_gids(state, intents),
+            "construct": builder.construct_gids(state, candidates),
         },
-        reason=(
-            f"Sviluppo ruolo '{role}': upgrade di "
-            f"'{builder.field_label(head)}' "
-            f"(livello {head.level}, slot {head.slot_id})"
-        ),
+        reason=reason,
     )
 
 
@@ -798,7 +862,12 @@ def rule_wait(state: GameState, settings: Settings) -> Action:
                 f"Coda occupata, prossima costruzione tra ~{eta}s"
             )
         else:
-            free_side = "campi (dorf1)" if can_out else "edifici (dorf2)"
+            if can_out and can_in:
+                free_side = "entrambe le viste (dorf1+dorf2)"
+            elif can_out:
+                free_side = "campi (dorf1)"
+            else:
+                free_side = "edifici (dorf2)"
             reason = (
                 f"Coda {free_side} libera ma nessun upgrade avviabile; "
                 f"prossima costruzione tra ~{eta}s"
@@ -885,7 +954,25 @@ class RuleBasedBrain:
                     return "culture boost non attivo (ruolo/CP/residenza)"
                 return "riserva 3 coloni non coperta o nessun candidato"
             if name == "rule_role_buildings":
-                return "nessun intent di ruolo applicabile o coda piena"
+                if builder.crop_safety_needed(state, self.settings):
+                    return "grain safety attiva (margine grano sotto soglia)"
+                intents = builder.role_intents(state, self.settings)
+                if not intents:
+                    return "nessun intent di ruolo applicabile"
+                blocked = dict(builder.temp_blocked_slots(state))
+                for slot in builder.focus_stuck_slots(state):
+                    blocked.setdefault(slot, "STUCK")
+                tagged = [
+                    f"slot {f.slot_id} [{blocked.get(f.slot_id)}]"
+                    for f in intents
+                    if f.slot_id in blocked
+                ]
+                if tagged:
+                    return (
+                        "candidati di ruolo bloccati/rinviati: "
+                        + ", ".join(tagged)
+                    )
+                return "candidati di ruolo senza corsia coda libera"
             if name == "rule_upgrade_weakest_field":
                 return weakest_field_skip_reason(state, self.settings)
         except Exception:  # noqa: BLE001
