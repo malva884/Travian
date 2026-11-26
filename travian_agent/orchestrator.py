@@ -266,10 +266,8 @@ def _cap_feed_shipment(
     - Per-risorsa: mai oltre ``FEED_TARGET_FILL_MARGIN`` della capienza
       del magazzino/granaio target, al netto delle scorte attuali e dei
       mercanti gia' in viaggio verso di esso (vettori inbound radar).
-    - Filtro grano su croplog/15c: il grano non parte se il granaio del
-      target e' gia' al >=``FEED_CROP_FULL_RATIO`` o la sua produzione
-      netta di grano e' positiva (``crop_balance`` > 0) — in crescita
-      il feeder manda solo legno/argilla/ferro.
+    - Filtro grano su croplog/15c: un target con ruolo ``croplog`` (15 grani)
+      non riceve grano dal feeder (solo legno/argilla/ferro).
 
     Ritorna ``(surplus_cappato, spazio_libero_per_risorsa, nota_filtro)``.
     """
@@ -310,7 +308,7 @@ def _cap_feed_shipment(
     )
     for name in list(capped):
         capped[name] = min(capped[name], free.get(name, 0))
-    # Filtro grano verso croplog/15c in crescita.
+    # Filtro grano verso croplog/15c: escludi sempre crop se il target e' un croplog.
     note = ""
     if capped.get("crop", 0) > 0:
         is_crop_target = "crop" in str(target_role or "").strip().lower()
@@ -323,18 +321,19 @@ def _cap_feed_shipment(
             and target_res.crop_balance is not None
             and target_res.crop_balance > 0
         )
-        if is_crop_target and (gr_full or crop_net_pos):
-            why = (
-                f"granaio al {int(have_crop * 100 / max(1, cap_gr))}%"
-                if gr_full
-                else "produzione grano netta positiva"
-            )
+        if is_crop_target:
+            if gr_full:
+                why = f"granaio al {int(have_crop * 100 / max(1, cap_gr))}%"
+            elif crop_net_pos:
+                why = "produzione grano netta positiva"
+            else:
+                why = "destinatario croplog (15 grani)"
             note = (
                 f"grano escluso dal carico verso '{target_key}' "
                 f"({why}: un croplog in crescita riceve solo "
                 "legno/argilla/ferro)"
             )
-            del capped["crop"]
+            capped.pop("crop", None)
     return (
         {k: v for k, v in capped.items() if v > 0},
         free,
