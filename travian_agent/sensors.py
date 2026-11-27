@@ -3347,6 +3347,7 @@ class TravianParser:
                 "read_troops_home: navigazione rally fallita: %s", exc
             )
         units = await self._read_troops_dom()
+        probe = dict(getattr(self, "_troop_probe", None) or {})
         if not units:
             # Fallback panoramica: il box 'Unita' di dorf1.php mostra i
             # contingenti del villaggio anche quando la pagina rally ha
@@ -3363,29 +3364,45 @@ class TravianParser:
                 units = await self._read_troops_dom()
             except Exception:
                 pass
+            p2 = getattr(self, "_troop_probe", None) or {}
+            probe = {
+                "icons": max(
+                    probe.get("icons", 0), p2.get("icons", 0)
+                ),
+                "cells": probe.get("cells", 0) + p2.get("cells", 0),
+                "unresolved": probe.get("unresolved", 0)
+                + p2.get("unresolved", 0),
+            }
         if not units:
-            # Non silenzioso: il farming deve poter distinguere un
-            # villaggio davvero vuoto da un sensore cieco (bug 1.1).
+            # Anomalia SOLO se la pagina espone markup truppe che il
+            # parser non sa leggere: celle valore senza tipo risolto,
+            # oppure icone unita' senza celle valore. Una griglia tutta
+            # a zero o pagina senza markup truppa = villaggio davvero
+            # vuoto -> {} silenzioso (fixture 38553: solo benefici).
+            unmappable = probe.get("unresolved", 0) > 0 or (
+                probe.get("icons", 0) > 0 and probe.get("cells", 0) == 0
+            )
             try:
                 logger.info(
                     "read_troops_home: nessuna truppa letta su %s "
-                    "(rally tt=1 + dorf1), pagina=%s",
+                    "(rally tt=1 + dorf1), pagina=%s, probe=%s",
                     f"newdid={village_id}",
                     (self.page.url or "")[:120],
+                    probe,
                 )
             except Exception:
                 pass
-            # Fixture automatica: l'HTML reale di gid16/dorf1 serve a
-            # calibrare _read_troops_dom sul markup ts30 (report '0
-            # truppe nonostante unita' in casa').
-            try:
-                await capture_anomaly(
-                    self.page,
-                    "TROOPS_UNREAD",
-                    village_id=village_id,
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            if unmappable:
+                # Fixture automatica: l'HTML reale serve a calibrare
+                # _read_troops_dom sul markup ts30 non ancora mappato.
+                try:
+                    await capture_anomaly(
+                        self.page,
+                        "TROOPS_UNREAD",
+                        village_id=village_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         return units
 
     async def _read_troops_dom(self) -> dict[str, int]:
@@ -3429,6 +3446,42 @@ class TravianParser:
                     return null;
                 };
 
+                // --- dichiarazioni condivise: usate dal pass 0.5 e dal
+                //     probe diagnostico finale (devono essere visibili
+                //     anche quando il pass 0.5 non gira) ---
+                let unresolved = 0;
+                const uSel2 = [];
+                for (let n = 1; n <= 30; n++) {
+                    uSel2.push('[class*="u' + n + '"]');
+                }
+                uSel2.push(
+                    '[data-unit]', '[data-unit-id]', '[data-unitid]',
+                    'img.unit, i.unit, span.unit'
+                );
+                const iconSel2 = uSel2.join(',');
+                // ATTENZIONE (fixture 38553): nella pagina edificio
+                // `/slot` i `div.unit` 'N (+M)' compaiono ANCHE nei
+                // 'buildingBenefits' — icone culturePoints_medium /
+                // population_medium / troopVisibility con .value e
+                // .delta NON sono truppe. Senza questa esclusione
+                // il pass (b) puo' allineare i benefit ai tipi
+                // unita' e produrre truppe fantasma.
+                const benefitSel =
+                    '[class*="benefit" i], [class*="buildingBonus" i]';
+                const inBenefit = (el) => {
+                    for (let p = el; p; p = p.parentElement) {
+                        if (p.matches && p.matches(benefitSel)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                // Cella valore: solo cifre con separatore migliaia
+                // e opzionale '(+M)' — es. '1.234 (+5)' o '0'.
+                const valRe = /^\\s*\\d[\\d.]*\\s*(\\(\\s*\\+?\\s*\\d[\\d.]*\\s*\\))?\\s*$/;
+                let valCells = [];
+                const qtyOf = (c) => num(c.innerText);
+
                 // 0) Struttura tabella Travian: icone in
                 //    `tbody.units tr#unitRowAtTown` e valori in
                 //    `tbody.units.last td.unit`.
@@ -3444,9 +3497,11 @@ class TravianParser:
                         el => !rawIcons.some(o => o !== el && el.contains(o))
                     );
                     const colKeys = leafIcons.map(el => keyOf(el));
-                    valCells.forEach((td, idx) => {
+                    tbl.querySelectorAll(
+                        'tbody.units.last tr td.unit, tbody.units.last td.unit'
+                    ).forEach((td, idx) => {
                         const key = colKeys[idx];
-                        if (!key) return;
+                        if (!key) { unresolved++; return; }
                         const qty = num(td.innerText || td.textContent || '');
                         if (qty > 0) out[key] = (out[key] || 0) + qty;
                     });
@@ -3459,25 +3514,13 @@ class TravianParser:
                 //      per il dodge; +M = rinforzi ospitati, non
                 //      inviabili da questo villaggio — ignorati).
                 if (!Object.keys(out).length) {
-                    const uSel2 = [];
-                    for (let n = 1; n <= 30; n++) {
-                        uSel2.push('[class*="u' + n + '"]');
-                    }
-                    uSel2.push(
-                        '[data-unit]', '[data-unit-id]', '[data-unitid]',
-                        'img.unit, i.unit, span.unit'
-                    );
-                    const iconSel2 = uSel2.join(',');
-                    // Cella valore: solo cifre con separatore migliaia
-                    // e opzionale '(+M)' — es. '1.234 (+5)' o '0'.
-                    const valRe = /^\\s*\\d[\\d.]*\\s*(\\(\\s*\\+?\\s*\\d[\\d.]*\\s*\\))?\\s*$/;
-                    const valCells = Array.from(document.querySelectorAll(
+                    valCells = Array.from(document.querySelectorAll(
                         'div.unit, span.unit, td.unit, ' +
                         '[class*="unitValue" i], [class*="unit-value" i]'
                     )).filter(
-                        c => valRe.test(cleanTxt(c.innerText).trim())
+                        c => !inBenefit(c) &&
+                             valRe.test(cleanTxt(c.innerText).trim())
                     );
-                    const qtyOf = (c) => num(c.innerText);
                     // a) Tipo unita' risolto nel contesto della cella:
                     //    icona 'uN' dentro la cella, oppure icona
                     //    unica nel wrapper genitore (.unit/td/li).
@@ -3504,7 +3547,7 @@ class TravianParser:
                                 if (sib.length === 1) key = keyOf(sib[0]);
                             }
                         }
-                        if (!key) return;
+                        if (!key) { unresolved++; return; }
                         const qty = qtyOf(cell);
                         if (qty > 0) out[key] = (out[key] || 0) + qty;
                     });
@@ -3522,7 +3565,7 @@ class TravianParser:
                                 root.querySelectorAll(iconSel2)
                             );
                             const leafIcons = rawIcons.filter(
-                                el => !rawIcons.some(
+                                el => !inBenefit(el) && !rawIcons.some(
                                     o => o !== el && el.contains(o)
                                 )
                             );
@@ -3632,12 +3675,34 @@ class TravianParser:
                         }
                     });
                 }
-                return { units: out };
+                // Probe diagnostico: distingue 'villaggio vuoto' da
+                // 'markup truppe presente ma non letto'. icons = icone
+                // unita' risolvibili (uN/data-unit/label) fuori benefit;
+                // cells = celle valore 'N (+M)' non-benefit; unresolved
+                // = celle viste senza tipo unita' risolto.
+                let probeIcons = 0;
+                const probeEls = document.querySelectorAll(iconSel2);
+                for (const el of probeEls) {
+                    if (!inBenefit(el) && keyOf(el)) {
+                        probeIcons++;
+                        if (probeIcons > 30) break;
+                    }
+                }
+                return {
+                    units: out,
+                    probe: {
+                        icons: probeIcons,
+                        cells: valCells.length,
+                        unresolved: unresolved,
+                    },
+                };
             }
             """,
             {"labels": _troop_label_map()},
         )
-        units = (data or {}).get("units") or {}
+        data = data or {}
+        self._troop_probe = data.get("probe") or {}
+        units = data.get("units") or {}
         return {str(k): safe_int(v) for k, v in units.items() if safe_int(v) > 0}
 
     async def read_training_queue(

@@ -599,7 +599,20 @@ class ActionExecutor:
                         )) return false;
                         const txt = rowText(el);
                         if (!txt) return false;
-                        if (fakeRe.test(txt)) return false;
+                        // Una riga di lavoro ATTIVO incorpora spesso la
+                        // CTA premium 'completa ora' (capo cantiere /
+                        // gold / instant): fakeRe sul testo intero la
+                        // scartava come finta e queue_after restava 0
+                        // con cantiere in corso (fixture 38553).
+                        // Evidenza positiva di job = countdown o
+                        // data-gid: ha priorita' sul testo premium.
+                        const hasJobMark = el.hasAttribute('data-gid') ||
+                            !!el.querySelector(
+                                '.timer, .dur, .clocks, ' +
+                                '[class*="timer" i], ' +
+                                '[class*="countdown" i]'
+                            );
+                        if (!hasJobMark && fakeRe.test(txt)) return false;
                         return true;
                     };
                     // Dedup container annidati: si tengono solo i piu'
@@ -1305,6 +1318,32 @@ class ActionExecutor:
             )
             # Post-check: snapshot della coda PRIMA del click
             queue_before = await self._build_queue_count(page)
+            # Coda gia' satura: il gioco ignorerebbe il click — evita
+            # click a vuoto e falso QUEUE_UNCONFIRMED (transitorio:
+            # lo slot resta rinviato finche' la coda non si libera).
+            _qcap_pre = (
+                3
+                if getattr(self.settings, "allow_parallel_build", False)
+                else 2
+            )
+            if queue_before is not None and queue_before >= _qcap_pre:
+                logger.info(
+                    "Coda costruzioni gia' piena (%s>=%s) su slot %s: "
+                    "click evitato — QUEUE_FULL, rinvio slot",
+                    queue_before,
+                    _qcap_pre,
+                    slot_id,
+                )
+                return ActionResult(
+                    False,
+                    f"coda costruzioni piena ({queue_before}/{_qcap_pre}): "
+                    f"click su slot {slot_id} evitato",
+                    data={
+                        "error": "QUEUE_FULL",
+                        "slot_id": int(slot_id),
+                        "gid": int(gid),
+                    },
+                )
             # Il CTA del contratto puo' essere sotto la piega di /slot
             # (es. #contract_building26 sotto Deposito Segreto/Reggia):
             # portarlo in viewport — il click umano lavora su coordinate.
@@ -1509,6 +1548,40 @@ class ActionExecutor:
                 and queue_after > queue_before
             )
             confirmed = queue_grew or under_construction
+
+            # Coda fisica satura: il gioco ignora il click su qualsiasi
+            # candidato — esito transitorio, non anomalia strutturale.
+            # Niente QUEUE_UNCONFIRMED/capture; QUEUE_FULL rinvia lo
+            # slot via TRANSIENT_EXEC_ERRORS finche' la firma della
+            # coda non cambia (fixture 38553: Campo grano attivo, click
+            # su 'Amplia' assorbito dal gioco).
+            _qcap = (
+                3
+                if getattr(self.settings, "allow_parallel_build", False)
+                else 2
+            )
+            if (
+                not confirmed
+                and queue_after is not None
+                and queue_after >= _qcap
+            ):
+                logger.info(
+                    "Coda costruzioni piena (%s>=%s): click su slot %s "
+                    "non accodato dal gioco — QUEUE_FULL, rinvio slot",
+                    queue_after,
+                    _qcap,
+                    slot_id,
+                )
+                return ActionResult(
+                    False,
+                    f"coda costruzioni piena ({queue_after}/{_qcap}): "
+                    f"click su slot {slot_id} assorbito dal gioco",
+                    data={
+                        "error": "QUEUE_FULL",
+                        "slot_id": int(slot_id),
+                        "gid": int(gid),
+                    },
+                )
 
             if not confirmed:
                 logger.warning(

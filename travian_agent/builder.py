@@ -1383,7 +1383,7 @@ _TEMP_BLOCK_HISTORY: dict[
     tuple[float, str, tuple | None, frozenset | None, tuple | None],
 ] = {}
 TRANSIENT_EXEC_ERRORS = frozenset(
-    {"UPGRADE_BLOCKED", "INSUFFICIENT_RESOURCES"}
+    {"UPGRADE_BLOCKED", "INSUFFICIENT_RESOURCES", "QUEUE_FULL"}
 )
 _TEMP_BLOCK_TTL_S = 600.0
 

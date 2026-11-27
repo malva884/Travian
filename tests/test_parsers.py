@@ -256,6 +256,20 @@ class TestTroopsDomParser:
         # avvolgono i numeri e rompono i match: vanno rimossi prima.
         assert "cleanTxt" in src
         assert "200e" in src and "202a" in src
+        # I `div.unit` 'N (+M)' compaiono anche nei buildingBenefits
+        # (culturePoints/population/troopVisibility — NON truppe):
+        # vanno esclusi o il pass (b) mappa benefit su tipi unita'.
+        assert "benefit" in src and "inBenefit" in src
+
+    def test_troops_unread_probe_gating(self):
+        import inspect
+        from travian_agent import sensors
+        src = inspect.getsource(sensors.TravianParser.read_troops_home)
+        # Il probe distingue 'villaggio vuoto' da 'markup non letto':
+        # TROOPS_UNREAD solo se unresolved>0 o icone senza celle.
+        assert "unmappable" in src
+        assert "unresolved" in src and "icons" in src and "cells" in src
+        assert "_troop_probe" in src
 
 
 class TestRallyMovementsParser:
