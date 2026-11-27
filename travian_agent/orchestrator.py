@@ -3268,11 +3268,20 @@ async def monitor_all_villages(
 
             # ------------------------------------------------------------------
             # Filtro ruoli e competenza territoriale per il Farming / Raid:
-            # - Fondatori e Feeder non eseguono raid.
+            # - I Feeder partecipano a pieno titolo ai raid: accumulano bottino
+            #   locale che viene poi spedito dal Feeder Push al villaggio bersaglio.
+            # - I fondatori puri (early_cropper_founder) sono esclusi di default
+            #   per non rischiare perdite prima della fondazione, salvo override farm_enabled.
             # - Ogni villaggio raida SOLO i target di cui e' il piu' vicino
             #   (nearest_village) e che non siano stati gia' attaccati di recente.
             # ------------------------------------------------------------------
-            is_raiding_role = village.role not in ("early_cropper_founder", "feeder")
+            _vcfg_farm = settings.village_config_for(
+                village.name, village.village_id
+            )
+            is_raiding_role = (
+                village.role != "early_cropper_founder"
+                or (_vcfg_farm is not None and _vcfg_farm.farm_enabled)
+            )
             if not is_raiding_role:
                 _record_decision(
                     settings,
@@ -3292,9 +3301,6 @@ async def monitor_all_villages(
             # Il gate enabled (globale + per-villaggio) precede il check di
             # pausa anti-detection: un modulo disabilitato esce subito e non
             # produce ne' SKIPPED ne' MODULE_PAUSED nel log.
-            _vcfg_farm = settings.village_config_for(
-                village.name, village.village_id
-            )
             farming_enabled = bool(
                 getattr(settings.farming, "enabled", True)
                 and (_vcfg_farm is None or _vcfg_farm.farm_enabled)
