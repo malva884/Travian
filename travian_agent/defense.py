@@ -788,14 +788,39 @@ class DefenseManager:
             if "|" in tgt:
                 try:
                     sx, sy = tgt.split("|", 1)
-                    return int(sx), int(sy), 0
+                    tx, ty = int(sx), int(sy)
                 except ValueError:
-                    pass
+                    tx = ty = None
+                # Mai evacuare verso casa propria: se il target
+                # configurato coincide col villaggio attaccato si
+                # passa al fallback del proprio piu' vicino.
+                if tx is not None and not (
+                    tx == village.x and ty == village.y
+                ):
+                    host_id = next(
+                        (
+                            int(v.village_id or 0)
+                            for v in villages or []
+                            if v.x == tx and v.y == ty
+                        ),
+                        0,
+                    )
+                    return tx, ty, host_id
             for v in villages or []:
-                if v.name == tgt and v.x is not None and v.y is not None:
+                if (
+                    v.name == tgt
+                    and v.village_id != village.village_id
+                    and v.x is not None
+                    and v.y is not None
+                ):
                     return v.x, v.y, v.village_id
             t_cfg = settings.village_config_for(tgt)
-            if t_cfg and t_cfg.x is not None and t_cfg.y is not None:
+            if (
+                t_cfg
+                and t_cfg.x is not None
+                and t_cfg.y is not None
+                and not (t_cfg.x == village.x and t_cfg.y == village.y)
+            ):
                 return t_cfg.x, t_cfg.y, 0
 
         if village.x is not None and village.y is not None:
@@ -1015,9 +1040,25 @@ class DefenseManager:
                 ),
             )
             result = await executor.execute(action, village_id=village.village_id)
+            msg = str(result.message or "").lower()
             if result.success:
                 logger.warning(
                     "%s Smart Recall eseguito: %s", prefix, result.message
+                )
+            elif "già a" in msg or "gia' a" in msg:
+                # Il server risponde "le tue truppe sono gia' a <casa>":
+                # il rientro e' gia' avvenuto -> record completato,
+                # si rimuove invece di ritentare a ogni ciclo.
+                logger.info(
+                    "%s Smart Recall concluso: truppe gia' rientrate "
+                    "(%s); record rimosso.",
+                    prefix, result.message,
+                )
+                self._audit_event(
+                    "TROOP_RECALL",
+                    "SKIPPED",
+                    f"Rientro verso '{rec.home_name}' gia' completato "
+                    f"lato server: {result.message}",
                 )
             else:
                 remaining.append(rec)
